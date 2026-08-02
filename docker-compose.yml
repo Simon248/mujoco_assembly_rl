@@ -1,0 +1,130 @@
+name: mujoco-assembly-rl
+
+x-common-environment: &common-environment
+  PYTHONPATH: /workspace
+  PYTHONUNBUFFERED: "1"
+  PYTHONFAULTHANDLER: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+
+  MUJOCO_XML_PATH: /data/input/scene.xml
+  OUTPUT_DIR: /data/output
+  MUJOCO_GL: egl
+
+  # Désactive les mécanismes torch.compile/Dynamo.
+  # SAC utilise ici l'exécution PyTorch classique.
+  TORCHDYNAMO_DISABLE: "1"
+
+  OMP_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+  OPENBLAS_NUM_THREADS: "1"
+  NUMEXPR_NUM_THREADS: "1"
+
+x-common-service: &common-service
+  image: mujoco-assembly-rl:gpu
+
+  build:
+    context: .
+    dockerfile: Dockerfile
+    args:
+      APP_UID: "${HOST_UID:-1000}"
+      APP_GID: "${HOST_GID:-1000}"
+
+  working_dir: /workspace
+
+  init: true
+  shm_size: "2gb"
+
+  volumes:
+    # Code modifiable sans reconstruire l'image.
+    - ./src:/workspace/src
+
+    # Modèles et données d'entrée en lecture seule.
+    - ./data/input:/data/input:ro
+
+    # Modèles entraînés, checkpoints et logs persistants.
+    - ./data/output:/data/output
+
+  environment:
+    <<: *common-environment
+
+  restart: "no"
+
+
+services:
+  train:
+    <<: *common-service
+
+    # Nécessite Docker Compose 2.30 ou plus récent.
+    gpus: all
+
+    environment:
+      <<: *common-environment
+
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,graphics
+
+      SB3_DEVICE: "${SB3_DEVICE:-cuda}"
+      BUFFER_SIZE: "${BUFFER_SIZE:-50000}"
+      BATCH_SIZE: "${BATCH_SIZE:-256}"
+
+    command:
+      - python
+      - -u
+      - -X
+      - faulthandler
+      - -m
+      - src.train
+      - --timesteps
+      - "${TOTAL_TIMESTEPS:-500000}"
+      - --seed
+      - "${SEED:-7}"
+      - --checkpoint-freq
+      - "${CHECKPOINT_FREQ:-50000}"
+      - --learning-starts
+      - "${LEARNING_STARTS:-5000}"
+      - --log-freq
+      - "${LOG_FREQ:-250}"
+
+
+  evaluate:
+    <<: *common-service
+
+    gpus: all
+
+    environment:
+      <<: *common-environment
+
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,graphics
+
+      SB3_DEVICE: "${SB3_DEVICE:-cuda}"
+      EVAL_EPISODES: "${EVAL_EPISODES:-10}"
+      EVAL_RENDER: "${EVAL_RENDER:-none}"
+
+    command:
+      - python
+      - -u
+      - -X
+      - faulthandler
+      - -m
+      - src.evaluate
+      - --episodes
+      - "${EVAL_EPISODES:-10}"
+      - --render
+      - "${EVAL_RENDER:-none}"
+
+
+  tensorboard:
+    <<: *common-service
+
+    ports:
+      - "${TENSORBOARD_PORT:-6006}:6006"
+
+    command:
+      - tensorboard
+      - --logdir
+      - /data/output/tensorboard
+      - --host
+      - 0.0.0.0
+      - --port
+      - "6006"
