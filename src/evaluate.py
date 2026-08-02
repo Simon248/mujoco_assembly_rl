@@ -10,7 +10,7 @@ from typing import Any
 from stable_baselines3 import SAC
 
 from src.assembly_env import AssemblyEnv
-
+import numpy as np
 
 def _path_from_env(name: str, default: str) -> Path:
     return Path(
@@ -123,7 +123,21 @@ def find_latest_model(
         key=lambda path: path.stat().st_mtime,
     )
 
+def json_default(value):
+    """Convertit les types NumPy en types JSON standards."""
 
+    if isinstance(value, np.generic):
+        return value.item()
+
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+
+    if isinstance(value, Path):
+        return str(value)
+
+    raise TypeError(
+        f"Type non sérialisable en JSON : {type(value).__name__}"
+    )
 def main() -> None:
     args = parse_args()
 
@@ -168,16 +182,13 @@ def main() -> None:
             "--episodes must be greater than zero"
         )
 
-    render_mode = (
-        "human"
-        if args.render == "human"
-        else None
-    )
+    render_mode = "human" if args.render == "human" else None
 
     env = AssemblyEnv(
         xml_path,
         render_mode=render_mode,
     )
+
 
     model = SAC.load(
         str(model_path),
@@ -286,6 +297,7 @@ def main() -> None:
         json.dumps(
             summary,
             indent=2,
+            default=json_default,
         ),
         encoding="utf-8",
     )
@@ -300,6 +312,7 @@ def main() -> None:
         json.dumps(
             public_summary,
             indent=2,
+            default=json_default,
         )
     )
 

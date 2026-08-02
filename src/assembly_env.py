@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any
 
@@ -7,6 +8,7 @@ import gymnasium as gym
 from gymnasium import spaces
 import mujoco
 import numpy as np
+
 
 
 class AssemblyEnv(gym.Env[np.ndarray, np.ndarray]):
@@ -87,6 +89,11 @@ class AssemblyEnv(gym.Env[np.ndarray, np.ndarray]):
         self._previous_pos_error = 0.0
         self._previous_rot_error = 0.0
         self._viewer = None
+        # Cadencement temps réel du rendu "human".
+        # Durée simulée par appel à step() = timestep * frame_skip.
+        self._step_wall_time = float(self.model.opt.timestep) * self.frame_skip
+        self._next_render_time: float | None = None
+
 
     def _name2id(self, object_type: mujoco.mjtObj, name: str) -> int:
         object_id = mujoco.mj_name2id(self.model, object_type, name)
@@ -269,9 +276,28 @@ class AssemblyEnv(gym.Env[np.ndarray, np.ndarray]):
             import mujoco.viewer
 
             self._viewer = mujoco.viewer.launch_passive(self.model, self.data)
+            self._next_render_time = time.monotonic()
         self._viewer.sync()
+
+        # Cadencement temps réel : on attend que l'horloge murale rattrape
+        # le temps simulé écoulé depuis le dernier rendu. Sans cela, la
+        # simulation défile trop vite pour être observable.
+        if self._next_render_time is not None:
+            self._next_render_time += self._step_wall_time
+            delay = self._next_render_time - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            else:
+                # On a pris du retard : on resynchronise plutôt que
+                # d'accumuler la dette temporelle.
+                self._next_render_time = time.monotonic()
 
     def close(self) -> None:
         if self._viewer is not None:
-            self._viewer.close()
+            try:
+                self._viewer.close()
+            except Exception:
+                pass
             self._viewer = None
+            self._next_render_time = None
+

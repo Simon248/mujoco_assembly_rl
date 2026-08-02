@@ -91,6 +91,15 @@ services:
 
     gpus: all
 
+    # Accès au serveur X11 de l'hôte pour afficher la fenêtre MuJoCo.
+    # Nécessite d'avoir autorisé l'accès côté hôte, par exemple :
+    #   xhost +local:root      (ou +local:docker)
+    volumes:
+      - ./src:/workspace/src
+      - ./data/input:/data/input:ro
+      - ./data/output:/data/output
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+
     environment:
       <<: *common-environment
 
@@ -101,7 +110,15 @@ services:
       EVAL_EPISODES: "${EVAL_EPISODES:-10}"
       EVAL_RENDER: "${EVAL_RENDER:-none}"
 
+      # Pour un rendu "human" MuJoCo, il faut utiliser GLFW (fenêtre X11)
+      # plutôt que EGL (offscreen).
+      MUJOCO_GL: "${MUJOCO_GL:-glfw}"
+      DISPLAY: "${DISPLAY:-:0}"
+      QT_X11_NO_MITSHM: "1"
+
+
     command:
+
       - python
       - -u
       - -X
