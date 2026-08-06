@@ -187,6 +187,8 @@ def main() -> None:
     env = AssemblyEnv(
         xml_path,
         render_mode=render_mode,
+        curriculum_enabled=False,
+        disassembly_probability=0.0,
     )
 
 

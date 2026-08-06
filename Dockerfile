@@ -28,6 +28,10 @@ COPY requirements.txt /tmp/requirements.txt
 
 RUN pip install --break-system-packages --no-cache-dir -r /tmp/requirements.txt
 
+# The CAD task uses MuJoCo's built-in signed-distance-field plugin.  Fail the
+# image build early if the wheel does not contain the corresponding library.
+RUN python -c "import mujoco; from pathlib import Path; p = Path(mujoco.__file__).parent / 'plugin'; assert any(p.glob('*sdf*.so')), f'SDF plugin missing from {p}'"
+
 RUN mkdir -p /data/input /data/output
 
 COPY src /workspace/src

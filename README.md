@@ -1,7 +1,8 @@
 # MuJoCo Assembly RL — version Docker
 
-Ce projet entraîne une politique SAC sur une tâche minimale d'insertion
-pion-logement dans MuJoCo, sans ROS 2 pendant l'entraînement.
+Ce projet entraîne une politique SAC sur l'assemblage CAD de deux pièces dans
+MuJoCo, sans ROS 2 pendant l'entraînement. `chandelier_part_1.stl` est la
+pièce mobile et `chandelier_assembly_table_visual.stl` la structure fixe.
 
 ## Architecture des volumes
 
@@ -17,7 +18,8 @@ mujoco_assembly_rl_docker/
 │   └── evaluate.py
 ├── data/
 │   ├── input/               # monté en lecture seule dans /data/input
-│   │   └── scene.xml
+│   │   ├── scene.xml
+│   │   └── cad/              # STL d'origine, dans le repère d'assemblage
 │   └── output/              # monté en lecture/écriture dans /data/output
 └── .env.example
 ```
@@ -26,6 +28,39 @@ Le code est un bind mount : une modification locale de `src/` est visible dans
 le conteneur sans reconstruire l'image. Le modèle MuJoCo est lu depuis
 `data/input/`. Les modèles SAC, checkpoints, métriques et logs TensorBoard sont
 écrits dans `data/output/`.
+
+## Collisions CAD
+
+Les STL restent intacts et sont utilisés pour le rendu. Les collisions sont
+calculées par le plugin SDF natif de MuJoCo 3.1.4, à partir de ces mêmes STL :
+elles respectent donc les cavités et concavités des pièces, sans hull convexe.
+L'image Docker vérifie que la bibliothèque SDF est bien fournie par MuJoCo.
+
+La pièce est tenue par un portique cartésien à six degrés de liberté. L'action
+de la politique est `[dx, dy, dz, droll, dpitch, dyaw]`. La distribution finale
+de reset est `z=+0,20 m`, X/Y uniformes dans ±0,10 m et roll/pitch/yaw dans
+±15°. Le succès correspond à la pose CAD relative identité, à 1,5 mm et 2° près.
+
+L'entraînement applique un curriculum non directionnel : les poses initiales
+restent toujours validées sans contact pièce-table, puis la proportion de poses
+tirées dans la distribution finale augmente de 20 % à 100 % entre 0 et 350 000
+décisions. Cela facilite l'exploration sans imposer de trajectoire.
+
+Par défaut, 25 % des épisodes d'entraînement sont des épisodes de
+désassemblage : la pièce commence dans la pose CAD assemblée et doit rejoindre
+une pose libre aléatoire, explicitement fournie à la politique dans l'observation.
+
+## Diagnostiquer la collision SDF
+
+Pour exporter en PLY la surface SDF locale effectivement utilisée par MuJoCo :
+
+```bash
+docker compose run --rm train python -m src.export_sdf_pointcloud
+```
+
+Le fichier `data/output/sdf/table_isosurface_local.ply` peut être ouvert dans
+MeshLab ou CloudCompare. La résolution par défaut est 2 mm ; utiliser
+`--resolution 0.005` pour un premier diagnostic plus rapide.
 
 ## Prérequis
 
@@ -155,16 +190,16 @@ Le chemin peut aussi être remplacé au niveau du conteneur avec la variable
 
 ## Passage au vrai robot
 
-La politique produit actuellement :
+La politique produit :
 
 ```text
-[delta_x, delta_y, delta_z, delta_yaw]
+[delta_x, delta_y, delta_z, delta_roll, delta_pitch, delta_yaw]
 ```
 
 Pour un bras réel :
 
 1. remplacer le portique cartésien dans `data/input/scene.xml` par le MJCF du robot ;
-2. passer à six actions `[dx, dy, dz, dRx, dRy, dRz]` ;
+2. conserver ou adapter les six actions `[dx, dy, dz, dRx, dRy, dRz]` ;
 3. utiliser `differential_ik_position_target()` dans `src/cartesian_ik.py` ;
 4. conserver exactement l'ordre, les unités et la normalisation des observations ;
 5. exporter ensuite `data/output/models/assembly_sac.zip` vers le nœud ROS 2 d'inférence.

@@ -63,6 +63,17 @@ class ConsoleProgressCallback(BaseCallback):
 
         if infos:
             self._last_info = dict(infos[-1])
+            for key in (
+                "position_error_m",
+                "lateral_error_m",
+                "rotation_error_rad",
+                "force_norm_N",
+                "curriculum_stage",
+                "curriculum_success_rate",
+                "is_disassembly",
+            ):
+                if key in self._last_info:
+                    self.logger.record(f"assembly/{key}", self._last_info[key])
 
         if (
             self.num_timesteps >= self._next_print
@@ -221,6 +232,9 @@ def write_metadata(
 ) -> None:
     metadata = {
         "algorithm": "SAC",
+        "task": "chandelier_cad_assembly",
+        "action_space": "[dx, dy, dz, droll, dpitch, dyaw]",
+        "cad_collision": "MuJoCo SDF generated from the original STL meshes",
         "xml_path": str(xml_path),
         "timesteps_requested": timesteps_requested,
         "timesteps_completed": timesteps_completed,
@@ -336,6 +350,7 @@ def main() -> None:
             "lateral_error_m",
             "rotation_error_rad",
             "force_norm_N",
+            "is_disassembly",
         ),
     )
 
@@ -386,7 +401,7 @@ def main() -> None:
         train_freq=1,
         gradient_steps=1,
         policy_kwargs={
-            "net_arch": [64, 64],
+            "net_arch": [256, 256],
         },
         verbose=1,
         tensorboard_log=str(tensorboard_dir),

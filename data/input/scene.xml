@@ -1,169 +1,77 @@
-<mujoco model="square_peg_in_hole">
-  <compiler angle="radian" autolimits="true"/>
+<mujoco model="chandelier_cad_assembly">
+  <compiler angle="radian" autolimits="true" meshdir="cad"/>
 
-  <option
-      timestep="0.001"
-      integrator="implicitfast"
-      cone="elliptic"/>
+  <option timestep="0.001" integrator="implicitfast" cone="elliptic"
+          sdf_iterations="10" sdf_initpoints="20"/>
 
   <default>
-    <joint
-        damping="2"
-        armature="0.02"/>
-
-    <geom
-        friction="1.0 0.01 0.001"
-        condim="4"
-        solref="0.004 1"
-        solimp="0.90 0.95 0.001"/>
-
-    <position
-        kp="700"
-        kv="45"/>
+    <joint damping="2" armature="0.02"/>
+    <geom friction="0.9 0.01 0.001" condim="4"
+          solref="0.004 1" solimp="0.90 0.95 0.001"/>
+    <position kp="700" kv="45"/>
   </default>
 
+  <!-- sdflib turns each original STL into a non-convex collision SDF. -->
+  <extension>
+    <plugin plugin="mujoco.sdf.sdflib">
+      <instance name="table_sdf"><config key="aabb" value="0"/></instance>
+      <instance name="part_sdf"><config key="aabb" value="0"/></instance>
+    </plugin>
+  </extension>
+
+  <asset>
+    <mesh name="assembly_table_mesh" file="chandelier_assembly_table_visual.stl"/>
+    <mesh name="part_1_mesh" file="chandelier_part_1.stl"/>
+  </asset>
+
   <worldbody>
-    <light
-        pos="0 -1 1.5"
-        dir="0 1 -1"/>
+    <light pos="0 -1 1.5" dir="0 1 -1"/>
+    <camera name="overview" pos="0.75 -1.10 0.65"
+            xyaxes="0.83 0.56 0 -0.22 0.34 0.91"/>
+    <geom name="floor" type="plane" size="0 0 0.05" rgba="0.85 0.85 0.85 1"/>
 
-    <camera
-        name="overview"
-        pos="0.25 -0.35 0.25"
-        xyaxes="0.81 0.58 0 -0.25 0.35 0.90"/>
-
-    <geom
-        name="floor"
-        type="plane"
-        size="0 0 0.05"
-        rgba="0.85 0.85 0.85 1"/>
-
-    <!-- Assemblage fixe -->
+    <!-- Both CAD files share this assembly coordinate frame. -->
     <body name="fixture" pos="0 0 0">
-      <geom
-          name="bottom"
-          type="box"
-          pos="0 0 0.0025"
-          size="0.05 0.05 0.0025"/>
-
-      <geom
-          name="wall_x_pos"
-          type="box"
-          pos="0.0305 0 0.0275"
-          size="0.0195 0.05 0.0225"/>
-
-      <geom
-          name="wall_x_neg"
-          type="box"
-          pos="-0.0305 0 0.0275"
-          size="0.0195 0.05 0.0225"/>
-
-      <geom
-          name="wall_y_pos"
-          type="box"
-          pos="0 0.0305 0.0275"
-          size="0.011 0.0195 0.0225"/>
-
-      <geom
-          name="wall_y_neg"
-          type="box"
-          pos="0 -0.0305 0.0275"
-          size="0.011 0.0195 0.0225"/>
-
-      <site
-          name="hole_frame"
-          pos="0 0 0.05"
-          size="0.003"
-          rgba="0 1 0 1"/>
+      <geom name="assembly_table_visual" type="mesh" mesh="assembly_table_mesh"
+            contype="0" conaffinity="0" rgba="0.65 0.65 0.70 1"/>
+      <geom name="assembly_table_collision" type="sdf" mesh="assembly_table_mesh"
+            rgba="0.65 0.65 0.70 0">
+        <plugin instance="table_sdf"/>
+      </geom>
+      <site name="assembly_frame" pos="0 0 0" size="0.005" rgba="0 1 0 1"/>
     </body>
 
-    <!-- Robot cartésien minimal à quatre degrés de liberté -->
-    <body name="x_stage" pos="0 0 0.11">
-
-      <!--
-        Chaque corps mobile doit avoir une masse et une inertie propres.
-        Les valeurs représentent ici les masses fictives des chariots.
-      -->
-      <inertial
-          pos="0 0 0"
-          mass="1.0"
-          diaginertia="0.001 0.001 0.001"/>
-
-      <joint
-          name="joint_x"
-          type="slide"
-          axis="1 0 0"
-          range="-0.025 0.025"/>
-
+    <!-- Six-DOF Cartesian fixture; the part stays grasped for this task. -->
+    <body name="x_stage" pos="0 0 0.20">
+      <inertial pos="0 0 0" mass="1.0" diaginertia="0.001 0.001 0.001"/>
+      <joint name="joint_x" type="slide" axis="1 0 0" range="-0.15 0.15"/>
       <body name="y_stage">
-
-        <inertial
-            pos="0 0 0"
-            mass="0.8"
-            diaginertia="0.0008 0.0008 0.0008"/>
-
-        <joint
-            name="joint_y"
-            type="slide"
-            axis="0 1 0"
-            range="-0.025 0.025"/>
-
+        <inertial pos="0 0 0" mass="0.8" diaginertia="0.0008 0.0008 0.0008"/>
+        <joint name="joint_y" type="slide" axis="0 1 0" range="-0.15 0.15"/>
         <body name="z_stage">
-
-          <inertial
-              pos="0 0 0"
-              mass="0.6"
-              diaginertia="0.0006 0.0006 0.0006"/>
-
-          <joint
-              name="joint_z"
-              type="slide"
-              axis="0 0 1"
-              range="-0.058 0.020"/>
-
-          <body name="yaw_stage">
-
-            <inertial
-                pos="0 0 0"
-                mass="0.4"
-                diaginertia="0.0004 0.0004 0.0004"/>
-
-            <joint
-                name="joint_yaw"
-                type="hinge"
-                axis="0 0 1"
-                range="-0.35 0.35"/>
-
-            <!--
-              Corps intermédiaire soudé au yaw_stage.
-              Le capteur mesure l'interaction entre ce corps et son parent.
-            -->
-            <body name="ft_dummy">
-
-              <site
-                  name="wrist_ft_site"
-                  pos="0 0 0"
-                  size="0.004"
-                  rgba="1 0 0 1"/>
-
-              <site
-                  name="ee_site"
-                  pos="0 0 0"
-                  size="0.003"
-                  rgba="0 0 1 1"/>
-
-              <geom
-                  name="peg"
-                  type="box"
-                  pos="0 0 -0.025"
-                  size="0.0095 0.0095 0.025"
-                  mass="0.20"/>
-
-              <site
-                  name="peg_tip"
-                  pos="0 0 -0.05"
-                  size="0.002"
-                  rgba="1 1 0 1"/>
+          <inertial pos="0 0 0" mass="0.6" diaginertia="0.0006 0.0006 0.0006"/>
+          <joint name="joint_z" type="slide" axis="0 0 1" range="-0.24 0.05"/>
+          <body name="roll_stage">
+            <inertial pos="0 0 0" mass="0.4" diaginertia="0.0004 0.0004 0.0004"/>
+            <joint name="joint_roll" type="hinge" axis="1 0 0" range="-0.70 0.70"/>
+            <body name="pitch_stage">
+              <inertial pos="0 0 0" mass="0.3" diaginertia="0.0003 0.0003 0.0003"/>
+              <joint name="joint_pitch" type="hinge" axis="0 1 0" range="-0.70 0.70"/>
+              <body name="yaw_stage">
+                <inertial pos="0 0 0" mass="0.2" diaginertia="0.0002 0.0002 0.0002"/>
+                <joint name="joint_yaw" type="hinge" axis="0 0 1" range="-0.70 0.70"/>
+                <body name="ft_dummy">
+                  <site name="wrist_ft_site" pos="0 0 0" size="0.004" rgba="1 0 0 1"/>
+                  <site name="ee_site" pos="0 0 0" size="0.003" rgba="0 0 1 1"/>
+                  <geom name="part_1_visual" type="mesh" mesh="part_1_mesh"
+                        contype="0" conaffinity="0" rgba="0.90 0.55 0.12 1"/>
+                  <geom name="part_1_collision" type="sdf" mesh="part_1_mesh"
+                        mass="0.20" rgba="0.90 0.55 0.12 0">
+                    <plugin instance="part_sdf"/>
+                  </geom>
+                  <site name="part_frame" pos="0 0 0" size="0.005" rgba="1 1 0 1"/>
+                </body>
+              </body>
             </body>
           </body>
         </body>
@@ -172,62 +80,22 @@
   </worldbody>
 
   <actuator>
-    <position
-        name="act_x"
-        joint="joint_x"
-        ctrlrange="-0.025 0.025"
-        forcerange="-200 200"/>
-
-    <position
-        name="act_y"
-        joint="joint_y"
-        ctrlrange="-0.025 0.025"
-        forcerange="-200 200"/>
-
-    <position
-        name="act_z"
-        joint="joint_z"
-        ctrlrange="-0.058 0.020"
-        forcerange="-250 250"/>
-
-    <position
-        name="act_yaw"
-        joint="joint_yaw"
-        ctrlrange="-0.35 0.35"
-        forcerange="-20 20"/>
+    <position name="act_x" joint="joint_x" ctrlrange="-0.15 0.15" forcerange="-250 250"/>
+    <position name="act_y" joint="joint_y" ctrlrange="-0.15 0.15" forcerange="-250 250"/>
+    <position name="act_z" joint="joint_z" ctrlrange="-0.24 0.05" forcerange="-300 300"/>
+    <position name="act_roll" joint="joint_roll" ctrlrange="-0.70 0.70" forcerange="-30 30"/>
+    <position name="act_pitch" joint="joint_pitch" ctrlrange="-0.70 0.70" forcerange="-30 30"/>
+    <position name="act_yaw" joint="joint_yaw" ctrlrange="-0.70 0.70" forcerange="-30 30"/>
   </actuator>
 
   <sensor>
-    <force
-        name="wrist_force"
-        site="wrist_ft_site"/>
-
-    <torque
-        name="wrist_torque"
-        site="wrist_ft_site"/>
-
-    <framepos
-        name="ee_pos"
-        objtype="site"
-        objname="ee_site"/>
-
-    <framequat
-        name="ee_quat"
-        objtype="site"
-        objname="ee_site"/>
-
-    <framepos
-        name="part_rel_pos"
-        objtype="site"
-        objname="peg_tip"
-        reftype="site"
-        refname="hole_frame"/>
-
-    <framequat
-        name="part_rel_quat"
-        objtype="site"
-        objname="peg_tip"
-        reftype="site"
-        refname="hole_frame"/>
+    <force name="wrist_force" site="wrist_ft_site"/>
+    <torque name="wrist_torque" site="wrist_ft_site"/>
+    <framepos name="ee_pos" objtype="site" objname="ee_site"/>
+    <framequat name="ee_quat" objtype="site" objname="ee_site"/>
+    <framepos name="part_rel_pos" objtype="site" objname="part_frame"
+              reftype="site" refname="assembly_frame"/>
+    <framequat name="part_rel_quat" objtype="site" objname="part_frame"
+               reftype="site" refname="assembly_frame"/>
   </sensor>
 </mujoco>
