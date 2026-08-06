@@ -131,6 +131,32 @@ services:
       - "${EVAL_RENDER:-none}"
 
 
+  test-env-colision:
+    <<: *common-service
+
+    profiles: ["gui"]
+
+    volumes:
+      - ./src:/workspace/src
+      - ./data/input:/data/input:ro
+      - ./data/output:/data/output
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+
+    environment:
+      <<: *common-environment
+
+      MUJOCO_GL: "${MUJOCO_GL:-glfw}"
+      DISPLAY: "${DISPLAY:-:0}"
+      QT_X11_NO_MITSHM: "1"
+
+    command:
+      - python
+      - -u
+      - -m
+      - src.test_env_colision
+      - --viewer
+
+
   tensorboard:
     <<: *common-service
 

@@ -4,3 +4,4 @@ stable-baselines3
 tensorboard
 rich
 tqdm
+PyYAML>=6.0

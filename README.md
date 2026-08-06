@@ -62,6 +62,42 @@ Le fichier `data/output/sdf/table_isosurface_local.ply` peut être ouvert dans
 MeshLab ou CloudCompare. La résolution par défaut est 2 mm ; utiliser
 `--resolution 0.005` pour un premier diagnostic plus rapide.
 
+## Tester les trajectoires et collisions
+
+Le script rejoue les poses des trois YAML dans un MJCF de test, avec les mêmes
+collisions SDF que l'environnement. Il contrôle chaque pièce contre la table et
+les pièces posées avant elle. Il conserve également toutes les métadonnées YAML
+dans le rapport.
+
+```bash
+docker compose run --rm train python -m src.test_env_colision
+```
+
+Le résultat est enregistré dans `data/output/collision_report.json`. Les
+segments à contrôler se choisissent directement dans
+`src/test_env_colision.py`, via :
+
+```python
+SELECTED_SEGMENTS = ("approach", "place")
+```
+
+Les valeurs possibles sont `approach`, `place`, `retreat` (ou `retrait`). Pour
+ouvrir la relecture visuelle sous Linux/X11 :
+
+```bash
+xhost +local:docker
+docker compose --profile gui run --rm test-env-colision
+xhost -local:docker
+```
+
+Le bloc `summary` en tête du JSON, et la sortie terminal, donnent directement
+le verdict par pièce et segment. En cas de collision, ils indiquent l'obstacle,
+l'instant, la pénétration maximale et le point de contact dans le repère de la
+table. Dans le viewer, les contacts déjà rencontrés sont marqués en rouge ; le
+contact le plus profond est jaune. À l'entrée dans chaque contact distinct, la
+relecture attend une pression sur Entrée avant de continuer. Les réglages de
+vitesse, confirmation et taille des marqueurs sont en tête du script.
+
 ## Prérequis
 
 - Docker Engine avec le plugin Docker Compose ;
