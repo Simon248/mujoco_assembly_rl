@@ -134,6 +134,36 @@ services:
       - "${EVAL_RENDER:-human}"
 
 
+  evaluate-nominal:
+    <<: *common-service
+
+    # Baseline déterministe : aucun modèle SAC n'est chargé et l'action
+    # résiduelle reste nulle. Le seuil dur de sécurité reste actif.
+    environment:
+      <<: *common-environment
+
+      NOMINAL_EPISODES: "${NOMINAL_EPISODES:-5}"
+      NOMINAL_SEED: "${NOMINAL_SEED:-100}"
+      NOMINAL_RENDER: "${NOMINAL_RENDER:-none}"
+      NOMINAL_PROGRESS_SPEED: "${NOMINAL_PROGRESS_SPEED:-0.25}"
+
+    command:
+      - python
+      - -u
+      - -X
+      - faulthandler
+      - -m
+      - src.evaluate_nominal
+      - --episodes
+      - "${NOMINAL_EPISODES:-5}"
+      - --seed
+      - "${NOMINAL_SEED:-100}"
+      - --render
+      - "${NOMINAL_RENDER:-none}"
+      - --progress-speed
+      - "${NOMINAL_PROGRESS_SPEED:-0.25}"
+
+
   test-env-colision:
     <<: *common-service
 

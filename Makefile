@@ -1,4 +1,4 @@
-.PHONY: build train evaluate evaluate-gui evaluate-shell tensorboard shell clean-output
+.PHONY: build train evaluate evaluate-nominal evaluate-gui evaluate-shell tensorboard shell clean-output
 
 build:
 	docker compose build
@@ -8,6 +8,9 @@ train:
 
 evaluate:
 	docker compose run --rm evaluate
+
+evaluate-nominal:
+	docker compose run --rm evaluate-nominal
 
 # Évaluation avec fenêtre MuJoCo (GUI) affichée sur l'hôte via X11.
 # Autorise l'accès au serveur X, puis lance l'évaluation en mode render=human.
@@ -36,4 +39,3 @@ shell:
 
 clean-output:
 	find data/output -mindepth 1 ! -name .gitkeep -delete
-

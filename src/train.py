@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import json
 import os
 import time
@@ -17,7 +18,70 @@ from stable_baselines3.common.callbacks import (
 from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.monitor import Monitor
 
-from src.assembly_env import AssemblyEnv
+from src.assembly_env import AssemblyEnv, ResidualConfig
+
+
+SAC_GAMMA = 0.999
+
+
+MONITOR_INFO_KEYWORDS = (
+    "is_success",
+    "path_progress",
+    "max_path_progress",
+    "progress_action",
+    "progress_intention",
+    "progress_scale",
+    "effective_progress_request",
+    "mean_progress_action",
+    "mean_effective_progress_request",
+    "advance_fraction",
+    "hold_fraction",
+    "retreat_fraction",
+    "final_position_error_m",
+    "final_rotation_error_rad",
+    "force_norm_N",
+    "torque_norm_Nm",
+    "contact_impulse_Ns",
+    "unsafe_contact",
+    "max_force_N",
+    "max_torque_Nm",
+    "terminated",
+    "truncated",
+    "termination_reason",
+    "control_mode",
+    "next_control_mode",
+    "contact_search_count",
+    "contact_search_duration_s",
+    "contact_search_fraction",
+    "contact_search_latched",
+    "contact_search_trigger",
+    "tracking_duration_s",
+    "tracking_fraction",
+    "recovery_count",
+    "recovery_from_contact_search_count",
+    "recovery_duration_s",
+    "recovery_fraction",
+    "recovery_attempt_duration_s",
+    "recovery_trigger",
+    "recovery_trigger_contact",
+    "recovery_trigger_force_N",
+    "recovery_trigger_torque_Nm",
+    "stuck_detected",
+    "forced_retreat",
+    "recovery_failed",
+    "soft_effort_exceeded",
+    "terminal_linear_limit_m",
+    "residual_linear_offset_m",
+    "residual_angular_offset_rad",
+    "admittance_linear_offset_m",
+    "admittance_angular_offset_rad",
+    "offset_cost",
+    "dense_reward",
+    "terminal_reward",
+    "episode_offset_cost",
+    "episode_dense_reward",
+    "episode_terminal_reward",
+)
 
 
 def _path_from_env(name: str, default: str) -> Path:
@@ -71,6 +135,8 @@ class ConsoleProgressCallback(BaseCallback):
                 "torque_norm_Nm",
                 "contact_impulse_Ns",
                 "unsafe_contact",
+                "contact_search_fraction",
+                "recovery_fraction",
             ):
                 if key in self._last_info:
                     self.logger.record(f"assembly/{key}", self._last_info[key])
@@ -248,11 +314,66 @@ def write_metadata(
     metadata = {
         "algorithm": "SAC",
         "task": "chandelier_residual_tactile_place",
+        "control_semantics_version": 6,
         "part_name": part_name,
         "paths_dir": str(paths_dir),
-        "action_space": "[vx_res, vy_res, vz_res, wx_res, wy_res, wz_res, progress_rate]",
-        "control_mode": "geometric_place_path + fixed_admittance + tactile_residual_sac",
-        "cad_collision": "MuJoCo SDF generated from the original STL meshes",
+        "action_space": "[vx_res, vy_res, vz_res, wx_res, wy_res, wz_res, progress_residual]",
+        "progress_action_semantics": {
+            "tracking": "0=nominal speed, -1=stop, +1=1.5x nominal speed",
+            "contact_search": "0=0.25x nominal, negative=hold/retreat, positive<=0.5x nominal",
+            "recovery": "positive=hold, zero=hold, negative=retreat",
+        },
+        "residual_action_authority": (
+            "all six Cartesian residual actions remain active over the whole path; "
+            "there is no progress-based action gate"
+        ),
+        "control_mode": "tracking + contact_search + bounded_recovery",
+        "contact_search_latch": (
+            "contact_search is activated only by simulated contact and remains "
+            "latched for the episode; inertial wrench alone cannot trigger it"
+        ),
+        "stall_detection": (
+            "final-pose stagnation is monitored from s=0.85; this progress "
+            "threshold does not activate contact_search"
+        ),
+        "terminal_residual_limit": (
+            "24 mm only after the tactile latch, in contact_search or in recovery; "
+            "it is not activated by path progress"
+        ),
+        "admittance_activation": (
+            "measured wrench is applied to admittance only during current "
+            "simulated contact; free-space inertial loads do not bend the path"
+        ),
+        "recovery_residual_actions": (
+            "all three translations and all three rotations remain available"
+        ),
+        "recovery_triggers": (
+            "with tactile context, 5 persistent decisions above 20 N/4.5 Nm; "
+            "or final-pose stagnation from s=0.85"
+        ),
+        "observation": (
+            "8 frames x 56 values (448 total), including current and maximum "
+            "progress, controller modes, tactile latch, residual offset, "
+            "admittance offset and admittance velocity"
+        ),
+        "reward": {
+            "dense": (
+                "clipped to [-0.1, 0.1], including accumulated-offset cost; "
+                "progress is rewarded only when exceeding the episode maximum"
+            ),
+            "success": 250.0,
+            "unsafe": -800.0,
+            "unsafe_force_and_torque": -900.0,
+            "recovery_failed": -300.0,
+            "time_limit": "final-pose quality penalty, bounded to -60",
+        },
+        "discount_factor": SAC_GAMMA,
+        "time_limit_handling": (
+            "700-step truncations are stored as terminal transitions; the "
+            "critic does not bootstrap beyond an episode reset"
+        ),
+        "residual_config": asdict(ResidualConfig()),
+        "cad_collision": "MuJoCo SDF using chandelier_assembly_table_collision.stl",
         "xml_path": str(xml_path),
         "timesteps_requested": timesteps_requested,
         "timesteps_completed": timesteps_completed,
@@ -365,28 +486,7 @@ def main() -> None:
         filename=str(
             monitor_dir / "train"
         ),
-        info_keywords=(
-            "is_success",
-            "path_progress",
-            "final_position_error_m",
-            "final_rotation_error_rad",
-            "force_norm_N",
-            "torque_norm_Nm",
-            "contact_impulse_Ns",
-            "unsafe_contact",
-            "max_force_N",
-            "max_torque_Nm",
-            "terminated",
-            "truncated",
-            "termination_reason",
-            "control_mode",
-            "recovery_count",
-            "recovery_duration_s",
-            "stuck_detected",
-            "forced_retreat",
-            "recovery_failed",
-            "soft_torque_stop",
-        ),
+        info_keywords=MONITOR_INFO_KEYWORDS,
     )
 
     checkpoint_callback = CheckpointCallback(
@@ -422,6 +522,7 @@ def main() -> None:
     print(f"[train] CUDA disponible : {torch.cuda.is_available()}", flush=True)
     print(f"[train] buffer_size     : {buffer_size}", flush=True)
     print(f"[train] batch_size      : {batch_size}", flush=True)
+    print(f"[train] gamma           : {SAC_GAMMA}", flush=True)
     print("[train] création du modèle SAC...", flush=True)
 
     model = SAC(
@@ -432,7 +533,10 @@ def main() -> None:
         learning_starts=args.learning_starts,
         batch_size=batch_size,
         tau=0.005,
-        gamma=0.99,
+        gamma=SAC_GAMMA,
+        replay_buffer_kwargs={
+            "handle_timeout_termination": False,
+        },
         train_freq=1,
         gradient_steps=1,
         policy_kwargs={

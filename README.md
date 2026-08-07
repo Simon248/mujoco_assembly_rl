@@ -36,24 +36,18 @@ le conteneur sans reconstruire l'image. Le modèle MuJoCo est lu depuis
 
 ## Collisions CAD
 
-Les STL restent intacts et sont utilisés pour le rendu. Les collisions sont
-calculées par le plugin SDF natif de MuJoCo 3.1.4, à partir de ces mêmes STL :
-elles respectent donc les cavités et concavités des pièces, sans hull convexe.
-L'image Docker vérifie que la bibliothèque SDF est bien fournie par MuJoCo.
+Les STL visuels restent intacts et sont utilisés pour le rendu. La table utilise
+`chandelier_assembly_table_collision.stl` pour les collisions, tandis que
+`chandelier_assembly_table_visual.stl` reste réservé à l'affichage. Les
+collisions sont calculées par le plugin SDF natif de MuJoCo 3.1.4 ; elles
+respectent donc les cavités et concavités des pièces, sans hull convexe. L'image
+Docker vérifie que la bibliothèque SDF est bien fournie par MuJoCo.
 
-La pièce est tenue par un portique cartésien à six degrés de liberté. L'action
-de la politique est `[dx, dy, dz, droll, dpitch, dyaw]`. La distribution finale
-de reset est `z=+0,20 m`, X/Y uniformes dans ±0,10 m et roll/pitch/yaw dans
-±15°. Le succès correspond à la pose CAD relative identité, à 1,5 mm et 2° près.
-
-L'entraînement applique un curriculum non directionnel : les poses initiales
-restent toujours validées sans contact pièce-table, puis la proportion de poses
-tirées dans la distribution finale augmente de 20 % à 100 % entre 0 et 350 000
-décisions. Cela facilite l'exploration sans imposer de trajectoire.
-
-Par défaut, 25 % des épisodes d'entraînement sont des épisodes de
-désassemblage : la pièce commence dans la pose CAD assemblée et doit rejoindre
-une pose libre aléatoire, explicitement fournie à la politique dans l'observation.
+La pièce est tenue par un portique cartésien à six degrés de liberté. La tâche
+active se concentre exclusivement sur son segment `place` enregistré ; les
+pièces déjà assemblées sont chargées comme obstacles fixes. La commande tactile
+résiduelle à sept dimensions est détaillée dans la section d'entraînement
+ci-dessous.
 
 ## Diagnostiquer la collision SDF
 
@@ -146,9 +140,89 @@ ASSEMBLY_PART=part_2 TOTAL_TIMESTEPS=500000 docker compose run --rm train
 ASSEMBLY_PART=part_2 docker compose run --rm evaluate
 ```
 
-L'action est `[vx_res, vy_res, vz_res, wx_res, wy_res, wz_res, progression]`.
-Les limites d'admittance, de force et de correction sont regroupées dans
+L'action est
+`[vx_res, vy_res, vz_res, wx_res, wy_res, wz_res, progression_residuelle]`.
+Les six commandes cartésiennes résiduelles restent actives sur toute la
+trajectoire : il n'existe aucun verrou ni aucune rampe d'autorité fondés sur la
+progression. SAC peut donc adapter l'approche avant le premier contact ; le coût
+de l'offset accumulé l'incite néanmoins à rester proche du chemin enregistré.
+
+Le contrôleur expose trois modes à SAC dans chaque observation de l'historique :
+
+- `tracking` : une action de progression nulle suit le chemin à sa vitesse
+  nominale, `-1` l'arrête et `+1` l'accélère jusqu'à 1,5 fois cette vitesse ;
+- `contact_search` : une action de progression nulle n'avance plus qu'à 25 % de
+  la vitesse nominale, `-0,25` maintient `s`, une valeur plus négative recule,
+  et l'avance est plafonnée à 50 % puis ralentie par les efforts mesurés ;
+- `recovery` : l'augmentation de `s` est interdite, tandis que les six
+  corrections résiduelles, translations et rotations, permettent le dégagement
+  borné.
+
+`contact_search` est déclenché uniquement par un contact simulé. Cette
+activation tactile est mémorisée jusqu'au reset, même si le contact disparaît
+ensuite. Un wrench inertiel en espace libre ne peut donc pas déclencher le
+latch. Le seuil `s=0,85` sert seulement à commencer la détection d'une
+stagnation près du but ; il ne change pas le mode de commande.
+
+L'admittance n'interprète le wrench comme un effort de contact que pendant un
+contact simulé courant. En espace libre, même après un latch antérieur, elle
+revient vers zéro et n'infléchit donc pas la trajectoire à cause des seules
+charges inertielles.
+
+Les rotations résiduelles restent disponibles pendant `contact_search`. Après
+le latch tactile, dans `contact_search` ou en `recovery`, le contrôleur autorise
+24 mm de correction résiduelle et 6 mm d'admittance, soit 30 mm au total. Cette
+limite élargie n'est jamais activée par la seule progression. Après un contact,
+un couple supérieur à 4,5 Nm ou une force supérieure à 20 N doit persister cinq
+décisions avant de déclencher une récupération, y compris en `contact_search`.
+Un contact faible qui reste sous ces seuils peut demeurer en recherche tactile ; une
+stagnation détectée près du but déclenche également la récupération. Seuls les
+seuils durs de 8 Nm ou 80 N interrompent immédiatement la simulation. Les
+limites d'admittance, d'effort et de correction sont regroupées dans
 `ResidualConfig` de `src/assembly_env.py`.
+
+Chaque trame d'observation contient aussi la progression maximale déjà atteinte,
+le latch tactile, l'offset résiduel accumulé, l'offset d'admittance et sa
+vitesse. SAC peut ainsi distinguer deux états ayant la même pose mesurée mais
+des cibles internes différentes. Une trame contient 56 valeurs et l'historique
+de huit trames en contient 448. La pose réelle pièce–gabarit reste cachée à la
+politique.
+
+La récompense dense d'alignement est bornée dans `[-0,1 ; 0,1]` et devient plus
+informative près du but. Une portion du chemin ne rapporte qu'une fois, lors du
+nouveau maximum de progression : reculer puis réavancer ne permet pas de gagner
+la même récompense en boucle. Elle inclut aussi un coût explicite de l'offset
+accumulé. Les bonus et pénalités de fin sont séparés dans `terminal_reward` :
+`+250` pour un succès, `-800` pour un seuil dur, `-900` si force et couple sont
+tous deux dangereux, et `-300` pour l'échec d'une récupération. À la limite de
+temps, la qualité de la pose finale ajoute une pénalité bornée à `-60`. Le
+facteur d'actualisation SAC est `gamma=0,999`, adapté aux 700 décisions de
+l'épisode. Les pénalités de sécurité restent ainsi dominantes même lorsqu'un
+seuil dur n'est atteint que très tard dans l'épisode et donc fortement actualisé.
+Les troncatures à 700 décisions sont stockées comme de vraies fins d'épisode
+dans le replay buffer : le critic ne prolonge pas artificiellement leur valeur
+au-delà du reset suivant.
+
+Le CSV expose notamment le déclencheur et le latch de recherche tactile, les
+offsets linéaire et angulaire, ainsi que `offset_cost`, `dense_reward` et
+`terminal_reward`.
+
+Cette nouvelle sémantique de commande et l'ajout des états internes à
+l'observation ne sont pas compatibles avec les anciens checkpoints : il faut
+réentraîner SAC depuis zéro après cette modification.
+
+Avant de relancer SAC, vérifier que le contrôleur nominal termine le segment
+avec toutes les variabilités à zéro, sans charger de réseau et sans activer la
+récupération :
+
+```bash
+ASSEMBLY_PART=part_1 NOMINAL_EPISODES=5 docker compose run --rm evaluate-nominal
+```
+
+Le rapport est écrit dans
+`data/output/<pièce>/nominal_evaluation.json`. Tant que `baseline_passed` vaut
+`false`, le défaut se situe dans le chemin, les collisions ou le contrôleur
+nominal ; entraîner SAC ne constitue pas encore un test pertinent.
 
 L'évaluation affiche maintenant par défaut le viewer **MuJoCo** (le projet
 n'utilise pas Gazebo). Pour une exécution sans fenêtre, notamment sur une

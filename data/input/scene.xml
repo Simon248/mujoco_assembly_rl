@@ -20,7 +20,8 @@
   </extension>
 
   <asset>
-    <mesh name="assembly_table_mesh" file="chandelier_assembly_table_visual.stl"/>
+    <mesh name="assembly_table_visual_mesh" file="chandelier_assembly_table_visual.stl"/>
+    <mesh name="assembly_table_collision_mesh" file="chandelier_assembly_table_collision.stl"/>
     <mesh name="part_1_mesh" file="chandelier_part_1.stl"/>
   </asset>
 
@@ -32,9 +33,9 @@
 
     <!-- Both CAD files share this assembly coordinate frame. -->
     <body name="fixture" pos="0 0 0">
-      <geom name="assembly_table_visual" type="mesh" mesh="assembly_table_mesh"
+      <geom name="assembly_table_visual" type="mesh" mesh="assembly_table_visual_mesh"
             contype="0" conaffinity="0" rgba="0.65 0.65 0.70 1"/>
-      <geom name="assembly_table_collision" type="sdf" mesh="assembly_table_mesh"
+      <geom name="assembly_table_collision" type="sdf" mesh="assembly_table_collision_mesh"
             rgba="0.65 0.65 0.70 0">
         <plugin instance="table_sdf"/>
       </geom>

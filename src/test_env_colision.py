@@ -83,15 +83,18 @@ def make_model(paths: dict[str, dict[str, Any]], cad_dir: Path) -> tuple[mujoco.
     ]
     xml += [f'<instance name="{name}_sdf"><config key="aabb" value="0"/></instance>' for name in names]
     xml += ['</plugin></extension>', '<asset>']
-    xml += [f'<mesh name="table_mesh" file="{escape(str(cad_dir / "chandelier_assembly_table_visual.stl"))}"/>']
+    xml += [
+        f'<mesh name="table_visual_mesh" file="{escape(str(cad_dir / "chandelier_assembly_table_visual.stl"))}"/>',
+        f'<mesh name="table_collision_mesh" file="{escape(str(cad_dir / "chandelier_assembly_table_collision.stl"))}"/>',
+    ]
     xml += [f'<mesh name="{name}_mesh" file="{escape(str(cad_dir / (name + ".stl")))}"/>' for name in names]
     xml += [
         '</asset><worldbody>',
         '<light pos="0 -1 1.5" dir="0 1 -1"/>',
         '<camera name="overview" pos="0.75 -1.10 0.65" xyaxes="0.83 0.56 0 -0.22 0.34 0.91"/>',
         '<geom type="plane" size="0 0 .05" contype="0" conaffinity="0" rgba=".85 .85 .85 1"/>',
-        '<geom name="assembly_table_visual" type="mesh" mesh="table_mesh" contype="0" conaffinity="0" rgba=".65 .65 .70 1"/>',
-        '<geom name="assembly_table_collision" type="sdf" mesh="table_mesh" rgba=".65 .65 .70 0"><plugin instance="table_sdf"/></geom>',
+        '<geom name="assembly_table_visual" type="mesh" mesh="table_visual_mesh" contype="0" conaffinity="0" rgba=".65 .65 .70 1"/>',
+        '<geom name="assembly_table_collision" type="sdf" mesh="table_collision_mesh" rgba=".65 .65 .70 0"><plugin instance="table_sdf"/></geom>',
     ]
     for name in names:
         final_p, final_q = pose(paths[name]["segments"]["place"][-1]["pose"])

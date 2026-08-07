@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import csv
+from collections import Counter
 import json
 import os
 from pathlib import Path
@@ -11,6 +13,29 @@ from stable_baselines3 import SAC
 
 from src.assembly_env import AssemblyEnv
 import numpy as np
+
+
+STEP_REWARD_METRICS = (
+    "offset_cost",
+    "dense_reward",
+    "terminal_reward",
+)
+
+EVALUATION_METRICS = {
+    "path_progress": "mean_final_path_progress",
+    "max_path_progress": "mean_max_path_progress",
+    "final_position_error_m": "mean_final_position_error_m",
+    "final_rotation_error_rad": "mean_final_rotation_error_rad",
+    "max_force_N": "mean_max_force_N",
+    "max_torque_Nm": "mean_max_torque_Nm",
+    "contact_impulse_Ns": "mean_contact_impulse_Ns",
+    "contact_duration_s": "mean_contact_duration_s",
+    "recovery_count": "mean_recovery_count",
+    "recovery_duration_s": "mean_recovery_duration_s",
+    "contact_search_latched": "contact_search_latched_rate",
+    "residual_linear_offset_m": "mean_final_residual_linear_offset_m",
+    "residual_angular_offset_rad": "mean_final_residual_angular_offset_rad",
+}
 
 def _path_from_env(name: str, default: str) -> Path:
     return Path(
@@ -148,6 +173,51 @@ def json_default(value):
     raise TypeError(
         f"Type non sérialisable en JSON : {type(value).__name__}"
     )
+
+
+def _mean_final_metric(
+    episodes: list[dict[str, Any]],
+    key: str,
+) -> float | None:
+    values = [
+        float(item["final_info"][key])
+        for item in episodes
+        if isinstance(item["final_info"].get(key), (int, float, np.number))
+    ]
+    return mean(values) if values else None
+
+
+def _write_episode_csv(
+    path: Path,
+    episodes: list[dict[str, Any]],
+) -> None:
+    """Write one flat, inspectable row per deterministic evaluation episode."""
+    base_fields = ["episode", "seed", "reward", "steps", "success"]
+    total_fields = [f"{key}_sum" for key in STEP_REWARD_METRICS]
+    info_fields = sorted(
+        {
+            key
+            for episode in episodes
+            for key, value in episode["final_info"].items()
+            if key != "config" and not isinstance(value, dict)
+        }
+    )
+    fieldnames = base_fields + total_fields + info_fields
+
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
+        writer.writeheader()
+        for episode in episodes:
+            row = {key: episode[key] for key in base_fields}
+            row.update(episode["reward_metric_sums"])
+            for key in info_fields:
+                value = episode["final_info"].get(key)
+                if isinstance(value, (list, tuple, np.ndarray)):
+                    value = json.dumps(value, default=json_default)
+                row[key] = value
+            writer.writerow(row)
+
+
 def main() -> None:
     args = parse_args()
 
@@ -222,6 +292,10 @@ def main() -> None:
             terminated = False
             truncated = False
             total_reward = 0.0
+            reward_metric_sums = {
+                f"{key}_sum": 0.0
+                for key in STEP_REWARD_METRICS
+            }
             steps = 0
             final_info: dict[str, Any] = {}
 
@@ -242,6 +316,10 @@ def main() -> None:
                 ) = env.step(action)
 
                 total_reward += float(reward)
+                for key in STEP_REWARD_METRICS:
+                    value = final_info.get(key)
+                    if isinstance(value, (int, float, np.number)):
+                        reward_metric_sums[f"{key}_sum"] += float(value)
                 steps += 1
 
             success = bool(
@@ -261,6 +339,7 @@ def main() -> None:
                     "reward": total_reward,
                     "steps": steps,
                     "success": success,
+                    "reward_metric_sums": reward_metric_sums,
                     "final_info": final_info,
                 }
             )
@@ -283,6 +362,29 @@ def main() -> None:
         for item in episodes
     )
 
+    evaluation_metrics = {
+        summary_key: value
+        for key, summary_key in EVALUATION_METRICS.items()
+        if (value := _mean_final_metric(episodes, key)) is not None
+    }
+    evaluation_metrics.update(
+        {
+            f"mean_{key}_sum": mean(
+                float(item["reward_metric_sums"][f"{key}_sum"])
+                for item in episodes
+            )
+            for key in STEP_REWARD_METRICS
+        }
+    )
+    evaluation_metrics["contact_search_trigger_counts"] = dict(
+        Counter(
+            str(item["final_info"].get("contact_search_trigger", "unknown"))
+            for item in episodes
+        )
+    )
+
+    episode_csv_file = result_file.with_suffix(".csv")
+
     summary = {
         "model_path": str(model_path),
         "xml_path": str(xml_path),
@@ -301,6 +403,8 @@ def main() -> None:
             int(item["steps"])
             for item in episodes
         ),
+        "evaluation_metrics": evaluation_metrics,
+        "episode_csv_path": str(episode_csv_file),
         "episodes": episodes,
     }
 
@@ -317,6 +421,8 @@ def main() -> None:
         ),
         encoding="utf-8",
     )
+
+    _write_episode_csv(episode_csv_file, episodes)
 
     public_summary = {
         key: value
@@ -335,6 +441,10 @@ def main() -> None:
     print(
         f"[evaluate] résultat détaillé : "
         f"{result_file}"
+    )
+    print(
+        f"[evaluate] résumé CSV par épisode : "
+        f"{episode_csv_file}"
     )
 
 
