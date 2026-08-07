@@ -1,206 +1,53 @@
 name: mujoco-assembly-rl
-
-x-common-environment: &common-environment
-  PYTHONPATH: /workspace
-  PYTHONUNBUFFERED: "1"
-  PYTHONFAULTHANDLER: "1"
-  PYTHONDONTWRITEBYTECODE: "1"
-
-  MUJOCO_XML_PATH: /data/input/scene.xml
-  PATHS_DIR: /data/input/chemin
-  ASSEMBLY_PART: "${ASSEMBLY_PART:-part_1}"
-  SKIP_ENV_CHECK: "${SKIP_ENV_CHECK:-0}"
-  OUTPUT_DIR: /data/output
-  MUJOCO_GL: egl
-
-  # Désactive les mécanismes torch.compile/Dynamo.
-  # SAC utilise ici l'exécution PyTorch classique.
-  TORCHDYNAMO_DISABLE: "1"
-
-  OMP_NUM_THREADS: "1"
-  MKL_NUM_THREADS: "1"
-  OPENBLAS_NUM_THREADS: "1"
-  NUMEXPR_NUM_THREADS: "1"
-
-x-common-service: &common-service
-  image: mujoco-assembly-rl:gpu
-
-  build:
-    context: .
-    dockerfile: Dockerfile
-    args:
-      APP_UID: "${HOST_UID:-1000}"
-      APP_GID: "${HOST_GID:-1000}"
-
+x-base: &base
+  build: .
   working_dir: /workspace
-
-  init: true
-  shm_size: "2gb"
-
+  gpus: all
   volumes:
-    # Code modifiable sans reconstruire l'image.
-    - ./src:/workspace/src
-
-    # Modèles et données d'entrée en lecture seule.
+    - ./:/workspace
     - ./data/input:/data/input:ro
-
-    # Modèles entraînés, checkpoints et logs persistants.
-    - ./data/output:/data/output
-
+    - ./data/output:/workspace/data/output
   environment:
-    <<: *common-environment
-
-  restart: "no"
-
-
+    PYTHONPATH: /workspace
+    MUJOCO_GL: egl
+    NVIDIA_VISIBLE_DEVICES: all
+    NVIDIA_DRIVER_CAPABILITIES: compute,utility,graphics
 services:
   train:
-    <<: *common-service
-
-    # Nécessite Docker Compose 2.30 ou plus récent.
-    gpus: all
-
-    environment:
-      <<: *common-environment
-
-      NVIDIA_VISIBLE_DEVICES: all
-      NVIDIA_DRIVER_CAPABILITIES: compute,utility,graphics
-
-      SB3_DEVICE: "${SB3_DEVICE:-cuda}"
-      BUFFER_SIZE: "${BUFFER_SIZE:-50000}"
-      BATCH_SIZE: "${BATCH_SIZE:-256}"
-
-    command:
-      - python
-      - -u
-      - -X
-      - faulthandler
-      - -m
-      - src.train
-      - --timesteps
-      - "${TOTAL_TIMESTEPS:-500000}"
-      - --seed
-      - "${SEED:-7}"
-      - --checkpoint-freq
-      - "${CHECKPOINT_FREQ:-50000}"
-      - --learning-starts
-      - "${LEARNING_STARTS:-5000}"
-      - --log-freq
-      - "${LOG_FREQ:-250}"
-
-
+    <<: *base
+    command: python -m src.train --config ${CONFIG:-configs/test1.yaml} --timesteps ${TOTAL_TIMESTEPS:-500000} --run ${RUN_NAME:-test1}
   evaluate:
-    <<: *common-service
-
-    gpus: all
-
-    # Accès au serveur X11 de l'hôte pour afficher la fenêtre MuJoCo.
-    # Nécessite d'avoir autorisé l'accès côté hôte, par exemple :
-    #   xhost +local:root      (ou +local:docker)
+    <<: *base
+    command: python -m src.evaluate --run data/output/${RUN_NAME:-test1} --episodes ${EVAL_EPISODES:-20}
+  evaluate-gui:
+    <<: *base
     volumes:
-      - ./src:/workspace/src
+      - ./:/workspace
       - ./data/input:/data/input:ro
-      - ./data/output:/data/output
+      - ./data/output:/workspace/data/output
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
-
     environment:
-      <<: *common-environment
-
+      PYTHONPATH: /workspace
+      MUJOCO_GL: glfw
+      DISPLAY: ${DISPLAY:-:0}
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility,graphics
-
-      SB3_DEVICE: "${SB3_DEVICE:-cuda}"
-      EVAL_EPISODES: "${EVAL_EPISODES:-10}"
-      EVAL_RENDER: "${EVAL_RENDER:-human}"
-
-      # Pour un rendu "human" MuJoCo, il faut utiliser GLFW (fenêtre X11)
-      # plutôt que EGL (offscreen).
-      MUJOCO_GL: "${MUJOCO_GL:-glfw}"
-      DISPLAY: "${DISPLAY:-:0}"
-      QT_X11_NO_MITSHM: "1"
-
-
-    command:
-
-      - python
-      - -u
-      - -X
-      - faulthandler
-      - -m
-      - src.evaluate
-      - --episodes
-      - "${EVAL_EPISODES:-10}"
-      - --render
-      - "${EVAL_RENDER:-human}"
-
-
-  evaluate-nominal:
-    <<: *common-service
-
-    # Baseline déterministe : aucun modèle SAC n'est chargé et l'action
-    # résiduelle reste nulle. Le seuil dur de sécurité reste actif.
-    environment:
-      <<: *common-environment
-
-      NOMINAL_EPISODES: "${NOMINAL_EPISODES:-5}"
-      NOMINAL_SEED: "${NOMINAL_SEED:-100}"
-      NOMINAL_RENDER: "${NOMINAL_RENDER:-none}"
-      NOMINAL_PROGRESS_SPEED: "${NOMINAL_PROGRESS_SPEED:-0.25}"
-
-    command:
-      - python
-      - -u
-      - -X
-      - faulthandler
-      - -m
-      - src.evaluate_nominal
-      - --episodes
-      - "${NOMINAL_EPISODES:-5}"
-      - --seed
-      - "${NOMINAL_SEED:-100}"
-      - --render
-      - "${NOMINAL_RENDER:-none}"
-      - --progress-speed
-      - "${NOMINAL_PROGRESS_SPEED:-0.25}"
-
-
-  test-env-colision:
-    <<: *common-service
-
-    profiles: ["gui"]
-
+    command: python -m src.evaluate --run data/output/${RUN_NAME:-test1} --episodes ${EVAL_EPISODES:-20} --render --render-speed ${RENDER_SPEED:-1.0}
+  debug:
+    <<: *base
     volumes:
-      - ./src:/workspace/src
+      - ./:/workspace
       - ./data/input:/data/input:ro
-      - ./data/output:/data/output
+      - ./data/output:/workspace/data/output
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
-
     environment:
-      <<: *common-environment
-
-      MUJOCO_GL: "${MUJOCO_GL:-glfw}"
-      DISPLAY: "${DISPLAY:-:0}"
-      QT_X11_NO_MITSHM: "1"
-
-    command:
-      - python
-      - -u
-      - -m
-      - src.test_env_colision
-      - --viewer
-
-
+      PYTHONPATH: /workspace
+      MUJOCO_GL: glfw
+      DISPLAY: ${DISPLAY:-:0}
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,graphics
+    command: python -m src.debug --config ${CONFIG:-configs/test0.yaml}
   tensorboard:
-    <<: *common-service
-
-    ports:
-      - "${TENSORBOARD_PORT:-6006}:6006"
-
-    command:
-      - tensorboard
-      - --logdir
-      - /data/output/tensorboard
-      - --host
-      - 0.0.0.0
-      - --port
-      - "6006"
+    <<: *base
+    ports: ["${TENSORBOARD_PORT:-6006}:6006"]
+    command: tensorboard --logdir data/output --host 0.0.0.0

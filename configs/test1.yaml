@@ -1,0 +1,2 @@
+# SAC minimal: perception parfaite et pose initiale fixe.
+extends: test0.yaml

@@ -35,6 +35,7 @@ RUN python -c "import mujoco; from pathlib import Path; p = Path(mujoco.__file__
 RUN mkdir -p /data/input /data/output
 
 COPY src /workspace/src
+COPY configs /workspace/configs
 COPY data/input /data/input
 
 CMD ["python", "-u", "-X", "faulthandler", "-m", "src.train"]

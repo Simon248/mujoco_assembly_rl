@@ -1,0 +1,50 @@
+# Test 0: validation mécanique et commande manuelle. Les unités sont SI.
+case: tenon_1                 # tenon_1 (tenon_visual.stl) ou tenon_2 (tenon-2.stl)
+simulation:
+  timestep: 0.002
+  control_dt: 0.02
+  max_episode_steps: 300
+target_pose_fixed_to_mobile:
+  position: [0.0, 0.0, 0.0]
+  orientation_quat: [1.0, 0.0, 0.0, 0.0] # w, x, y, z
+initial_pose_fixed_to_mobile:
+  position: [0.0, 0.0, 0.04]
+  orientation_quat: [1.0, 0.0, 0.0, 0.0]
+randomization:
+  mobile_translation: [0.0, 0.0, 0.0]
+  mobile_rotation_deg: [0.0, 0.0, 0.0]
+  fixed_translation: [0.0, 0.0, 0.0]
+  fixed_rotation_deg: [0.0, 0.0, 0.0]
+  friction_scale: [1.0, 1.0]
+perception:
+  translation_bias: [0.0, 0.0, 0.0]
+  rotation_bias_deg: [0.0, 0.0, 0.0]
+  translation_noise_std: 0.0
+  rotation_noise_std_deg: 0.0
+  wrench_noise_std: [0, 0, 0, 0, 0, 0]
+action:
+  max_translation_step: 0.003
+  max_rotation_step_deg: 3.0
+admittance:
+  mass: [2.0, 2.0, 2.0, 0.08, 0.08, 0.08]
+  damping: [80, 80, 80, 2.0, 2.0, 2.0]
+  stiffness: [600, 600, 600, 15, 15, 15]
+  max_offset: [0.008, 0.008, 0.008, 0.15, 0.15, 0.15]
+success:
+  position_tolerance: 0.003
+  rotation_tolerance_deg: 4.0
+  max_force: 100.0
+  max_torque: 10.0
+  workspace_radius: 0.20
+reward:
+  position_weight: 20.0
+  orientation_weight: 2.0
+  progress_weight: 10.0
+  force_weight: 0.01
+  action_weight: 0.01
+  success_bonus: 100.0
+observation:
+  position_scale: 0.05
+  rotation_scale: 0.5
+  force_scale: 50.0
+  torque_scale: 5.0

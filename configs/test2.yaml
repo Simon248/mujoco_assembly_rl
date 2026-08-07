@@ -1,0 +1,4 @@
+extends: test0.yaml
+randomization:
+  mobile_translation: [0.005, 0.005, 0.005]
+  mobile_rotation_deg: [5.0, 5.0, 5.0]
