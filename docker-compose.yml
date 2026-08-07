@@ -7,6 +7,9 @@ x-common-environment: &common-environment
   PYTHONDONTWRITEBYTECODE: "1"
 
   MUJOCO_XML_PATH: /data/input/scene.xml
+  PATHS_DIR: /data/input/chemin
+  ASSEMBLY_PART: "${ASSEMBLY_PART:-part_1}"
+  SKIP_ENV_CHECK: "${SKIP_ENV_CHECK:-0}"
   OUTPUT_DIR: /data/output
   MUJOCO_GL: egl
 
@@ -108,7 +111,7 @@ services:
 
       SB3_DEVICE: "${SB3_DEVICE:-cuda}"
       EVAL_EPISODES: "${EVAL_EPISODES:-10}"
-      EVAL_RENDER: "${EVAL_RENDER:-none}"
+      EVAL_RENDER: "${EVAL_RENDER:-human}"
 
       # Pour un rendu "human" MuJoCo, il faut utiliser GLFW (fenêtre X11)
       # plutôt que EGL (offscreen).
@@ -128,7 +131,7 @@ services:
       - --episodes
       - "${EVAL_EPISODES:-10}"
       - --render
-      - "${EVAL_RENDER:-none}"
+      - "${EVAL_RENDER:-human}"
 
 
   test-env-colision:

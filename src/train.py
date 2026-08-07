@@ -64,13 +64,13 @@ class ConsoleProgressCallback(BaseCallback):
         if infos:
             self._last_info = dict(infos[-1])
             for key in (
-                "position_error_m",
-                "lateral_error_m",
-                "rotation_error_rad",
+                "path_progress",
+                "final_position_error_m",
+                "final_rotation_error_rad",
                 "force_norm_N",
-                "curriculum_stage",
-                "curriculum_success_rate",
-                "is_disassembly",
+                "torque_norm_Nm",
+                "contact_impulse_Ns",
+                "unsafe_contact",
             ):
                 if key in self._last_info:
                     self.logger.record(f"assembly/{key}", self._last_info[key])
@@ -96,7 +96,7 @@ class ConsoleProgressCallback(BaseCallback):
 
             if self._last_info:
                 position_error = self._last_info.get(
-                    "position_error_m",
+                    "final_position_error_m",
                     float("nan"),
                 )
 
@@ -113,8 +113,9 @@ class ConsoleProgressCallback(BaseCallback):
                 )
 
                 extra = (
-                    f" | erreur={position_error:.4f} m"
+                    f" | err. finale={position_error:.4f} m"
                     f" | force={force_norm:.1f} N"
+                    f" | s={self._last_info.get('path_progress', float('nan')):.2f}"
                     f" | succès={success}"
                 )
 
@@ -146,6 +147,17 @@ def parse_args() -> argparse.Namespace:
             "MUJOCO_XML_PATH",
             "/data/input/scene.xml",
         ),
+    )
+    parser.add_argument(
+        "--part",
+        choices=("part_1", "part_2", "part_3"),
+        default=os.environ.get("ASSEMBLY_PART", "part_1"),
+        help="Pièce active ; les modèles et métriques sont séparés par pièce.",
+    )
+    parser.add_argument(
+        "--paths-dir",
+        type=Path,
+        default=_path_from_env("PATHS_DIR", "/data/input/chemin"),
     )
 
     parser.add_argument(
@@ -215,6 +227,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip-env-check",
         action="store_true",
+        default=os.environ.get("SKIP_ENV_CHECK", "0") == "1",
     )
 
     return parser.parse_args()
@@ -229,11 +242,16 @@ def write_metadata(
     seed: int,
     model_path: Path,
     completed: bool,
+    part_name: str,
+    paths_dir: Path,
 ) -> None:
     metadata = {
         "algorithm": "SAC",
-        "task": "chandelier_cad_assembly",
-        "action_space": "[dx, dy, dz, droll, dpitch, dyaw]",
+        "task": "chandelier_residual_tactile_place",
+        "part_name": part_name,
+        "paths_dir": str(paths_dir),
+        "action_space": "[vx_res, vy_res, vz_res, wx_res, wy_res, wz_res, progress_rate]",
+        "control_mode": "geometric_place_path + fixed_admittance + tactile_residual_sac",
         "cad_collision": "MuJoCo SDF generated from the original STL meshes",
         "xml_path": str(xml_path),
         "timesteps_requested": timesteps_requested,
@@ -255,7 +273,8 @@ def main() -> None:
     args = parse_args()
 
     xml_path = args.xml.resolve()
-    output_dir = args.output_dir.resolve()
+    output_dir = args.output_dir.resolve() / args.part
+    paths_dir = args.paths_dir.resolve()
 
     if not xml_path.is_file():
         raise FileNotFoundError(
@@ -301,6 +320,8 @@ def main() -> None:
     print("[train] configuration", flush=True)
     print(f"[train] XML             : {xml_path}", flush=True)
     print(f"[train] sortie          : {output_dir}", flush=True)
+    print(f"[train] pièce           : {args.part}", flush=True)
+    print(f"[train] chemins          : {paths_dir}", flush=True)
     print(f"[train] timesteps       : {args.timesteps}", flush=True)
     print(
         f"[train] learning_starts : {args.learning_starts}",
@@ -325,7 +346,7 @@ def main() -> None:
             flush=True,
         )
 
-        test_env = AssemblyEnv(xml_path)
+        test_env = AssemblyEnv(xml_path, part_name=args.part, paths_dir=paths_dir)
 
         check_env(
             test_env,
@@ -340,17 +361,31 @@ def main() -> None:
         )
 
     env = Monitor(
-        AssemblyEnv(xml_path),
+        AssemblyEnv(xml_path, part_name=args.part, paths_dir=paths_dir),
         filename=str(
             monitor_dir / "train"
         ),
         info_keywords=(
             "is_success",
-            "position_error_m",
-            "lateral_error_m",
-            "rotation_error_rad",
+            "path_progress",
+            "final_position_error_m",
+            "final_rotation_error_rad",
             "force_norm_N",
-            "is_disassembly",
+            "torque_norm_Nm",
+            "contact_impulse_Ns",
+            "unsafe_contact",
+            "max_force_N",
+            "max_torque_Nm",
+            "terminated",
+            "truncated",
+            "termination_reason",
+            "control_mode",
+            "recovery_count",
+            "recovery_duration_s",
+            "stuck_detected",
+            "forced_retreat",
+            "recovery_failed",
+            "soft_torque_stop",
         ),
     )
 
@@ -440,6 +475,8 @@ def main() -> None:
             seed=args.seed,
             model_path=final_model_path,
             completed=True,
+            part_name=args.part,
+            paths_dir=paths_dir,
         )
 
         print(
@@ -468,6 +505,8 @@ def main() -> None:
             seed=args.seed,
             model_path=interrupted_model_path,
             completed=False,
+            part_name=args.part,
+            paths_dir=paths_dir,
         )
 
         print(

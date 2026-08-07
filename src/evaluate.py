@@ -31,6 +31,16 @@ def parse_args() -> argparse.Namespace:
             "/data/input/scene.xml",
         ),
     )
+    parser.add_argument(
+        "--part",
+        choices=("part_1", "part_2", "part_3"),
+        default=os.environ.get("ASSEMBLY_PART", "part_1"),
+    )
+    parser.add_argument(
+        "--paths-dir",
+        type=Path,
+        default=_path_from_env("PATHS_DIR", "/data/input/chemin"),
+    )
 
     parser.add_argument(
         "--output-dir",
@@ -89,7 +99,7 @@ def parse_args() -> argparse.Namespace:
         ),
         default=os.environ.get(
             "EVAL_RENDER",
-            "none",
+            "human",
         ),
     )
 
@@ -142,9 +152,11 @@ def main() -> None:
     args = parse_args()
 
     xml_path = args.xml.resolve()
-    output_dir = args.output_dir.resolve()
+    output_dir = args.output_dir.resolve() / args.part
     requested_model_path = args.model.resolve()
-    result_file = args.result_file.resolve()
+    raw_result_file = args.result_file.resolve()
+    result_file = raw_result_file.parent / args.part / raw_result_file.name
+    paths_dir = args.paths_dir.resolve()
 
     if not xml_path.is_file():
         raise FileNotFoundError(
@@ -187,8 +199,8 @@ def main() -> None:
     env = AssemblyEnv(
         xml_path,
         render_mode=render_mode,
-        curriculum_enabled=False,
-        disassembly_probability=0.0,
+        part_name=args.part,
+        paths_dir=paths_dir,
     )
 
 
@@ -274,6 +286,8 @@ def main() -> None:
     summary = {
         "model_path": str(model_path),
         "xml_path": str(xml_path),
+        "part_name": args.part,
+        "paths_dir": str(paths_dir),
         "episode_count": len(episodes),
         "success_count": successes,
         "success_rate": (

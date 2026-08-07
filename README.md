@@ -1,3 +1,8 @@
+
+# usefull cmd  
+```ASSEMBLY_PART=part_1 TOTAL_TIMESTEPS=150000 LEARNING_STARTS=5000 docker compose run --rm train```  
+```ASSEMBLY_PART=part_3 docker compose run --rm evaluate```  
+
 # MuJoCo Assembly RL — version Docker
 
 Ce projet entraîne une politique SAC sur l'assemblage CAD de deux pièces dans
@@ -125,7 +130,45 @@ ou :
 make build
 ```
 
-## Entraînement
+## Entraînement residual RL tactile
+
+L'environnement entraîne désormais un residual SAC sur le segment `place`
+d'une pièce donnée. La trajectoire YAML devient un chemin géométrique : la
+politique choisit une progression (avance, arrêt ou recul) et une vitesse
+cartésienne résiduelle. Les efforts traversent une admittance fixe ; les
+erreurs de prise et de gabarit sont physiques mais cachées à la politique.
+
+Choisir la pièce avec `ASSEMBLY_PART` (`part_1`, `part_2` ou `part_3`). Les
+modèles et rapports sont enregistrés sous `data/output/<pièce>/`.
+
+```bash
+ASSEMBLY_PART=part_2 TOTAL_TIMESTEPS=500000 docker compose run --rm train
+ASSEMBLY_PART=part_2 docker compose run --rm evaluate
+```
+
+L'action est `[vx_res, vy_res, vz_res, wx_res, wy_res, wz_res, progression]`.
+Les limites d'admittance, de force et de correction sont regroupées dans
+`ResidualConfig` de `src/assembly_env.py`.
+
+L'évaluation affiche maintenant par défaut le viewer **MuJoCo** (le projet
+n'utilise pas Gazebo). Pour une exécution sans fenêtre, notamment sur une
+machine sans serveur X11 :
+
+```bash
+EVAL_RENDER=none docker compose run --rm evaluate
+```
+
+Le prétraitement SDF des STL est fait au chargement d'un modèle MuJoCo. Le
+plugin `mujoco.sdf.sdflib` fourni par MuJoCo 3.1.4 ne fournit pas de cache SDF
+persistant sur disque ; monter `data/output` ne peut donc pas éviter ce calcul
+entre deux conteneurs. En entraînement, la validation Gym crée un environnement
+supplémentaire. Après une première validation réussie, elle peut être évitée :
+
+```bash
+SKIP_ENV_CHECK=1 docker compose run --rm train
+```
+
+## Entraînement (commandes)
 
 ```bash
 docker compose run --rm train
