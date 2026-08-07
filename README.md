@@ -20,21 +20,33 @@ les CAD actuels utilisent l'identité.
 
 ```bash
 make build
+make test
 make debug                         # Test 0, repères MuJoCo et commande manuelle
-CONFIG=configs/test1.yaml RUN_NAME=test1 make train
-RUN_NAME=test1 make evaluate
-RUN_NAME=test1 EVAL_EPISODES=1 make evaluate-gui  # viewer MuJoCo via X11
+CONFIG=configs/test1.yaml RUN_NAME=test1_v2 make train
+RUN_NAME=test1_v2 make evaluate
+RUN_NAME=test1_v2 EVAL_EPISODES=1 make evaluate-gui  # viewer MuJoCo via X11
 # Lecture au quart de la vitesse réelle :
-RUN_NAME=test1 EVAL_EPISODES=1 RENDER_SPEED=0.25 make evaluate-gui
+RUN_NAME=test1_v2 EVAL_EPISODES=1 RENDER_SPEED=0.25 make evaluate-gui
 make tensorboard                   # http://localhost:6006
 ```
 
 `make debug` et `make evaluate-gui` utilisent X11 et ouvrent le viewer MuJoCo. Selon l'hôte, il peut être
 nécessaire d'autoriser Docker temporairement avec `xhost +local:root`.
 
-Chaque entraînement est isolé dans `data/output/<RUN_NAME>/`: `config.yaml`,
-`monitor.csv`, événements TensorBoard, checkpoints, modèle final et résultats
-d'évaluation CSV/JSON.
+Chaque entraînement est isolé dans `data/output/<RUN_NAME>/`. Outre le modèle,
+les checkpoints et les métriques, le run archive le YAML résolu, les versions,
+les empreintes des CAD/grasp poses et un snapshot du code source. La gestion
+des commits et du versionnement Git reste volontairement externe au pipeline.
+
+Pour comparer explicitement deux checkpoints sans mélanger leurs résultats :
+
+```bash
+RUN_NAME=test1_v2 MODEL_PATH=checkpoints/sac_50000_steps.zip make evaluate
+RUN_NAME=test1_v2 MODEL_PATH=checkpoints/sac_100000_steps.zip make evaluate
+```
+
+Les fichiers sont écrits sous `evaluations/<nom_du_modèle>_{episodes,trajectory}.csv`
+et `evaluations/<nom_du_modèle>_summary.json` avec le SHA-256 du modèle.
 
 ## Fichiers importants
 
@@ -46,6 +58,8 @@ d'évaluation CSV/JSON.
 - [src/wrench.py](src/wrench.py) somme les forces de contact et transporte les
   couples au grasp frame; ce n'est pas un simple capteur de site.
 - [src/admittance.py](src/admittance.py) est testable indépendamment du RL.
+- [src/task_logic.py](src/task_logic.py) impose un succès sûr, les raisons de
+  terminaison et la pénalité terminale de sécurité.
 - [src/debug.py](src/debug.py) est la validation mécanique obligatoire avant
   l'entraînement.
 
@@ -54,3 +68,8 @@ La conversion `.001` s'applique donc uniquement à la position du grasp dans
 `assembly_env.py`.
 Les rotations sont toujours composées sous forme de quaternion/rotation-vector,
 jamais en ajoutant du bruit à un quaternion.
+
+Les seuils de force/couple sont contrôlés à chaque sous-pas MuJoCo. Un état
+géométriquement assemblé ne compte comme succès que s'il respecte simultanément
+les limites de sécurité. Les colonnes `episode_reward_*` du monitoring sont les
+sommes par épisode; `reward_*` reste la valeur du dernier pas pour le diagnostic.

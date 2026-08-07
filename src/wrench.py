@@ -19,11 +19,11 @@ def contact_wrench_at_site(model: mujoco.MjModel, data: mujoco.MjData, mobile_ge
         contact = data.contact[index]
         if mobile_geom not in (contact.geom1, contact.geom2): continue
         mujoco.mj_contactForce(model, data, index, buffer)
-        # The contact frame has its normal as x-axis. MuJoCo returns the force
-        # in this local frame; frame columns map it to world coordinates.
+        # MuJoCo stocke exceptionnellement les axes du contact sur les lignes
+        # de frame. La transformation contact -> monde est donc sa transposée.
         contact_rotation = contact.frame.reshape(3, 3)
-        force = contact_rotation @ buffer[:3]
-        torque = contact_rotation @ buffer[3:]
+        force = contact_rotation.T @ buffer[:3]
+        torque = contact_rotation.T @ buffer[3:]
         # mj_contactForce convention is force on geom2.
         if contact.geom1 == mobile_geom: force, torque = -force, -torque
         total_force += force

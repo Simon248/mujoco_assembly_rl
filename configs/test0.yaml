@@ -23,13 +23,15 @@ perception:
   rotation_noise_std_deg: 0.0
   wrench_noise_std: [0, 0, 0, 0, 0, 0]
 action:
-  max_translation_step: 0.003
-  max_rotation_step_deg: 3.0
+  # 1 mm et 1° par décision à 50 Hz pour limiter les impacts au Test 1.
+  max_translation_step: 0.001
+  max_rotation_step_deg: 1.0
 admittance:
   mass: [2.0, 2.0, 2.0, 0.08, 0.08, 0.08]
   damping: [80, 80, 80, 2.0, 2.0, 2.0]
   stiffness: [600, 600, 600, 15, 15, 15]
   max_offset: [0.008, 0.008, 0.008, 0.15, 0.15, 0.15]
+  max_velocity: [0.02, 0.02, 0.02, 0.25, 0.25, 0.25]
 success:
   position_tolerance: 0.003
   rotation_tolerance_deg: 4.0
@@ -43,6 +45,9 @@ reward:
   force_weight: 0.01
   action_weight: 0.01
   success_bonus: 100.0
+  # Plus coûteux qu'un timeout immobile (~ -240) : l'agent n'a aucun intérêt
+  # à provoquer volontairement un arrêt de sécurité rapide.
+  unsafe_penalty: 300.0
 observation:
   position_scale: 0.05
   rotation_scale: 0.5

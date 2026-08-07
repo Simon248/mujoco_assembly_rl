@@ -46,6 +46,25 @@ def load_config(path: str | Path) -> dict[str, Any]:
     missing = required - cfg.keys()
     if missing: raise ValueError(f"Configuration incomplète ({path}): {sorted(missing)}")
     if cfg["case"] not in {"tenon_1", "tenon_2"}: raise ValueError("case doit être tenon_1 ou tenon_2")
+    required_fields = {
+        "admittance": {"mass", "damping", "stiffness", "max_offset", "max_velocity"},
+        "reward": {
+            "position_weight", "orientation_weight", "progress_weight",
+            "force_weight", "action_weight", "success_bonus", "unsafe_penalty",
+        },
+        "randomization": {"friction_scale"},
+    }
+    for section, fields in required_fields.items():
+        values = cfg.get(section)
+        absent = fields if not isinstance(values, dict) else fields - values.keys()
+        if absent:
+            raise ValueError(
+                f"Configuration obsolète ou incomplète ({path}): "
+                f"{section} doit définir {sorted(absent)}. Relancez un nouvel essai."
+            )
+    friction_range = cfg["randomization"]["friction_scale"]
+    if len(friction_range) != 2 or friction_range[0] <= 0 or friction_range[0] > friction_range[1]:
+        raise ValueError("randomization.friction_scale doit être [min, max] avec 0 < min <= max")
     return cfg
 
 
