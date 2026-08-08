@@ -73,14 +73,24 @@ def reward_components(
     action: np.ndarray,
     status: TaskStatus,
     config: dict,
+    action_config: dict,
 ) -> dict[str, float]:
     """Calcule les composantes interprétables du reward sur vérité terrain."""
-    previous = previous_position_error + 0.1 * previous_rotation_error
-    current = position_error + 0.1 * rotation_error
+    position_progress = previous_position_error - position_error
+    normalized_position_progress = (
+        position_progress / float(action_config["max_translation_step"])
+    )
+    rotation_progress = previous_rotation_error - rotation_error
+    normalized_rotation_progress = (
+        rotation_progress
+        / np.deg2rad(float(action_config["max_rotation_step_deg"]))
+    )
     return {
         "reward_position": -float(config["position_weight"]) * position_error,
         "reward_orientation": -float(config["orientation_weight"]) * rotation_error,
-        "reward_progress": float(config["progress_weight"]) * (previous - current),
+        "reward_progress": float(config["progress_weight"]) * (
+            normalized_position_progress + normalized_rotation_progress
+        ),
         "reward_force": -float(config["force_weight"]) * max_force,
         "reward_action": -float(config["action_weight"]) * float(np.dot(action, action)),
         "reward_success": float(config["success_bonus"]) if status.success else 0.0,

@@ -1,0 +1,4 @@
+# Rééquilibrage A/B de la reward de progrès par rapport au run test1V3.
+extends: test1.yaml
+reward:
+  progress_weight: 2.5

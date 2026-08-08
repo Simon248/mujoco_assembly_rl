@@ -4,6 +4,12 @@ simulation:
   timestep: 0.002
   control_dt: 0.02
   max_episode_steps: 300
+training:
+  n_envs: 16
+  base_seed: 7
+  checkpoint_freq: 50000
+  ent_coef: auto
+  target_entropy: auto
 target_pose_fixed_to_mobile:
   position: [0.0, 0.0, 0.0]
   orientation_quat: [1.0, 0.0, 0.0, 0.0] # w, x, y, z
@@ -23,6 +29,8 @@ perception:
   rotation_noise_std_deg: 0.0
   wrench_noise_std: [0, 0, 0, 0, 0, 0]
 action:
+  # grasp = comportement historique; task = incréments dans les axes CAD cibles.
+  action_frame: grasp
   # 1 mm et 1° par décision à 50 Hz pour limiter les impacts au Test 1.
   max_translation_step: 0.001
   max_rotation_step_deg: 1.0

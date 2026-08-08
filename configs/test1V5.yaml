@@ -1,0 +1,4 @@
+# Même expérience que test1V4, avec les actions exprimées dans le repère CAD.
+extends: test1V4.yaml
+action:
+  action_frame: task

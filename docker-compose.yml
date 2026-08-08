@@ -1,6 +1,7 @@
 name: mujoco-assembly-rl
 x-base: &base
   build: .
+  init: true
   working_dir: /workspace
   gpus: all
   volumes:
@@ -13,7 +14,10 @@ x-base: &base
     NVIDIA_VISIBLE_DEVICES: all
     NVIDIA_DRIVER_CAPABILITIES: compute,utility,graphics
     MODEL_PATH: ${MODEL_PATH:-}
+    MODEL_PATHS: ${MODEL_PATHS:-}
     EVAL_RESULT_NAME: ${EVAL_RESULT_NAME:-}
+    EVAL_ALL_CHECKPOINTS: ${EVAL_ALL_CHECKPOINTS:-}
+    EVAL_TRAJECTORY: ${EVAL_TRAJECTORY:-}
 services:
   train:
     <<: *base
@@ -35,7 +39,10 @@ services:
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility,graphics
       MODEL_PATH: ${MODEL_PATH:-}
+      MODEL_PATHS: ${MODEL_PATHS:-}
       EVAL_RESULT_NAME: ${EVAL_RESULT_NAME:-}
+      EVAL_ALL_CHECKPOINTS: ${EVAL_ALL_CHECKPOINTS:-}
+      EVAL_TRAJECTORY: ${EVAL_TRAJECTORY:-}
     command: python -m src.evaluate --run data/output/${RUN_NAME:-test1} --episodes ${EVAL_EPISODES:-20} --render --render-speed ${RENDER_SPEED:-1.0}
   debug:
     <<: *base

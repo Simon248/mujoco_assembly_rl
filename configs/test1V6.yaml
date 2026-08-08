@@ -1,0 +1,4 @@
+# Même expérience que test1V5, avec une target entropy SAC moins négative.
+extends: test1V5.yaml
+training:
+  target_entropy: -3.0

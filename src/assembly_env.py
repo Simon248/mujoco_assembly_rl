@@ -21,6 +21,34 @@ from src.wrench import contact_wrench_at_site
 
 ROOT = Path(__file__).resolve().parents[1]
 
+
+def advance_grasp_reference(
+    grasp_reference: tuple[np.ndarray, np.ndarray],
+    task_to_grasp: tuple[np.ndarray, np.ndarray],
+    delta_pose: tuple[np.ndarray, np.ndarray],
+    action_frame: str,
+    task_target: tuple[np.ndarray, np.ndarray] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Applique un delta au grasp historique ou dans les axes du CAD cible."""
+    if action_frame == "grasp":
+        return compose(grasp_reference, delta_pose)
+    if action_frame == "task":
+        if task_target is None:
+            raise ValueError("task_target est requis avec action_frame='task'")
+        task_reference = compose(grasp_reference, inverse(task_to_grasp))
+        reference_in_target = relative(task_target, task_reference)
+        desired_in_target = (
+            reference_in_target[0] + delta_pose[0],
+            compose(
+                (np.zeros(3), delta_pose[1]),
+                (np.zeros(3), reference_in_target[1]),
+            )[1],
+        )
+        task_desired = compose(task_target, desired_in_target)
+        return compose(task_desired, task_to_grasp)
+    raise ValueError("action.action_frame doit être 'task' ou 'grasp'")
+
+
 class TenonMortaiseEnv(gym.Env):
     metadata = {"render_modes": ["human"], "render_fps": 50}
     def __init__(self, config_path: str | Path = "configs/test1.yaml", render_mode: str | None = None,
@@ -32,6 +60,7 @@ class TenonMortaiseEnv(gym.Env):
         self.control_dt = float(self.cfg["simulation"]["control_dt"])
         self.frame_skip = round(self.control_dt / self.cfg["simulation"]["timestep"])
         if self.frame_skip < 1: raise ValueError("control_dt doit être >= timestep")
+        self.task_to_grasp = self._load_grasp_pose()
         load_sdf_plugin()
         self.model = mujoco.MjModel.from_xml_string(self._mjcf())
         self.data = mujoco.MjData(self.model)
@@ -65,7 +94,7 @@ class TenonMortaiseEnv(gym.Env):
         mobile = "tenon_visual.stl" if self.cfg["case"] == "tenon_1" else "tenon-2.stl"
         # Les STL sont déjà exprimés en mètres. Le CSV de grasp reste en
         # millimètres et sa position est convertie dans _load_grasp_pose().
-        grasp = self._load_grasp_pose()
+        grasp = self.task_to_grasp
         p, q = grasp
         weld_p, weld_q = inverse(grasp)  # T_grasp_to_mobile pour le weld mocap.
         return f'''<mujoco model="tenon_mortaise">
@@ -160,12 +189,13 @@ class TenonMortaiseEnv(gym.Env):
     def step(self, action):
         action = np.clip(np.asarray(action,float), -1, 1); a=self.cfg["action"]
         nominal = np.r_[action[:3]*a["max_translation_step"], action[3:]*np.deg2rad(a["max_rotation_step_deg"])]
-        # SAC intègre sa propre référence cartésienne. L'admittance fournit un
-        # offset absolu autour de cette référence, jamais un incrément répété.
-        reference_p, reference_q = self.reference_pose
-        self.reference_pose = (
-            reference_p + rotate(reference_q, nominal[:3]),
-            compose((np.zeros(3), reference_q), (np.zeros(3), rotvec_to_quat(nominal[3:])))[1],
+        delta_pose = (nominal[:3], rotvec_to_quat(nominal[3:]))
+        # La policy intègre sa référence dans le repère configuré, puis la
+        # commande est ramenée analytiquement au grasp nominal.
+        task_target = compose(self._pose(self.fixed_body), self._target())
+        self.reference_pose = advance_grasp_reference(
+            self.reference_pose, self.task_to_grasp, delta_pose, a["action_frame"],
+            task_target,
         )
         observed_wrench = self._observed_wrench()
         actual_grasp_q = self._site_quat()
@@ -200,7 +230,7 @@ class TenonMortaiseEnv(gym.Env):
             position_error=pos, rotation_error=rot,
             previous_position_error=previous_pos, previous_rotation_error=previous_rot,
             max_force=step_max_force, action=action,
-            status=status, config=self.cfg["reward"],
+            status=status, config=self.cfg["reward"], action_config=a,
         )
         for key, value in components.items():
             self.episode_reward_components[key] = self.episode_reward_components.get(key, 0.0) + value
@@ -218,6 +248,18 @@ class TenonMortaiseEnv(gym.Env):
             "true_error": true_error,
             "position_error": pos,
             "rotation_error": rot,
+            "position_error_x": float(true_error[0]),
+            "position_error_y": float(true_error[1]),
+            "position_error_z": float(true_error[2]),
+            "rotation_error_x": float(true_error[3]),
+            "rotation_error_y": float(true_error[4]),
+            "rotation_error_z": float(true_error[5]),
+            "action_x": float(action[0]),
+            "action_y": float(action[1]),
+            "action_z": float(action[2]),
+            "action_rx": float(action[3]),
+            "action_ry": float(action[4]),
+            "action_rz": float(action[5]),
             "force": float(np.linalg.norm(final_wrench[:3])),
             "torque": float(np.linalg.norm(final_wrench[3:])),
             "max_force_substep": step_max_force,
