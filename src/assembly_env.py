@@ -15,10 +15,7 @@ import numpy as np
 from src.admittance import AdmittanceController
 from src.config import load_config
 from src.mujoco_plugins import load_sdf_plugin
-from src.task_logic import (
-    assess_status, newly_reached_milestones, prepare_proximity_milestones,
-    reward_components, satisfied_milestone_indices,
-)
+from src.task_logic import assess_status, pose_distance, reward_components
 from src.transforms import compose, euler_xyz_to_quat, inv, inverse, quat_to_rotvec, relative, rotvec_to_quat, rotate
 from src.wrench import contact_wrench_at_site
 
@@ -89,9 +86,6 @@ class TenonMortaiseEnv(gym.Env):
         self.free_joint = self._id(mujoco.mjtObj.mjOBJ_JOINT, "tenon_free")
         self.qadr = self.model.jnt_qposadr[self.free_joint]
         self.admittance = AdmittanceController(self.cfg["admittance"])
-        self.proximity_milestones = prepare_proximity_milestones(
-            self.cfg["reward"].get("proximity_milestones", [])
-        )
         self._contact_geom_ids = np.array([self.fixed_geom, self.mobile_geom])
         self._base_contact_friction = self.model.geom_friction[self._contact_geom_ids].copy()
         self.action_space = spaces.Box(-1., 1., (6,), dtype=np.float32)
@@ -105,13 +99,12 @@ class TenonMortaiseEnv(gym.Env):
         self.observation_space = spaces.Box(
             -np.inf, np.inf, (observation_size,), dtype=np.float32
         )
-        self.viewer = None; self.steps = 0; self.last_true_error = np.zeros(6)
+        self.viewer = None; self.steps = 0
         self.perception_bias = (np.zeros(3), np.array([1., 0., 0., 0.]))
         # État réservé au mode historique; le mode réactif n'en dépend pas.
         self.reference_pose: tuple[np.ndarray, np.ndarray] | None = None
         self.episode_max_force = 0.0; self.episode_max_torque = 0.0
         self.episode_reward_components: dict[str, float] = {}
-        self.proximity_milestones_reached: set[int] = set()
         self.friction_scale = 1.0
         # Set by the periodic evaluation callback; zero during training.
         self.training_timesteps = 0
@@ -205,15 +198,9 @@ class TenonMortaiseEnv(gym.Env):
         self.data.mocap_pos[self.model.body_mocapid[self.target_mocap]], self.data.mocap_quat[self.model.body_mocapid[self.target_mocap]] = grasp
         p = self.cfg["perception"]
         self.perception_bias = (np.array(p["translation_bias"],float), euler_xyz_to_quat(np.deg2rad(p["rotation_bias_deg"])))
-        self.last_true_error = self._error()
-        initial_position_error = float(np.linalg.norm(self.last_true_error[:3]))
-        initial_rotation_error = float(np.linalg.norm(self.last_true_error[3:]))
-        self.proximity_milestones_reached = satisfied_milestone_indices(
-            initial_position_error, initial_rotation_error,
-            self.proximity_milestones,
-        )
+        true_error = self._error()
         return self._observation(), {
-            "true_error": self.last_true_error.copy(), "friction_scale": self.friction_scale
+            "true_error": true_error, "friction_scale": self.friction_scale
         }
 
     def _site_quat(self):
@@ -241,6 +228,7 @@ class TenonMortaiseEnv(gym.Env):
 
     def step(self, action):
         action = np.clip(np.asarray(action,float), -1, 1); a=self.cfg["action"]
+        current_true_error = self._error()
         nominal = np.r_[action[:3]*a["max_translation_step"], action[3:]*np.deg2rad(a["max_rotation_step_deg"])]
         delta_pose = (nominal[:3], rotvec_to_quat(nominal[3:]))
         actual_grasp_pose = (
@@ -290,27 +278,30 @@ class TenonMortaiseEnv(gym.Env):
         self.episode_max_force = max(self.episode_max_force, step_max_force)
         self.episode_max_torque = max(self.episode_max_torque, step_max_torque)
         true_error = self._error(); pos = float(np.linalg.norm(true_error[:3])); rot = float(np.linalg.norm(true_error[3:]))
-        previous_pos = float(np.linalg.norm(self.last_true_error[:3])); previous_rot = float(np.linalg.norm(self.last_true_error[3:])); self.last_true_error = true_error
         status = assess_status(
             position_error=pos, rotation_error=rot,
             max_force=step_max_force, max_torque=step_max_torque,
             workspace_error=pos, step_count=self.steps,
             config=safety, max_episode_steps=self.cfg["simulation"]["max_episode_steps"],
         )
-        proximity_bonus, self.proximity_milestones_reached = newly_reached_milestones(
-            pos, rot, self.proximity_milestones,
-            self.proximity_milestones_reached,
+        rotation_length_scale = float(self.cfg["reward"]["rotation_length_scale"])
+        current_distance = pose_distance(
+            float(np.linalg.norm(current_true_error[:3])),
+            float(np.linalg.norm(current_true_error[3:])),
+            rotation_length_scale,
         )
+        next_distance = pose_distance(pos, rot, rotation_length_scale)
         components = reward_components(
-            position_error=pos, rotation_error=rot,
-            previous_position_error=previous_pos, previous_rotation_error=previous_rot,
+            current_pose_distance=current_distance,
+            next_pose_distance=next_distance,
+            gamma=float(self.cfg["training"]["gamma"]),
             max_force=step_max_force, action=action,
-            status=status, config=self.cfg["reward"], action_config=a,
+            status=status, config=self.cfg["reward"],
             max_torque=step_max_torque,
-            proximity_bonus=proximity_bonus,
         )
         for key, value in components.items():
-            self.episode_reward_components[key] = self.episode_reward_components.get(key, 0.0) + value
+            if key.startswith("reward_"):
+                self.episode_reward_components[key] = self.episode_reward_components.get(key, 0.0) + value
         final_wrench = self._true_wrench()
         info = {
             **components,
@@ -349,12 +340,13 @@ class TenonMortaiseEnv(gym.Env):
             "max_torque": self.episode_max_torque,
             "training_timesteps": self.training_timesteps,
             "friction_scale": self.friction_scale,
-            "proximity_milestones_reached": len(self.proximity_milestones_reached),
-            "proximity_milestones_total": len(self.proximity_milestones),
         }
         info.update({f"episode_{key}": value for key, value in self.episode_reward_components.items()})
         if self.render_mode=="human": self.render()
-        return self._observation(), float(sum(components.values())), status.terminated, status.truncated, info
+        total_reward = sum(
+            value for key, value in components.items() if key.startswith("reward_")
+        )
+        return self._observation(), float(total_reward), status.terminated, status.truncated, info
     def render(self):
         if self.viewer is None:
             import mujoco.viewer; self.viewer=mujoco.viewer.launch_passive(self.model,self.data)

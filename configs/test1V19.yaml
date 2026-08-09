@@ -1,16 +1,13 @@
-# Milestones pose complète; tous les autres paramètres viennent de V18.
+# Reward potentielle 6D continue; physique et entraînement hérités de V18.
 extends: test1V18.yaml
 reward:
-  proximity_milestones:
-    - position_threshold: 0.010
-      orientation_threshold_deg: 5.0
-      bonus: 5.0
-    - position_threshold: 0.006
-      orientation_threshold_deg: 4.0
-      bonus: 10.0
-    - position_threshold: 0.004
-      orientation_threshold_deg: 3.0
-      bonus: 20.0
-    - position_threshold: 0.002
-      orientation_threshold_deg: 2.0
-      bonus: 40.0
+  rotation_length_scale: 0.05
+  potential_scale: 10.0
+  potential_distance_scale: 0.010
+  step_penalty: 0.05
+  force_weight: 0.01
+  torque_weight: 0.08
+  action_weight: 0.01
+  success_bonus: 300.0
+  unsafe_penalty: 300.0
+  timeout_penalty: 150.0

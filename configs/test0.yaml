@@ -14,6 +14,7 @@ training:
   target_entropy: auto
   buffer_size: 50000
   learning_rate: 0.0003
+  gamma: 0.99
 evaluation:
   enabled: true
   eval_freq: 25000       # transitions globales SB3, indépendamment de n_envs

@@ -34,7 +34,7 @@ class RlAlgorithmTest(unittest.TestCase):
         self.env = DummyVecEnv([partial(TinyEnv)])
         self.base_training = {
             "algorithm": "sac", "buffer_size": 100,
-            "learning_rate": 1e-4, "ent_coef": "auto",
+            "learning_rate": 1e-4, "gamma": 0.97, "ent_coef": "auto",
             "target_entropy": "auto", "td3": {
                 "action_noise_std": 0.1, "policy_delay": 2,
                 "target_policy_noise": 0.2, "target_noise_clip": 0.5,
@@ -58,6 +58,8 @@ class RlAlgorithmTest(unittest.TestCase):
         self.assertIsInstance(td3, TD3)
         self.assertEqual(sac.policy.net_arch, [256, 256])
         self.assertEqual(td3.policy.net_arch, [256, 256])
+        self.assertEqual(sac.gamma, 0.97)
+        self.assertEqual(td3.gamma, 0.97)
         self.assertIsNone(sac.action_noise)
         self.assertEqual(td3.action_noise._sigma.shape, (6,))
         np.testing.assert_allclose(td3.action_noise._sigma, 0.1)

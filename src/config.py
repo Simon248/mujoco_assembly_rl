@@ -33,6 +33,10 @@ def load_config(path: str | Path) -> dict[str, Any]:
         cfg = yaml.safe_load(f) or {}
     if not isinstance(cfg, dict):
         raise ValueError(f"La configuration doit être un mapping YAML: {path}")
+    explicit_potential_reward = (
+        isinstance(cfg.get("reward"), dict)
+        and "potential_scale" in cfg["reward"]
+    )
     parent = cfg.pop("extends", None)
     if parent:
         parent_path = path.parent / parent
@@ -42,7 +46,11 @@ def load_config(path: str | Path) -> dict[str, Any]:
                 f"{parent!r}, introuvable à {parent_path}. "
                 "Cet essai utilise l'ancien format et doit être relancé."
             )
-        cfg = _merge(load_config(parent_path), cfg)
+        parent_config = load_config(parent_path)
+        if explicit_potential_reward:
+            # La nouvelle formulation remplace intégralement l'ancien bloc reward.
+            parent_config["reward"] = {}
+        cfg = _merge(parent_config, cfg)
     required = {"case", "target_pose_fixed_to_mobile", "initial_pose_fixed_to_mobile"}
     missing = required - cfg.keys()
     if missing: raise ValueError(f"Configuration incomplète ({path}): {sorted(missing)}")
@@ -51,7 +59,6 @@ def load_config(path: str | Path) -> dict[str, Any]:
         "action": {"max_translation_step", "max_rotation_step_deg"},
         "admittance": {"mass", "damping", "stiffness", "max_offset", "max_velocity"},
         "reward": {
-            "position_weight", "orientation_weight", "progress_weight",
             "force_weight", "action_weight", "success_bonus", "unsafe_penalty",
         },
         "randomization": {"friction_scale"},
@@ -71,44 +78,18 @@ def load_config(path: str | Path) -> dict[str, Any]:
             or torque_weight < 0 or not np.isfinite(torque_weight)):
         raise ValueError("reward.torque_weight doit être positif ou nul")
     reward = cfg["reward"]
-    milestones = reward.setdefault("proximity_milestones", [])
+    reward.setdefault("rotation_length_scale", 0.05)
+    reward.setdefault("potential_scale", 10.0)
+    reward.setdefault("potential_distance_scale", 0.010)
     reward.setdefault("step_penalty", 0.0)
     reward.setdefault("timeout_penalty", 0.0)
-    if not isinstance(milestones, list):
-        raise ValueError("reward.proximity_milestones doit être une liste")
-    for index, milestone in enumerate(milestones):
-        if not isinstance(milestone, dict):
-            raise ValueError(
-                f"reward.proximity_milestones[{index}] doit être un mapping"
-            )
-        old_keys = {"threshold", "bonus"}
-        new_keys = {"position_threshold", "orientation_threshold_deg", "bonus"}
-        keys = set(milestone)
-        if keys not in (old_keys, new_keys):
-            raise ValueError(
-                f"reward.proximity_milestones[{index}] doit utiliser soit "
-                "threshold+bonus, soit position_threshold+"
-                "orientation_threshold_deg+bonus, sans mélanger les formats"
-            )
-        threshold_keys = (
-            ("threshold",) if keys == old_keys
-            else ("position_threshold", "orientation_threshold_deg")
-        )
-        for key in threshold_keys:
-            value = milestone[key]
-            if (isinstance(value, bool) or not isinstance(value, (int, float))
-                    or value <= 0 or not np.isfinite(value)):
-                raise ValueError(
-                    f"reward.proximity_milestones[{index}].{key} "
-                    "doit être strictement positif"
-                )
-        bonus = milestone["bonus"]
-        if (isinstance(bonus, bool) or not isinstance(bonus, (int, float))
-                or bonus < 0 or not np.isfinite(bonus)):
-            raise ValueError(
-                f"reward.proximity_milestones[{index}].bonus "
-                "doit être positif ou nul"
-            )
+    for key in (
+        "rotation_length_scale", "potential_scale", "potential_distance_scale",
+    ):
+        value = reward[key]
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or value <= 0 or not np.isfinite(value)):
+            raise ValueError(f"reward.{key} doit être strictement positif")
     for key in ("step_penalty", "timeout_penalty"):
         value = reward[key]
         if (isinstance(value, bool) or not isinstance(value, (int, float))
@@ -146,6 +127,7 @@ def load_config(path: str | Path) -> dict[str, Any]:
     training.setdefault("total_timesteps", 500_000)
     training.setdefault("buffer_size", 50_000)
     training.setdefault("learning_rate", 3e-4)
+    training.setdefault("gamma", 0.99)
     td3 = training.setdefault("td3", {})
     if not isinstance(td3, dict):
         raise ValueError("training.td3 doit être un mapping")
@@ -162,6 +144,10 @@ def load_config(path: str | Path) -> dict[str, Any]:
             or not isinstance(learning_rate, (int, float))
             or not 0 < learning_rate < float("inf")):
         raise ValueError("training.learning_rate doit être strictement positif")
+    gamma = training["gamma"]
+    if (isinstance(gamma, bool) or not isinstance(gamma, (int, float))
+            or not 0 < gamma <= 1 or not np.isfinite(gamma)):
+        raise ValueError("training.gamma doit être dans ]0, 1]")
     for key in ("action_noise_std", "target_policy_noise", "target_noise_clip"):
         value = td3[key]
         if (isinstance(value, bool) or not isinstance(value, (int, float))

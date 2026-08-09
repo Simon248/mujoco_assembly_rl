@@ -102,7 +102,7 @@ def run_branch(
         "first_success": bool(info["safe_success"]),
         "first_terminated": bool(terminated),
         "first_truncated": bool(truncated),
-        "first_reward_progress": float(info["reward_progress"]),
+        "first_reward_potential": float(info["reward_potential"]),
     }
     length = 1
     while not (terminated or truncated):

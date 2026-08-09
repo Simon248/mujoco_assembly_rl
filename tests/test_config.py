@@ -149,44 +149,21 @@ class ConfigTest(unittest.TestCase):
         v14["reward"]["torque_weight"] = 0.08
         self.assertEqual(v16["reward"], v14["reward"])
 
-    def test_v18_only_adds_anti_stagnation_reward_to_v17(self):
-        v17 = load_config("configs/test1V17.yaml")
-        v18 = load_config("configs/test1V18.yaml")
-        self.assertEqual(v18["reward"]["step_penalty"], 0.02)
-        self.assertEqual(v18["reward"]["timeout_penalty"], 150.0)
-        self.assertEqual(v18["reward"]["proximity_milestones"], [
-            {"threshold": 0.010, "bonus": 5.0},
-            {"threshold": 0.006, "bonus": 10.0},
-            {"threshold": 0.004, "bonus": 20.0},
-            {"threshold": 0.002, "bonus": 40.0},
-        ])
-        v17["reward"].update({
-            "proximity_milestones": v18["reward"]["proximity_milestones"],
-            "step_penalty": 0.02, "timeout_penalty": 150.0,
-        })
-        self.assertEqual(v18, v17)
-
-    def test_v19_only_replaces_v18_milestones_with_pose_milestones(self):
-        v18 = load_config("configs/test1V18.yaml")
+    def test_v19_resolves_to_only_the_new_reward_terms(self):
         v19 = load_config("configs/test1V19.yaml")
-        expected = [
-            {"position_threshold": 0.010, "orientation_threshold_deg": 5.0, "bonus": 5.0},
-            {"position_threshold": 0.006, "orientation_threshold_deg": 4.0, "bonus": 10.0},
-            {"position_threshold": 0.004, "orientation_threshold_deg": 3.0, "bonus": 20.0},
-            {"position_threshold": 0.002, "orientation_threshold_deg": 2.0, "bonus": 40.0},
-        ]
-        self.assertEqual(v19["reward"]["proximity_milestones"], expected)
-        v18["reward"]["proximity_milestones"] = expected
-        self.assertEqual(v19, v18)
-
-    def test_milestone_formats_cannot_be_mixed(self):
-        config = load_config("configs/test1V19.yaml")
-        config["reward"]["proximity_milestones"][0]["threshold"] = 0.010
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "config.yaml"
-            save_resolved_config(config, path)
-            with self.assertRaisesRegex(ValueError, "sans mélanger les formats"):
-                load_config(path)
+        self.assertEqual(v19["reward"], {
+            "rotation_length_scale": 0.05,
+            "potential_scale": 10.0,
+            "potential_distance_scale": 0.010,
+            "step_penalty": 0.05,
+            "force_weight": 0.01,
+            "torque_weight": 0.08,
+            "action_weight": 0.01,
+            "success_bonus": 300.0,
+            "unsafe_penalty": 300.0,
+            "timeout_penalty": 150.0,
+        })
+        self.assertEqual(v19["training"]["gamma"], 0.99)
 
     def test_total_timesteps_resolution_and_archived_effective_value(self):
         training = {"total_timesteps": 1_000_000}

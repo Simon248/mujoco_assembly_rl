@@ -18,47 +18,18 @@ class TaskStatus:
     termination_reason: str
 
 
-def prepare_proximity_milestones(
-    configured: list[dict],
-) -> list[tuple[float, float | None, float]]:
-    """Convertit une fois les seuils configurés vers mètres/radians/bonus."""
-    return [
-        (
-            float(item.get("position_threshold", item.get("threshold"))),
-            (np.deg2rad(float(item["orientation_threshold_deg"]))
-             if "orientation_threshold_deg" in item else None),
-            float(item["bonus"]),
-        )
-        for item in configured
-    ]
+def pose_distance(
+    position_error: float, rotation_error: float, rotation_length_scale: float,
+) -> float:
+    """Distance de pose 6D en mètres, avec rotation convertie en longueur."""
+    return float(np.hypot(position_error, rotation_length_scale * rotation_error))
 
 
-def newly_reached_milestones(
-    position_error: float,
-    rotation_error: float,
-    milestones: list[tuple[float, float | None, float]],
-    reached: set[int],
-) -> tuple[float, set[int]]:
-    """Calcule tous les bonus encore disponibles atteints pendant ce step."""
-    satisfied = satisfied_milestone_indices(
-        position_error, rotation_error, milestones,
-    )
-    new_indices = satisfied - reached
-    bonus = sum(milestones[index][2] for index in new_indices)
-    return bonus, reached | new_indices
-
-
-def satisfied_milestone_indices(
-    position_error: float,
-    rotation_error: float,
-    milestones: list[tuple[float, float | None, float]],
-) -> set[int]:
-    """Retourne les milestones dont les conditions sont simultanément vraies."""
-    return {
-        index for index, (position_threshold, orientation_threshold, _) in enumerate(milestones)
-        if (position_error < position_threshold
-            and (orientation_threshold is None or rotation_error < orientation_threshold))
-    }
+def pose_potential(
+    distance: float, potential_scale: float, potential_distance_scale: float,
+) -> float:
+    """Potentiel positif, borné et strictement décroissant avec la distance."""
+    return float(potential_scale * np.exp(-distance / potential_distance_scale))
 
 
 def assess_status(
@@ -109,38 +80,34 @@ def assess_status(
 
 def reward_components(
     *,
-    position_error: float,
-    rotation_error: float,
-    previous_position_error: float,
-    previous_rotation_error: float,
+    current_pose_distance: float,
+    next_pose_distance: float,
+    gamma: float,
     max_force: float,
     action: np.ndarray,
     status: TaskStatus,
     config: dict,
-    action_config: dict,
     max_torque: float = 0.0,
-    proximity_bonus: float = 0.0,
 ) -> dict[str, float]:
-    """Calcule les composantes interprétables du reward sur vérité terrain."""
-    position_progress = previous_position_error - position_error
-    normalized_position_progress = (
-        position_progress / float(action_config["max_translation_step"])
+    """Calcule la reward potentielle et les seuls coûts/événements conservés."""
+    phi_current = pose_potential(
+        current_pose_distance, config["potential_scale"],
+        config["potential_distance_scale"],
     )
-    rotation_progress = previous_rotation_error - rotation_error
-    normalized_rotation_progress = (
-        rotation_progress
-        / np.deg2rad(float(action_config["max_rotation_step_deg"]))
+    phi_next = pose_potential(
+        next_pose_distance, config["potential_scale"],
+        config["potential_distance_scale"],
     )
+    # Dans ce MDP épisodique, aucun potentiel ne subsiste après un terminal.
+    phi_next_for_shaping = 0.0 if status.terminated else phi_next
     return {
-        "reward_position": -float(config["position_weight"]) * position_error,
-        "reward_orientation": -float(config["orientation_weight"]) * rotation_error,
-        "reward_progress": float(config["progress_weight"]) * (
-            normalized_position_progress + normalized_rotation_progress
-        ),
+        "pose_distance": next_pose_distance,
+        "phi_current": phi_current,
+        "phi_next": phi_next,
+        "reward_potential": gamma * phi_next_for_shaping - phi_current,
         "reward_force": -float(config["force_weight"]) * max_force,
         "reward_torque": -float(config.get("torque_weight", 0.0)) * max_torque,
         "reward_action": -float(config["action_weight"]) * float(np.dot(action, action)),
-        "reward_proximity": float(proximity_bonus),
         "reward_step": -float(config.get("step_penalty", 0.0)),
         "reward_success": float(config["success_bonus"]) if status.success else 0.0,
         "reward_unsafe": -float(config["unsafe_penalty"]) if status.unsafe else 0.0,
