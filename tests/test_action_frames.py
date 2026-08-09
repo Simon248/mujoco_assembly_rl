@@ -3,7 +3,10 @@ from __future__ import annotations
 import unittest
 import numpy as np
 
-from src.assembly_env import TenonMortaiseEnv, advance_grasp_reference
+from src.assembly_env import (
+    TenonMortaiseEnv, admittance_change_pose, advance_grasp_reference,
+    apply_action_delta,
+)
 from src.transforms import (
     compose, euler_xyz_to_quat, inverse, quat_to_rotvec, relative,
     rotate, rotvec_to_quat,
@@ -112,11 +115,52 @@ class ActionFrameGeometryTest(unittest.TestCase):
         displacement = np.linalg.norm(self.recovered_task(desired_grasp)[0] - self.task_pose[0])
         self.assertGreater(displacement, 0.001)
 
+    def test_reactive_action_does_not_accumulate_when_actual_pose_is_static(self):
+        actual = (np.zeros(3), np.array([1.0, 0.0, 0.0, 0.0]))
+        delta = (np.array([0.0, 0.0, -0.001]), rotvec_to_quat(np.zeros(3)))
+        first = apply_action_delta(actual, self.task_to_grasp, delta, "grasp")
+        second = apply_action_delta(actual, self.task_to_grasp, delta, "grasp")
+        self.assertAlmostEqual(first[0][2], -0.001)
+        self.assertAlmostEqual(second[0][2], -0.001)
+
+    def test_reactive_action_follows_the_pose_actually_reached(self):
+        actual = (np.array([0.0, 0.0, -0.0007]), np.array([1.0, 0.0, 0.0, 0.0]))
+        delta = (np.array([0.0, 0.0, -0.001]), rotvec_to_quat(np.zeros(3)))
+        target = apply_action_delta(actual, self.task_to_grasp, delta, "grasp")
+        self.assertAlmostEqual(target[0][2], -0.0017)
+
+    def test_zero_action_and_constant_admittance_leave_actual_pose_unchanged(self):
+        actual = self.grasp_pose
+        zero = (np.zeros(3), rotvec_to_quat(np.zeros(3)))
+        nominal = apply_action_delta(actual, self.task_to_grasp, zero, "grasp")
+        offset = np.array([0.001, -0.002, 0.003, 0.1, -0.05, 0.02])
+        target = compose(nominal, admittance_change_pose(offset, offset.copy()))
+        self.assert_pose_close(target, actual)
+
+    def test_only_admittance_change_is_applied_in_translation_and_rotation(self):
+        previous = np.array([0.0, 0.0, 0.001, 0.0, 0.0, np.deg2rad(2.0)])
+        current = np.array([0.0, 0.0, 0.0012, 0.0, 0.0, np.deg2rad(2.5)])
+        change = admittance_change_pose(previous, current)
+        reconstructed = compose(
+            (previous[:3], rotvec_to_quat(previous[3:])), change,
+        )
+        expected = (current[:3], rotvec_to_quat(current[3:]))
+        self.assert_pose_close(reconstructed, expected)
+        self.assertAlmostEqual(change[0][2], 0.0002)
+        self.assertAlmostEqual(quat_to_rotvec(change[1])[2], np.deg2rad(0.5))
+
+    def test_accumulated_reference_retains_historical_integration(self):
+        reference = (np.zeros(3), np.array([1.0, 0.0, 0.0, 0.0]))
+        delta = (np.array([0.0, 0.0, -0.001]), rotvec_to_quat(np.zeros(3)))
+        reference = apply_action_delta(reference, self.task_to_grasp, delta, "grasp")
+        reference = apply_action_delta(reference, self.task_to_grasp, delta, "grasp")
+        self.assertAlmostEqual(reference[0][2], -0.002)
+
     def test_task_environment_smoke_logs_clipped_policy_action_and_error_axes(self):
         env = TenonMortaiseEnv("configs/test1V5.yaml")
         try:
             observation, _ = env.reset(seed=17)
-            self.assertEqual(observation.shape, (12,))
+            self.assertEqual(observation.shape, (18,))
             _, _, _, _, info = env.step(np.array([2.0, -2.0, 0.25, 1.5, -1.5, 0.5]))
             np.testing.assert_allclose(
                 [info["position_error_x"], info["position_error_y"], info["position_error_z"],

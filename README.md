@@ -86,7 +86,9 @@ checkpoint restent exprimées en transitions, indépendamment de `n_envs`.
   physiques, reward, bruit et randomisation; `test1` à `test4` activent les
   difficultés progressivement.
 - [src/assembly_env.py](src/assembly_env.py) construit la scène CAD et expose
-  l'observation minimale `[erreur pose 6D, wrench 6D]`.
+  l'observation `[erreur pose 6D, wrench 6D, offset de position de
+  l'admittance 6D]`. L'offset est normalisé par `admittance.max_offset`; il est
+  connu du contrôleur réel et aucune vitesse MuJoCo ou interne n'est exposée.
 - [src/wrench.py](src/wrench.py) somme les forces de contact et transporte les
   couples au grasp frame; ce n'est pas un simple capteur de site.
 - [src/admittance.py](src/admittance.py) est testable indépendamment du RL.

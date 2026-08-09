@@ -4,8 +4,10 @@ from copy import deepcopy
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import Mock
 
 from src.config import load_config, save_resolved_config
+from src.train import learn_model, resolve_total_timesteps
 
 
 class ConfigTest(unittest.TestCase):
@@ -14,9 +16,17 @@ class ConfigTest(unittest.TestCase):
         self.assertNotIn("extends", config)
         self.assertIn("unsafe_penalty", config["reward"])
         self.assertIn("max_velocity", config["admittance"])
-        self.assertEqual(config["training"]["n_envs"], 12)
+        self.assertEqual(config["training"]["n_envs"], 16)
         self.assertEqual(config["training"]["base_seed"], 7)
         self.assertEqual(config["training"]["checkpoint_freq"], 50_000)
+        self.assertEqual(config["training"]["total_timesteps"], 500_000)
+        self.assertEqual(config["training"]["buffer_size"], 50_000)
+        self.assertEqual(config["training"]["learning_rate"], 3e-4)
+        self.assertTrue(config["observation"]["include_admittance_position"])
+        self.assertEqual(config["evaluation"], {
+            "enabled": True, "eval_freq": 25_000, "n_eval_episodes": 1,
+            "deterministic": True, "seed": 10_007,
+        })
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "config.yaml"
             save_resolved_config(config, output)
@@ -60,6 +70,34 @@ class ConfigTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "action.action_frame"):
                 load_config(path)
 
+    def test_missing_control_mode_defaults_to_historical_behavior(self):
+        config = load_config("configs/test1V5.yaml")
+        config["action"].pop("control_mode")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "archived_config.yaml"
+            save_resolved_config(config, path)
+            self.assertEqual(
+                load_config(path)["action"]["control_mode"],
+                "accumulated_reference",
+            )
+
+    def test_control_mode_rejects_unknown_values(self):
+        config = load_config("configs/test1V5.yaml")
+        config["action"]["control_mode"] = "integrate_everything"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            save_resolved_config(config, path)
+            with self.assertRaisesRegex(ValueError, "action.control_mode"):
+                load_config(path)
+
+    def test_test1_v10_only_switches_control_mode_from_test1_v9(self):
+        reference = load_config("data/output/test1V9/config.yaml")
+        reactive = load_config("configs/test1V10.yaml")
+        self.assertEqual(reference["action"]["control_mode"], "accumulated_reference")
+        self.assertEqual(reactive["action"]["control_mode"], "reactive_actual_pose")
+        reference["action"]["control_mode"] = "reactive_actual_pose"
+        self.assertEqual(reactive, reference)
+
     def test_test1_v5_only_switches_the_action_frame(self):
         v4 = load_config("configs/test1V4.yaml")
         v5 = load_config("configs/test1V5.yaml")
@@ -87,6 +125,126 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(resolved["training"]["ent_coef"], "auto")
         self.assertEqual(resolved["training"]["target_entropy"], "auto")
 
+    def test_old_config_gets_historical_sac_optimizer_defaults(self):
+        config = load_config("configs/test1V10.yaml")
+        config["training"].pop("buffer_size")
+        config["training"].pop("learning_rate")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "archived_config.yaml"
+            save_resolved_config(config, path)
+            resolved = load_config(path)
+        self.assertEqual(resolved["training"]["buffer_size"], 50_000)
+        self.assertEqual(resolved["training"]["learning_rate"], 3e-4)
+
+    def test_old_config_gets_zero_torque_penalty_and_v16_enables_it(self):
+        config = load_config("configs/test1V15.yaml")
+        config["reward"].pop("torque_weight")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "archived_config.yaml"
+            save_resolved_config(config, path)
+            self.assertEqual(load_config(path)["reward"]["torque_weight"], 0.0)
+        v14 = load_config("configs/test1V14.yaml")
+        v16 = load_config("configs/test1V16.yaml")
+        self.assertEqual(v16["reward"]["torque_weight"], 0.08)
+        v14["reward"]["torque_weight"] = 0.08
+        self.assertEqual(v16["reward"], v14["reward"])
+
+    def test_v18_only_adds_anti_stagnation_reward_to_v17(self):
+        v17 = load_config("configs/test1V17.yaml")
+        v18 = load_config("configs/test1V18.yaml")
+        self.assertEqual(v18["reward"]["step_penalty"], 0.02)
+        self.assertEqual(v18["reward"]["timeout_penalty"], 150.0)
+        self.assertEqual(v18["reward"]["proximity_milestones"], [
+            {"threshold": 0.010, "bonus": 5.0},
+            {"threshold": 0.006, "bonus": 10.0},
+            {"threshold": 0.004, "bonus": 20.0},
+            {"threshold": 0.002, "bonus": 40.0},
+        ])
+        v17["reward"].update({
+            "proximity_milestones": v18["reward"]["proximity_milestones"],
+            "step_penalty": 0.02, "timeout_penalty": 150.0,
+        })
+        self.assertEqual(v18, v17)
+
+    def test_v19_only_replaces_v18_milestones_with_pose_milestones(self):
+        v18 = load_config("configs/test1V18.yaml")
+        v19 = load_config("configs/test1V19.yaml")
+        expected = [
+            {"position_threshold": 0.010, "orientation_threshold_deg": 5.0, "bonus": 5.0},
+            {"position_threshold": 0.006, "orientation_threshold_deg": 4.0, "bonus": 10.0},
+            {"position_threshold": 0.004, "orientation_threshold_deg": 3.0, "bonus": 20.0},
+            {"position_threshold": 0.002, "orientation_threshold_deg": 2.0, "bonus": 40.0},
+        ]
+        self.assertEqual(v19["reward"]["proximity_milestones"], expected)
+        v18["reward"]["proximity_milestones"] = expected
+        self.assertEqual(v19, v18)
+
+    def test_milestone_formats_cannot_be_mixed(self):
+        config = load_config("configs/test1V19.yaml")
+        config["reward"]["proximity_milestones"][0]["threshold"] = 0.010
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            save_resolved_config(config, path)
+            with self.assertRaisesRegex(ValueError, "sans mélanger les formats"):
+                load_config(path)
+
+    def test_total_timesteps_resolution_and_archived_effective_value(self):
+        training = {"total_timesteps": 1_000_000}
+        self.assertEqual(resolve_total_timesteps(training, None), 1_000_000)
+        self.assertEqual(resolve_total_timesteps({}, None), 500_000)
+        self.assertEqual(resolve_total_timesteps(training, 100_000), 100_000)
+
+        config = load_config("configs/test0.yaml")
+        config["training"]["total_timesteps"] = resolve_total_timesteps(
+            config["training"], 100_000
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            save_resolved_config(config, path)
+            archived = load_config(path)
+        self.assertEqual(archived["training"]["total_timesteps"], 100_000)
+
+    def test_model_learn_receives_yaml_total_timesteps(self):
+        model = Mock()
+        callbacks = Mock()
+        training = {"total_timesteps": 1_000_000}
+        learn_model(model, resolve_total_timesteps(training, None), callbacks)
+        model.learn.assert_called_once_with(
+            total_timesteps=1_000_000,
+            callback=callbacks,
+            progress_bar=True,
+        )
+
+    def test_test1_v13_only_changes_budget_and_learning_rate_from_v12(self):
+        v12 = load_config("configs/test1V12.yaml")
+        v13 = load_config("configs/test1V13.yaml")
+        self.assertEqual(v13["training"]["total_timesteps"], 1_000_000)
+        self.assertEqual(v13["training"]["buffer_size"], 250_000)
+        self.assertEqual(v13["training"]["learning_rate"], 1e-4)
+        v12["training"]["total_timesteps"] = 1_000_000
+        v12["training"]["learning_rate"] = 1e-4
+        self.assertEqual(v13, v12)
+
+    def test_test1_v11_only_increases_replay_buffer(self):
+        v10 = load_config("configs/test1V10.yaml")
+        v11 = load_config("configs/test1V11.yaml")
+        self.assertEqual(v10["training"]["buffer_size"], 50_000)
+        self.assertEqual(v11["training"]["buffer_size"], 250_000)
+        self.assertEqual(v11["training"]["learning_rate"], 3e-4)
+        v10["training"]["buffer_size"] = 250_000
+        self.assertEqual(v11, v10)
+
+    def test_sac_buffer_and_learning_rate_must_be_positive(self):
+        config = load_config("configs/test1V10.yaml")
+        for field, invalid_value in (("buffer_size", 0), ("learning_rate", 0.0)):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                invalid = deepcopy(config)
+                invalid["training"][field] = invalid_value
+                path = Path(directory) / "config.yaml"
+                save_resolved_config(invalid, path)
+                with self.assertRaisesRegex(ValueError, rf"training\.{field}"):
+                    load_config(path)
+
     def test_test1_v6_only_overrides_target_entropy(self):
         v5 = load_config("configs/test1V5.yaml")
         v6 = load_config("configs/test1V6.yaml")
@@ -109,6 +267,18 @@ class ConfigTest(unittest.TestCase):
         self.assertIsInstance(resolved["training"]["ent_coef"], float)
         self.assertEqual(resolved["training"]["target_entropy"], -3.0)
         self.assertIsInstance(resolved["training"]["target_entropy"], float)
+
+    def test_old_config_gets_backward_compatible_observation_and_eval_defaults(self):
+        config = load_config("configs/test1.yaml")
+        config["observation"].pop("include_admittance_position")
+        config.pop("evaluation")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "archived_config.yaml"
+            save_resolved_config(config, path)
+            resolved = load_config(path)
+        self.assertFalse(resolved["observation"]["include_admittance_position"])
+        self.assertFalse(resolved["evaluation"]["enabled"])
+        self.assertTrue(resolved["evaluation"]["deterministic"])
 
 
 if __name__ == "__main__":

@@ -9,6 +9,37 @@ from src.assembly_env import TenonMortaiseEnv
 
 
 class EnvironmentHelpersTest(unittest.TestCase):
+    def test_environment_timeout_is_terminal_on_exact_last_step(self):
+        env = TenonMortaiseEnv("configs/test1V14.yaml")
+        try:
+            env.reset(seed=100)
+            env.cfg["simulation"]["max_episode_steps"] = 1
+            _, _, terminated, truncated, info = env.step(np.zeros(6))
+        finally:
+            env.close()
+        self.assertTrue(terminated)
+        self.assertFalse(truncated)
+        self.assertEqual(info["termination_reason"], "timeout")
+
+    def test_reset_clears_proximity_milestone_state(self):
+        env = TenonMortaiseEnv("configs/test1V18.yaml")
+        try:
+            env.reset(seed=100)
+            self.assertEqual(env.proximity_milestones_reached, set())
+            env.proximity_milestones_reached = {0, 1, 2, 3}
+            env.reset(seed=100)
+            self.assertEqual(env.proximity_milestones_reached, set())
+            _, _, _, _, info = env.step(np.zeros(6))
+            self.assertEqual(info["reward_step"], -0.02)
+            self.assertEqual(info["reward_proximity"], 0.0)
+            self.assertEqual(info["reward_timeout"], 0.0)
+            self.assertEqual(info["proximity_milestones_reached"], 0)
+            self.assertIn("episode_reward_proximity", info)
+            self.assertIn("episode_reward_step", info)
+            self.assertIn("episode_reward_timeout", info)
+        finally:
+            env.close()
+
     def _substep_env(self, wrenches):
         env = object.__new__(TenonMortaiseEnv)
         env.model = object(); env.data = object(); env.frame_skip = 10

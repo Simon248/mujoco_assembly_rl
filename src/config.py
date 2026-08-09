@@ -4,6 +4,7 @@ from __future__ import annotations
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
+import numpy as np
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -63,6 +64,56 @@ def load_config(path: str | Path) -> dict[str, Any]:
                 f"Configuration obsolète ou incomplète ({path}): "
                 f"{section} doit définir {sorted(absent)}. Relancez un nouvel essai."
             )
+    # Compatibilité des runs archivés avant l'introduction de cette composante.
+    torque_weight = cfg["reward"].setdefault("torque_weight", 0.0)
+    if (isinstance(torque_weight, bool)
+            or not isinstance(torque_weight, (int, float))
+            or torque_weight < 0 or not np.isfinite(torque_weight)):
+        raise ValueError("reward.torque_weight doit être positif ou nul")
+    reward = cfg["reward"]
+    milestones = reward.setdefault("proximity_milestones", [])
+    reward.setdefault("step_penalty", 0.0)
+    reward.setdefault("timeout_penalty", 0.0)
+    if not isinstance(milestones, list):
+        raise ValueError("reward.proximity_milestones doit être une liste")
+    for index, milestone in enumerate(milestones):
+        if not isinstance(milestone, dict):
+            raise ValueError(
+                f"reward.proximity_milestones[{index}] doit être un mapping"
+            )
+        old_keys = {"threshold", "bonus"}
+        new_keys = {"position_threshold", "orientation_threshold_deg", "bonus"}
+        keys = set(milestone)
+        if keys not in (old_keys, new_keys):
+            raise ValueError(
+                f"reward.proximity_milestones[{index}] doit utiliser soit "
+                "threshold+bonus, soit position_threshold+"
+                "orientation_threshold_deg+bonus, sans mélanger les formats"
+            )
+        threshold_keys = (
+            ("threshold",) if keys == old_keys
+            else ("position_threshold", "orientation_threshold_deg")
+        )
+        for key in threshold_keys:
+            value = milestone[key]
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or value <= 0 or not np.isfinite(value)):
+                raise ValueError(
+                    f"reward.proximity_milestones[{index}].{key} "
+                    "doit être strictement positif"
+                )
+        bonus = milestone["bonus"]
+        if (isinstance(bonus, bool) or not isinstance(bonus, (int, float))
+                or bonus < 0 or not np.isfinite(bonus)):
+            raise ValueError(
+                f"reward.proximity_milestones[{index}].bonus "
+                "doit être positif ou nul"
+            )
+    for key in ("step_penalty", "timeout_penalty"):
+        value = reward[key]
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or value < 0 or not np.isfinite(value)):
+            raise ValueError(f"reward.{key} doit être positif ou nul")
     for field in ("max_translation_step", "max_rotation_step_deg"):
         value = cfg["action"][field]
         if (isinstance(value, bool) or not isinstance(value, (int, float))
@@ -71,22 +122,77 @@ def load_config(path: str | Path) -> dict[str, Any]:
     action_frame = cfg["action"].setdefault("action_frame", "grasp")
     if action_frame not in {"task", "grasp"}:
         raise ValueError("action.action_frame doit être 'task' ou 'grasp'")
+    control_mode = cfg["action"].setdefault("control_mode", "accumulated_reference")
+    if control_mode not in {"accumulated_reference", "reactive_actual_pose"}:
+        raise ValueError(
+            "action.control_mode doit être 'accumulated_reference' ou "
+            "'reactive_actual_pose'"
+        )
     friction_range = cfg["randomization"]["friction_scale"]
     if len(friction_range) != 2 or friction_range[0] <= 0 or friction_range[0] > friction_range[1]:
         raise ValueError("randomization.friction_scale doit être [min, max] avec 0 < min <= max")
     training = cfg.setdefault("training", {})
+    algorithm = training.setdefault("algorithm", "sac")
+    if not isinstance(algorithm, str) or algorithm.lower() not in {"sac", "td3"}:
+        raise ValueError(
+            f"Unsupported RL algorithm: {algorithm}. Supported algorithms: sac, td3"
+        )
+    training["algorithm"] = algorithm.lower()
     training.setdefault("n_envs", 1)
     training.setdefault("base_seed", 7)
     training.setdefault("checkpoint_freq", 50_000)
     training.setdefault("ent_coef", "auto")
     training.setdefault("target_entropy", "auto")
-    for key in ("n_envs", "checkpoint_freq"):
+    training.setdefault("total_timesteps", 500_000)
+    training.setdefault("buffer_size", 50_000)
+    training.setdefault("learning_rate", 3e-4)
+    td3 = training.setdefault("td3", {})
+    if not isinstance(td3, dict):
+        raise ValueError("training.td3 doit être un mapping")
+    td3.setdefault("action_noise_std", 0.1)
+    td3.setdefault("policy_delay", 2)
+    td3.setdefault("target_policy_noise", 0.2)
+    td3.setdefault("target_noise_clip", 0.5)
+    for key in ("n_envs", "checkpoint_freq", "total_timesteps", "buffer_size"):
         value = training[key]
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ValueError(f"training.{key} doit être un entier strictement positif")
+    learning_rate = training["learning_rate"]
+    if (isinstance(learning_rate, bool)
+            or not isinstance(learning_rate, (int, float))
+            or not 0 < learning_rate < float("inf")):
+        raise ValueError("training.learning_rate doit être strictement positif")
+    for key in ("action_noise_std", "target_policy_noise", "target_noise_clip"):
+        value = td3[key]
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or value < 0 or not np.isfinite(value)):
+            raise ValueError(f"training.td3.{key} doit être positif ou nul")
+    policy_delay = td3["policy_delay"]
+    if isinstance(policy_delay, bool) or not isinstance(policy_delay, int) or policy_delay <= 0:
+        raise ValueError("training.td3.policy_delay doit être un entier strictement positif")
     base_seed = training["base_seed"]
     if isinstance(base_seed, bool) or not isinstance(base_seed, int) or base_seed < 0:
         raise ValueError("training.base_seed doit être un entier positif ou nul")
+    observation = cfg.setdefault("observation", {})
+    observation.setdefault("include_admittance_position", False)
+    if not isinstance(observation["include_admittance_position"], bool):
+        raise ValueError("observation.include_admittance_position doit être un booléen")
+    evaluation = cfg.setdefault("evaluation", {})
+    evaluation.setdefault("enabled", False)
+    evaluation.setdefault("eval_freq", 25_000)
+    evaluation.setdefault("n_eval_episodes", 1)
+    evaluation.setdefault("deterministic", True)
+    evaluation.setdefault("seed", 10_007)
+    for key in ("enabled", "deterministic"):
+        if not isinstance(evaluation[key], bool):
+            raise ValueError(f"evaluation.{key} doit être un booléen")
+    for key in ("eval_freq", "n_eval_episodes"):
+        value = evaluation[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"evaluation.{key} doit être un entier strictement positif")
+    eval_seed = evaluation["seed"]
+    if isinstance(eval_seed, bool) or not isinstance(eval_seed, int) or eval_seed < 0:
+        raise ValueError("evaluation.seed doit être un entier positif ou nul")
     return cfg
 
 

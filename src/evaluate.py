@@ -10,9 +10,23 @@ from pathlib import Path
 import re
 
 import numpy as np
-from stable_baselines3 import SAC
+from stable_baselines3 import SAC, TD3
+from stable_baselines3.common.base_class import BaseAlgorithm
 
 from src.assembly_env import TenonMortaiseEnv
+
+
+def load_evaluation_model(
+    model_path: Path, env: TenonMortaiseEnv, algorithm: str,
+) -> BaseAlgorithm:
+    """Charge le type de modèle archivé avec le run, SAC par défaut historique."""
+    if algorithm == "sac":
+        return SAC.load(model_path, env=env)
+    if algorithm == "td3":
+        return TD3.load(model_path, env=env)
+    raise ValueError(
+        f"Unsupported RL algorithm: {algorithm}. Supported algorithms: sac, td3"
+    )
 
 
 CHECKPOINT_SUMMARY_FIELDS = (
@@ -187,7 +201,8 @@ def evaluate_model(
     env = TenonMortaiseEnv(
         run / "config.yaml", "human" if render else None, render_speed
     )
-    model = SAC.load(model_path, env=env)
+    algorithm = env.cfg["training"].get("algorithm", "sac").lower()
+    model = load_evaluation_model(model_path, env, algorithm)
     episodes: list[dict] = []
     trajectory: list[dict] = []
     try:

@@ -1,0 +1,14 @@
+# Reward anti-stagnation; tous les autres paramètres viennent de V17.
+extends: test1V17.yaml
+reward:
+  proximity_milestones:
+    - threshold: 0.010
+      bonus: 5.0
+    - threshold: 0.006
+      bonus: 10.0
+    - threshold: 0.004
+      bonus: 20.0
+    - threshold: 0.002
+      bonus: 40.0
+  step_penalty: 0.02
+  timeout_penalty: 150.0

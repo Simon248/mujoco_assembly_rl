@@ -18,10 +18,16 @@ x-base: &base
     EVAL_RESULT_NAME: ${EVAL_RESULT_NAME:-}
     EVAL_ALL_CHECKPOINTS: ${EVAL_ALL_CHECKPOINTS:-}
     EVAL_TRAJECTORY: ${EVAL_TRAJECTORY:-}
+    TOTAL_TIMESTEPS: ${TOTAL_TIMESTEPS:-}
 services:
   train:
     <<: *base
-    command: python -m src.train --config ${CONFIG:-configs/test1.yaml} --timesteps ${TOTAL_TIMESTEPS:-500000} --run ${RUN_NAME:-test1}
+    command: >-
+      /bin/sh -c 'set -- python -m src.train --config "${CONFIG:-configs/test1.yaml}"
+      --run "${RUN_NAME:-test1}";
+      if [ -n "$$TOTAL_TIMESTEPS" ]; then
+      set -- "$$@" --timesteps "$$TOTAL_TIMESTEPS"; fi;
+      exec "$$@"'
   evaluate:
     <<: *base
     command: python -m src.evaluate --run data/output/${RUN_NAME:-test1} --episodes ${EVAL_EPISODES:-20}

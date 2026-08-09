@@ -1,0 +1,17 @@
+# Test A/B de test1V10 : seule la capacité du replay buffer SAC change.
+extends: test1V12.yaml
+training:
+  buffer_size: 250000
+  learning_rate: 0.0001
+  total_timesteps: 6000000
+success:
+  position_tolerance: 0.0005
+  rotation_tolerance_deg: 2.0
+  max_force: 80.0
+  max_torque: 10.0
+  workspace_radius: 0.15
+scripted_controller:
+  position_gain: 1.0
+  rotation_gain: 1.0
+scripted_evaluation:
+  n_episodes: 20

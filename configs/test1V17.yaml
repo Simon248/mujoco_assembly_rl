@@ -1,0 +1,12 @@
+# Pénalité continue de couple; tous les autres paramètres viennent de V15.
+extends: test1V14.yaml
+reward:
+  torque_weight: 0.08
+training:
+  buffer_size: 250000
+  learning_rate: 0.0001
+  total_timesteps: 5000000
+action:
+  action_frame: task
+  max_translation_step: 0.0005
+  max_rotation_step_deg: 0.25

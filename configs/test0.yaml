@@ -5,12 +5,22 @@ simulation:
   control_dt: 0.02
   max_episode_steps: 300
 training:
+  algorithm: sac
+  total_timesteps: 500000
   n_envs: 16
   base_seed: 7
   checkpoint_freq: 50000
   ent_coef: auto
   target_entropy: auto
-target_pose_fixed_to_mobile:
+  buffer_size: 50000
+  learning_rate: 0.0003
+evaluation:
+  enabled: true
+  eval_freq: 25000       # transitions globales SB3, indépendamment de n_envs
+  n_eval_episodes: 1
+  deterministic: true
+  seed: 10007
+target_pose_fixed_to_mobile: # C'est la cible finale de la tâche.
   position: [0.0, 0.0, 0.0]
   orientation_quat: [1.0, 0.0, 0.0, 0.0] # w, x, y, z
 initial_pose_fixed_to_mobile:
@@ -57,6 +67,8 @@ reward:
   # à provoquer volontairement un arrêt de sécurité rapide.
   unsafe_penalty: 300.0
 observation:
+  # État 6D connu du contrôleur, reconstructible à l'identique sur le robot réel.
+  include_admittance_position: true
   position_scale: 0.05
   rotation_scale: 0.5
   force_scale: 50.0

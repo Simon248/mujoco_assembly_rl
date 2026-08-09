@@ -1,0 +1,12 @@
+# Premier A/B TD3 sur la tâche physique et la reward inchangées de V14.
+extends: test1V14.yaml
+training:
+  algorithm: td3
+  buffer_size: 250000
+  learning_rate: 0.0003
+  total_timesteps: 500000
+  td3:
+    action_noise_std: 0.1
+    policy_delay: 2
+    target_policy_noise: 0.2
+    target_noise_clip: 0.5

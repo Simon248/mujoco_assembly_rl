@@ -15,27 +15,30 @@ import numpy as np
 from src.admittance import AdmittanceController
 from src.config import load_config
 from src.mujoco_plugins import load_sdf_plugin
-from src.task_logic import assess_status, reward_components
+from src.task_logic import (
+    assess_status, newly_reached_milestones, prepare_proximity_milestones,
+    reward_components, satisfied_milestone_indices,
+)
 from src.transforms import compose, euler_xyz_to_quat, inv, inverse, quat_to_rotvec, relative, rotvec_to_quat, rotate
 from src.wrench import contact_wrench_at_site
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def advance_grasp_reference(
-    grasp_reference: tuple[np.ndarray, np.ndarray],
+def apply_action_delta(
+    base_grasp_pose: tuple[np.ndarray, np.ndarray],
     task_to_grasp: tuple[np.ndarray, np.ndarray],
     delta_pose: tuple[np.ndarray, np.ndarray],
     action_frame: str,
     task_target: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Applique un delta au grasp historique ou dans les axes du CAD cible."""
+    """Applique le delta d'action à une pose grasp, sans choisir sa provenance."""
     if action_frame == "grasp":
-        return compose(grasp_reference, delta_pose)
+        return compose(base_grasp_pose, delta_pose)
     if action_frame == "task":
         if task_target is None:
             raise ValueError("task_target est requis avec action_frame='task'")
-        task_reference = compose(grasp_reference, inverse(task_to_grasp))
+        task_reference = compose(base_grasp_pose, inverse(task_to_grasp))
         reference_in_target = relative(task_target, task_reference)
         desired_in_target = (
             reference_in_target[0] + delta_pose[0],
@@ -47,6 +50,19 @@ def advance_grasp_reference(
         task_desired = compose(task_target, desired_in_target)
         return compose(task_desired, task_to_grasp)
     raise ValueError("action.action_frame doit être 'task' ou 'grasp'")
+
+
+# Nom historique conservé pour les utilisateurs externes et les anciens tests.
+advance_grasp_reference = apply_action_delta
+
+
+def admittance_change_pose(
+    previous_offset: np.ndarray, new_offset: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Retourne T_old_offset_to_new_offset, rotations incluses via SE(3)."""
+    old_pose = (previous_offset[:3], rotvec_to_quat(previous_offset[3:]))
+    new_pose = (new_offset[:3], rotvec_to_quat(new_offset[3:]))
+    return relative(old_pose, new_pose)
 
 
 class TenonMortaiseEnv(gym.Env):
@@ -73,16 +89,32 @@ class TenonMortaiseEnv(gym.Env):
         self.free_joint = self._id(mujoco.mjtObj.mjOBJ_JOINT, "tenon_free")
         self.qadr = self.model.jnt_qposadr[self.free_joint]
         self.admittance = AdmittanceController(self.cfg["admittance"])
+        self.proximity_milestones = prepare_proximity_milestones(
+            self.cfg["reward"].get("proximity_milestones", [])
+        )
         self._contact_geom_ids = np.array([self.fixed_geom, self.mobile_geom])
         self._base_contact_friction = self.model.geom_friction[self._contact_geom_ids].copy()
         self.action_space = spaces.Box(-1., 1., (6,), dtype=np.float32)
-        self.observation_space = spaces.Box(-np.inf, np.inf, (12,), dtype=np.float32)
+        # pose error 6D + wrench 6D + optional admittance position offset 6D.
+        # The offset is controller-owned and can also be reconstructed on the
+        # real robot; no simulator or admittance velocity is observed.
+        self.include_admittance_position = bool(
+            self.cfg["observation"]["include_admittance_position"]
+        )
+        observation_size = 12 + (6 if self.include_admittance_position else 0)
+        self.observation_space = spaces.Box(
+            -np.inf, np.inf, (observation_size,), dtype=np.float32
+        )
         self.viewer = None; self.steps = 0; self.last_true_error = np.zeros(6)
         self.perception_bias = (np.zeros(3), np.array([1., 0., 0., 0.]))
-        self.reference_pose = (np.zeros(3), np.array([1., 0., 0., 0.]))
+        # État réservé au mode historique; le mode réactif n'en dépend pas.
+        self.reference_pose: tuple[np.ndarray, np.ndarray] | None = None
         self.episode_max_force = 0.0; self.episode_max_torque = 0.0
         self.episode_reward_components: dict[str, float] = {}
+        self.proximity_milestones_reached: set[int] = set()
         self.friction_scale = 1.0
+        # Set by the periodic evaluation callback; zero during training.
+        self.training_timesteps = 0
 
     def _id(self, kind, name):
         result = mujoco.mj_name2id(self.model, kind, name)
@@ -107,7 +139,7 @@ class TenonMortaiseEnv(gym.Env):
  <body name="mortaise"><inertial pos="0 0 0" mass="1" diaginertia=".01 .01 .01"/><geom type="mesh" mesh="mortaise_mesh" contype="0" conaffinity="0" rgba=".45 .45 .5 1"/><geom name="mortaise_collision" type="sdf" mesh="mortaise_mesh" rgba="0 0 0 0"><plugin instance="mortaise_sdf"/></geom><site name="fixed_frame" size=".008" rgba="0 1 0 1"/></body>
  <body name="grasp_target" mocap="true"/>
  <body name="tenon"><freejoint name="tenon_free"/><geom type="mesh" mesh="tenon_mesh" contype="0" conaffinity="0" rgba=".9 .55 .1 1"/><geom name="tenon_collision" type="sdf" mesh="tenon_mesh" mass=".2" rgba="0 0 0 0"><plugin instance="tenon_sdf"/></geom><site name="mobile_frame" size=".008" rgba="1 1 0 1"/><site name="grasp_frame" pos="{p[0]} {p[1]} {p[2]}" quat="{q[0]} {q[1]} {q[2]} {q[3]}" size=".012" rgba="1 0 0 1"/></body>
- </worldbody><equality><weld name="grasp_weld" body1="grasp_target" body2="tenon" relpose="{weld_p[0]} {weld_p[1]} {weld_p[2]} {weld_q[0]} {weld_q[1]} {weld_q[2]} {weld_q[3]}" solref=".02 1"/></equality></mujoco>'''
+ </worldbody><equality><weld name="grasp_weld" body1="grasp_target" body2="tenon" relpose="{weld_p[0]} {weld_p[1]} {weld_p[2]} {weld_q[0]} {weld_q[1]} {weld_q[2]} {weld_q[3]}" solref=".004 1"/></equality></mujoco>'''
 
     def _load_grasp_pose(self):
         csv = ROOT / "data/input/grasp_poses/tenon/valid_poses.csv"
@@ -137,7 +169,17 @@ class TenonMortaiseEnv(gym.Env):
         )
     def _observation(self):
         error, wrench, n = self._error(observed=True), self._observed_wrench(), self.cfg["observation"]
-        return np.clip(np.r_[error[:3]/n["position_scale"], error[3:]/n["rotation_scale"], wrench[:3]/n["force_scale"], wrench[3:]/n["torque_scale"]], -20, 20).astype(np.float32)
+        values = [
+            error[:3] / n["position_scale"],
+            error[3:] / n["rotation_scale"],
+            wrench[:3] / n["force_scale"],
+            wrench[3:] / n["torque_scale"],
+        ]
+        if self.include_admittance_position:
+            # Translation and rotation-vector use the existing reference frame;
+            # max_offset gives a natural unit scale without changing its limits.
+            values.append(self.admittance.offset / self.admittance.offset_limit)
+        return np.clip(np.concatenate(values), -20, 20).astype(np.float32)
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed); self.steps = 0; self.admittance.reset()
@@ -155,11 +197,22 @@ class TenonMortaiseEnv(gym.Env):
         mujoco.mj_forward(self.model, self.data)
         # Target mocap is explicitly the grasp pose, not the CAD origin.
         grasp = (self.data.site_xpos[self.grasp_site].copy(), self._site_quat())
-        self.reference_pose = (grasp[0].copy(), grasp[1].copy())
+        self.reference_pose = (
+            (grasp[0].copy(), grasp[1].copy())
+            if self.cfg["action"]["control_mode"] == "accumulated_reference"
+            else None
+        )
         self.data.mocap_pos[self.model.body_mocapid[self.target_mocap]], self.data.mocap_quat[self.model.body_mocapid[self.target_mocap]] = grasp
         p = self.cfg["perception"]
         self.perception_bias = (np.array(p["translation_bias"],float), euler_xyz_to_quat(np.deg2rad(p["rotation_bias_deg"])))
-        self.last_true_error = self._error(); return self._observation(), {
+        self.last_true_error = self._error()
+        initial_position_error = float(np.linalg.norm(self.last_true_error[:3]))
+        initial_rotation_error = float(np.linalg.norm(self.last_true_error[3:]))
+        self.proximity_milestones_reached = satisfied_milestone_indices(
+            initial_position_error, initial_rotation_error,
+            self.proximity_milestones,
+        )
+        return self._observation(), {
             "true_error": self.last_true_error.copy(), "friction_scale": self.friction_scale
         }
 
@@ -190,27 +243,45 @@ class TenonMortaiseEnv(gym.Env):
         action = np.clip(np.asarray(action,float), -1, 1); a=self.cfg["action"]
         nominal = np.r_[action[:3]*a["max_translation_step"], action[3:]*np.deg2rad(a["max_rotation_step_deg"])]
         delta_pose = (nominal[:3], rotvec_to_quat(nominal[3:]))
-        # La policy intègre sa référence dans le repère configuré, puis la
-        # commande est ramenée analytiquement au grasp nominal.
+        actual_grasp_pose = (
+            self.data.site_xpos[self.grasp_site].copy(), self._site_quat(),
+        )
         task_target = compose(self._pose(self.fixed_body), self._target())
-        self.reference_pose = advance_grasp_reference(
-            self.reference_pose, self.task_to_grasp, delta_pose, a["action_frame"],
+        historical_mode = a["control_mode"] == "accumulated_reference"
+        if historical_mode and self.reference_pose is None:
+            raise RuntimeError("reset() doit être appelé avant step()")
+        command_base = self.reference_pose if historical_mode else actual_grasp_pose
+        nominal_target = apply_action_delta(
+            command_base, self.task_to_grasp, delta_pose, a["action_frame"],
             task_target,
         )
+        if historical_mode:
+            self.reference_pose = nominal_target
+
         observed_wrench = self._observed_wrench()
-        actual_grasp_q = self._site_quat()
-        reference_q = self.reference_pose[1]
-        # Le capteur exprime le wrench dans le grasp réel, tandis que l'offset
-        # est défini dans la référence nominale : changement de base explicite.
-        wrench_reference = np.r_[
-            rotate(inv(reference_q), rotate(actual_grasp_q, observed_wrench[:3])),
-            rotate(inv(reference_q), rotate(actual_grasp_q, observed_wrench[3:])),
-        ]
-        admittance_offset = self.admittance.step(wrench_reference, self.control_dt)
-        target = compose(
-            self.reference_pose,
-            (admittance_offset[:3], rotvec_to_quat(admittance_offset[3:])),
-        )
+        previous_admittance_offset = self.admittance.offset.copy()
+        if historical_mode:
+            # Compatibilité exacte : le wrench du grasp réel est exprimé dans
+            # la référence nominale historique qui porte l'offset absolu.
+            reference_q = self.reference_pose[1]
+            wrench_for_admittance = np.r_[
+                rotate(inv(reference_q), rotate(actual_grasp_pose[1], observed_wrench[:3])),
+                rotate(inv(reference_q), rotate(actual_grasp_pose[1], observed_wrench[3:])),
+            ]
+        else:
+            # Le capteur et l'admittance utilisent les axes observables du
+            # grasp réel courant : aucune référence historique cachée.
+            wrench_for_admittance = observed_wrench
+        new_admittance_offset = self.admittance.step(wrench_for_admittance, self.control_dt)
+        if historical_mode:
+            admittance_pose = (
+                new_admittance_offset[:3], rotvec_to_quat(new_admittance_offset[3:]),
+            )
+        else:
+            admittance_pose = admittance_change_pose(
+                previous_admittance_offset, new_admittance_offset,
+            )
+        target = compose(nominal_target, admittance_pose)
         mocap = self.model.body_mocapid[self.target_mocap]; self.data.mocap_pos[mocap], self.data.mocap_quat[mocap] = target
         safety = self.cfg["success"]
         step_max_force, step_max_torque = self._run_control_substeps(safety)
@@ -226,11 +297,17 @@ class TenonMortaiseEnv(gym.Env):
             workspace_error=pos, step_count=self.steps,
             config=safety, max_episode_steps=self.cfg["simulation"]["max_episode_steps"],
         )
+        proximity_bonus, self.proximity_milestones_reached = newly_reached_milestones(
+            pos, rot, self.proximity_milestones,
+            self.proximity_milestones_reached,
+        )
         components = reward_components(
             position_error=pos, rotation_error=rot,
             previous_position_error=previous_pos, previous_rotation_error=previous_rot,
             max_force=step_max_force, action=action,
             status=status, config=self.cfg["reward"], action_config=a,
+            max_torque=step_max_torque,
+            proximity_bonus=proximity_bonus,
         )
         for key, value in components.items():
             self.episode_reward_components[key] = self.episode_reward_components.get(key, 0.0) + value
@@ -266,7 +343,14 @@ class TenonMortaiseEnv(gym.Env):
             "max_torque_substep": step_max_torque,
             "episode_max_force": self.episode_max_force,
             "episode_max_torque": self.episode_max_torque,
+            "final_position_error": pos,
+            "final_rotation_error": rot,
+            "max_force": self.episode_max_force,
+            "max_torque": self.episode_max_torque,
+            "training_timesteps": self.training_timesteps,
             "friction_scale": self.friction_scale,
+            "proximity_milestones_reached": len(self.proximity_milestones_reached),
+            "proximity_milestones_total": len(self.proximity_milestones),
         }
         info.update({f"episode_{key}": value for key, value in self.episode_reward_components.items()})
         if self.render_mode=="human": self.render()

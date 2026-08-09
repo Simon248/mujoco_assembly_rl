@@ -1,0 +1,7 @@
+# Test A/B de test1V10 : seule la capacité du replay buffer SAC change.
+extends: test1V12.yaml
+training:
+  buffer_size: 250000
+  learning_rate: 0.0001
+  total_timesteps: 6000000
+

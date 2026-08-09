@@ -1,0 +1,4 @@
+# Test A/B de test1V9 (configuration identique à test1V5), avec commande réactive.
+extends: test1V5.yaml
+action:
+  control_mode: reactive_actual_pose

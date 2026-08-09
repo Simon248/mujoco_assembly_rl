@@ -1,0 +1,16 @@
+# Milestones pose complète; tous les autres paramètres viennent de V18.
+extends: test1V18.yaml
+reward:
+  proximity_milestones:
+    - position_threshold: 0.010
+      orientation_threshold_deg: 5.0
+      bonus: 5.0
+    - position_threshold: 0.006
+      orientation_threshold_deg: 4.0
+      bonus: 10.0
+    - position_threshold: 0.004
+      orientation_threshold_deg: 3.0
+      bonus: 20.0
+    - position_threshold: 0.002
+      orientation_threshold_deg: 2.0
+      bonus: 40.0

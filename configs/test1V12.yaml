@@ -1,0 +1,4 @@
+# Test A/B de test1V10 : seule la capacité du replay buffer SAC change.
+extends: test1V10.yaml
+training:
+  buffer_size: 250000
