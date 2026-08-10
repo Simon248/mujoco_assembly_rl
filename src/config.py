@@ -200,11 +200,12 @@ def load_config(path: str | Path) -> dict[str, Any]:
             )
         walk = curriculum["reverse_random_walk"]
         deduplication = curriculum["deduplication"]
-        # Valeurs injectées uniquement pour charger les archives V21 créées
-        # avant la séparation frontier/historical. Le YAML source courant les
-        # déclare explicitement pour assurer la reproductibilité du nouveau run.
+        # Valeurs injectées pour charger les archives V21 antérieures aux
+        # stratégies de sampling, revalidation et expansion actuelles. Le YAML
+        # source courant les déclare explicitement pour rester reproductible.
         start_sampling = curriculum.setdefault("start_sampling", {})
         revalidation = curriculum.setdefault("revalidation", {})
+        expansion = curriculum.setdefault("expansion", {})
         if not isinstance(walk, dict):
             raise ValueError("curriculum.reverse_random_walk doit être un mapping")
         if not isinstance(deduplication, dict):
@@ -213,11 +214,21 @@ def load_config(path: str | Path) -> dict[str, Any]:
             raise ValueError("curriculum.start_sampling doit être un mapping")
         if not isinstance(revalidation, dict):
             raise ValueError("curriculum.revalidation doit être un mapping")
+        if not isinstance(expansion, dict):
+            raise ValueError("curriculum.expansion doit être un mapping")
         start_sampling.setdefault("frontier_fraction", 0.625)
         start_sampling.setdefault("historical_fraction", 0.375)
         start_sampling.setdefault("historical_bins", 4)
         revalidation.setdefault("mastered_samples_per_update", 8)
         revalidation.setdefault("too_hard_samples_per_update", 12)
+        revalidation.setdefault("every_n_curriculum_updates", 1)
+        expansion.setdefault("max_hops_per_seed", 4)
+        expansion.setdefault("max_candidates_per_update", 24)
+        expansion.setdefault("initial_scale", 1.0)
+        expansion.setdefault("scale_up_factor", 1.25)
+        expansion.setdefault("scale_down_factor", 0.7)
+        expansion.setdefault("min_scale", 0.5)
+        expansion.setdefault("max_scale", 3.0)
         missing_walk = {
             "walks_per_seed", "max_steps", "action_scale",
         } - walk.keys()
@@ -297,6 +308,63 @@ def load_config(path: str | Path) -> dict[str, Any]:
                     f"curriculum.revalidation.{key} doit être un entier "
                     "positif ou nul"
                 )
+        revalidation_frequency = revalidation["every_n_curriculum_updates"]
+        if (isinstance(revalidation_frequency, bool)
+                or not isinstance(revalidation_frequency, int)
+                or revalidation_frequency <= 0):
+            raise ValueError(
+                "curriculum.revalidation.every_n_curriculum_updates doit être "
+                "un entier strictement positif"
+            )
+        for key in ("max_hops_per_seed", "max_candidates_per_update"):
+            value = expansion[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(
+                    f"curriculum.expansion.{key} doit être un entier "
+                    "strictement positif"
+                )
+        initial_scale = finite_number(
+            expansion["initial_scale"],
+            "curriculum.expansion.initial_scale",
+        )
+        scale_up_factor = finite_number(
+            expansion["scale_up_factor"],
+            "curriculum.expansion.scale_up_factor",
+        )
+        scale_down_factor = finite_number(
+            expansion["scale_down_factor"],
+            "curriculum.expansion.scale_down_factor",
+        )
+        min_scale = finite_number(
+            expansion["min_scale"],
+            "curriculum.expansion.min_scale",
+        )
+        max_scale = finite_number(
+            expansion["max_scale"],
+            "curriculum.expansion.max_scale",
+        )
+        if min_scale <= 0.0:
+            raise ValueError(
+                "curriculum.expansion.min_scale doit être strictement positif"
+            )
+        if max_scale < min_scale:
+            raise ValueError(
+                "curriculum.expansion exige min_scale <= max_scale"
+            )
+        if not min_scale <= initial_scale <= max_scale:
+            raise ValueError(
+                "curriculum.expansion.initial_scale doit être dans "
+                "[min_scale, max_scale]"
+            )
+        if scale_up_factor < 1.0:
+            raise ValueError(
+                "curriculum.expansion.scale_up_factor doit être supérieur "
+                "ou égal à 1"
+            )
+        if not 0.0 < scale_down_factor <= 1.0:
+            raise ValueError(
+                "curriculum.expansion.scale_down_factor doit être dans ]0, 1]"
+            )
         for key in (
             "update_interval_timesteps", "candidates_per_update",
             "evaluation_rollouts_per_candidate", "max_pool_size",

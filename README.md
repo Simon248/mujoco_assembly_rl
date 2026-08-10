@@ -97,11 +97,46 @@ persistante le vrai départ à 40 mm.
 
 À chaque mise à jour, toute la frontier est requalifiée sur cinq rollouts, avec
 des échantillons configurables de mastered et de too-hard. Les too-hard dont le
-parent est actuellement mastered sont prioritaires. Les nouvelles marches
-partent uniformément des feuilles du sous-graphe mastered, puis utilisent les
-fallbacks mastered, frontier et goal. Un enfant reçoit l'identifiant de son
-parent et une profondeur d'expansion augmentée de un. La classification reste
-fondée uniquement sur le taux de succès courant de la policy.
+parent est actuellement mastered sont prioritaires. La fréquence de cette
+revalidation est indépendante de l'expansion et vaut une fois par update par
+défaut (`revalidation.every_n_curriculum_updates: 1`). Les tailles des
+échantillons restent respectivement 8 et 12.
+
+L'expansion part des feuilles du sous-graphe mastered et répartit son budget
+entre plusieurs branches mélangées avec le RNG curriculum. Une branche peut
+enchaîner plusieurs random walks physiques dans le même update tant que chaque
+nouvel état est immédiatement classé mastered. Chaque hop repart du snapshot
+exact du précédent et crée donc le lineage `A → B → C`, avec une profondeur
+augmentée de un à chaque fois. Frontier, too-hard, duplicate ou état invalide
+arrêtent la branche. Le nombre de hops par branche et le nombre total de
+candidats qualifiés bornent strictement le coût :
+
+```yaml
+curriculum:
+  expansion:
+    max_hops_per_seed: 4
+    max_candidates_per_update: 24
+    initial_scale: 1.0
+    scale_up_factor: 1.25
+    scale_down_factor: 0.7
+    min_scale: 0.5
+    max_scale: 3.0
+```
+
+Le premier hop utilise l'amplitude de random walk existante. Après un candidat
+mastered, le hop suivant multiplie cette amplitude par 1,25, dans les bornes
+`min_scale` et `max_scale`. Frontier et too-hard ne déclenchent pas de seconde
+tentative immédiate; `scale_down_factor` est conservé pour une adaptation
+ultérieure, mais le scale n'est pas persisté dans cette version.
+`expansion_scale` est uniquement un réglage
+de génération reverse : il ne mesure ni la difficulté ni la progression. La
+classification reste fondée uniquement sur le taux de succès courant de la
+policy.
+
+Les anciens `candidates_per_update` et `walks_per_seed` restent utilisés par le
+générateur de bootstrap/diagnostic. Un update d'entraînement utilise un walk
+par hop et son plafond dur est exclusivement
+`expansion.max_candidates_per_update`.
 
 `pose_distance` reste une mesure de diagnostic et peut augmenter ou diminuer
 le long d'une branche. Elle ne choisit plus les seeds, les revalidations, le
@@ -133,6 +168,12 @@ si leurs noms ne suivent pas la convention du checkpoint. L'absence du replay
 est une erreur (reprise SAC non fidèle); l'absence du curriculum produit un
 warning puis un bootstrap propre depuis le goal.
 
+Les paramètres du bloc `expansion` et
+`revalidation.every_n_curriculum_updates` décrivent la stratégie courante : ils
+peuvent être ajustés lors d'une reprise sans invalider un ancien pickle
+curriculum. Les anciens YAML qui ne les déclarent pas reçoivent les valeurs par
+défaut ci-dessus et une fréquence de revalidation égale à 1.
+
 Les anciens pickles V21 minimalistes sont migrés sans régénérer les pools : la
 clé `mastered` devient directement la source `curriculum_historical`, tandis
 que frontier et too-hard sont conservés. Chaque ancien snapshot sans filiation
@@ -150,7 +191,10 @@ le timestep SAC afin de détecter automatiquement ce décalage.
 TensorBoard sépare fractions d'épisodes et de transitions, durées et succès par
 source, distances réellement utilisées et couverture min/quartiles/max des
 trois pools. Il publie aussi la profondeur maximale globale et par pool, le
-nombre de feuilles mastered et la profondeur des seeds d'expansion.
+nombre de feuilles mastered et la profondeur des seeds d'expansion. Les
+métriques d'expansion distinguent candidats, hops, branches, rollouts,
+nouveaux mastered/frontier/too-hard, efficacité de découverte de la frontier
+et échelles utilisées; les rollouts de revalidation sont comptés séparément.
 
 ## Fichiers importants
 

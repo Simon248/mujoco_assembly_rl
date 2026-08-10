@@ -39,11 +39,29 @@ class _Manager:
         }
         self.last_expansion_seed_distances = [.008, .009, .010]
         self.last_expansion_seed_depths = [2, 4, 6]
+        self.last_generation_report = SimpleNamespace(
+            expansion_candidates=8,
+            expansion_hops=10,
+            expansion_branches=3,
+            expansion_rollouts=40,
+            new_mastered=5,
+            new_frontier=2,
+            new_too_hard=1,
+            mean_hops_per_branch=10 / 3,
+            max_hops_reached=4,
+            expansion_scale_mean=1.25,
+            expansion_scale_max=1.5625,
+            frontier_found_per_candidate=.25,
+            expansion_wall_time=2.5,
+        )
         self.last_revalidation_report = SimpleNamespace(
             too_hard_revalidated=12,
             too_hard_to_frontier=3,
             too_hard_to_mastered=1,
             too_hard_remained_hard=8,
+            mastered_rollouts=40,
+            too_hard_rollouts=60,
+            wall_time=1.5,
         )
 
     def training_reset_pools(self):
@@ -178,6 +196,26 @@ class ReverseCurriculumCallbackTest(unittest.TestCase):
         self.assertEqual(values["curriculum/too_hard_to_frontier"], 3)
         self.assertEqual(values["curriculum/too_hard_to_mastered"], 1)
         self.assertEqual(values["curriculum/too_hard_remained_hard"], 8)
+        expected_update_metrics = {
+            "expansion_candidates": 8,
+            "expansion_hops": 10,
+            "expansion_branches": 3,
+            "expansion_rollouts": 40,
+            "revalidation_mastered_rollouts": 40,
+            "revalidation_too_hard_rollouts": 60,
+            "new_mastered": 5,
+            "new_frontier": 2,
+            "new_too_hard": 1,
+            "mean_hops_per_branch": 10 / 3,
+            "max_hops_reached": 4,
+            "expansion_scale_mean": 1.25,
+            "expansion_scale_max": 1.5625,
+            "frontier_found_per_candidate": .25,
+            "expansion_wall_time": 2.5,
+            "revalidation_wall_time": 1.5,
+        }
+        for name, expected in expected_update_metrics.items():
+            self.assertAlmostEqual(values[f"curriculum/{name}"], expected)
 
     def test_training_end_flushes_the_last_tensorboard_window(self):
         self.callback._process_due_work = lambda: None
@@ -228,6 +266,28 @@ class ReverseCurriculumCallbackTest(unittest.TestCase):
             logger.name_to_excluded[key] == ("stdout",)
             for key in lineage_update_keys
         ))
+        cost_and_efficiency_keys = [
+            "curriculum/revalidation_mastered_rollouts",
+            "curriculum/revalidation_too_hard_rollouts",
+            "curriculum/revalidation_wall_time",
+            *[
+                f"curriculum/{name}" for name in (
+                    "expansion_candidates", "expansion_hops",
+                    "expansion_branches", "expansion_rollouts",
+                    "new_mastered", "new_frontier", "new_too_hard",
+                    "mean_hops_per_branch", "max_hops_reached",
+                    "expansion_scale_mean", "expansion_scale_max",
+                    "frontier_found_per_candidate", "expansion_wall_time",
+                )
+            ],
+        ]
+        self.assertTrue(all(
+            key in logger.name_to_value for key in cost_and_efficiency_keys
+        ))
+        self.assertTrue(all(
+            logger.name_to_excluded[key] == ("stdout",)
+            for key in cost_and_efficiency_keys
+        ))
         self.assertEqual(
             logger.name_to_value["curriculum/max_generation_depth"], 7,
         )
@@ -243,6 +303,26 @@ class ReverseCurriculumCallbackTest(unittest.TestCase):
         self.assertNotIn("used_start_distance", stream.getvalue())
         self.assertNotIn("expansion_seed_distance", stream.getvalue())
         self.assertNotIn("expansion_seed_depth", stream.getvalue())
+        self.assertNotIn("expansion_candidates", stream.getvalue())
+        self.assertNotIn("revalidation_mastered", stream.getvalue())
+
+    def test_update_logging_accepts_legacy_reports_without_cost_fields(self):
+        self.manager.last_generation_report = SimpleNamespace(generated=3)
+        self.manager.last_revalidation_report = SimpleNamespace(
+            too_hard_revalidated=0,
+        )
+
+        self.callback._record_metrics(include_update_metrics=True)
+
+        self.assertEqual(
+            self.logger.values["curriculum/too_hard_revalidated"], 0,
+        )
+        self.assertNotIn(
+            "curriculum/expansion_candidates", self.logger.values,
+        )
+        self.assertNotIn(
+            "curriculum/revalidation_mastered_rollouts", self.logger.values,
+        )
 
 
 if __name__ == "__main__":

@@ -11,15 +11,17 @@ sa difficulté. Cette dernière dépend uniquement du taux de succès de la poli
 """
 from __future__ import annotations
 
+from collections import deque
 from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import math
 from pathlib import Path
 import pickle
 import random
+import time
 import warnings
 from typing import Any, Iterator, TYPE_CHECKING
 
@@ -37,6 +39,16 @@ POOL_NAMES = ("too_hard", "frontier", "mastered")
 RESET_SOURCES = (
     "true_start", "curriculum_frontier", "curriculum_historical",
 )
+EXPANSION_DEFAULTS: dict[str, int | float] = {
+    "max_hops_per_seed": 4,
+    "max_candidates_per_update": 24,
+    "initial_scale": 1.0,
+    "scale_up_factor": 1.25,
+    "scale_down_factor": 0.7,
+    "min_scale": 0.5,
+    "max_scale": 3.0,
+}
+EXPANSION_STRATEGY_KEYS = frozenset(EXPANSION_DEFAULTS)
 
 
 @dataclass
@@ -217,6 +229,24 @@ class GenerationReport:
     deduplicated_rejected: int = 0
     restoration_checks: int = 0
     restoration_failures: int = 0
+    invalid_rejected: int = 0
+    # Coût et résultat de la dernière expansion multi-hop. ``generated`` reste
+    # le nombre historique de pas physiques de reverse walk, tandis que
+    # ``expansion_hops`` compte les tentatives de produire au plus un état.
+    expansion_candidates: int = 0
+    expansion_hops: int = 0
+    expansion_branches: int = 0
+    expansion_rollouts: int = 0
+    new_mastered: int = 0
+    new_frontier: int = 0
+    new_too_hard: int = 0
+    mean_hops_per_branch: float = 0.0
+    max_hops_reached: int = 0
+    expansion_scale_mean: float = 0.0
+    expansion_scale_max: float = 0.0
+    frontier_found_per_candidate: float = 0.0
+    expansion_wall_time: float = 0.0
+    stop_reasons: dict[str, int] = field(default_factory=dict)
 
     def as_dict(self, states: list[CurriculumState]) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -228,6 +258,23 @@ class GenerationReport:
             "deduplicated_rejected": self.deduplicated_rejected,
             "restoration_checks": self.restoration_checks,
             "restoration_failures": self.restoration_failures,
+            "invalid_rejected": self.invalid_rejected,
+            "expansion_candidates": self.expansion_candidates,
+            "expansion_hops": self.expansion_hops,
+            "expansion_branches": self.expansion_branches,
+            "expansion_rollouts": self.expansion_rollouts,
+            "new_mastered": self.new_mastered,
+            "new_frontier": self.new_frontier,
+            "new_too_hard": self.new_too_hard,
+            "mean_hops_per_branch": self.mean_hops_per_branch,
+            "max_hops_reached": self.max_hops_reached,
+            "expansion_scale_mean": self.expansion_scale_mean,
+            "expansion_scale_max": self.expansion_scale_max,
+            "frontier_found_per_candidate": (
+                self.frontier_found_per_candidate
+            ),
+            "expansion_wall_time": self.expansion_wall_time,
+            "stop_reasons": dict(self.stop_reasons),
         }
         for name, values in (
             ("position_error", [state.position_error for state in states]),
@@ -256,6 +303,10 @@ class RevalidationReport:
     too_hard_to_frontier: int = 0
     too_hard_to_mastered: int = 0
     too_hard_remained_hard: int = 0
+    frontier_rollouts: int = 0
+    mastered_rollouts: int = 0
+    too_hard_rollouts: int = 0
+    wall_time: float = 0.0
 
     @property
     def total_revalidated(self) -> int:
@@ -264,6 +315,15 @@ class RevalidationReport:
             + self.mastered_revalidated
             + self.too_hard_revalidated
         )
+
+
+@dataclass
+class _ExpansionBranch:
+    """État minimal d'une branche remise en queue entre deux hops."""
+
+    current: CurriculumState
+    scale: float
+    hops: int = 0
 
 
 def mastered_boundary_states(
@@ -515,8 +575,24 @@ class ReverseCurriculumManager:
         """Alias legacy du bord topologique, sans usage de l'ancienne fraction."""
         return self.mastered_boundary_states()
 
+    def _expansion_settings(self) -> dict[str, int | float]:
+        """Retourne la stratégie courante avec defaults pour les anciens YAML."""
+        settings = dict(EXPANSION_DEFAULTS)
+        configured = self.config.get("expansion", {})
+        if isinstance(configured, dict):
+            settings.update({
+                key: configured[key]
+                for key in EXPANSION_STRATEGY_KEYS if key in configured
+            })
+        return settings
+
     def _expansion_seeds(self) -> list[CurriculumState]:
-        """Explore uniformément les feuilles mastered, sans classement géométrique."""
+        """Mélange toutes les branches éligibles sans classement de profondeur.
+
+        La limite globale est appliquée par ``_expand_branches``. Garder ici
+        toutes les feuilles permet à la queue round-robin de donner un premier
+        hop au plus grand nombre possible de branches avant leur second hop.
+        """
         mastered = self.pools["mastered"]
         preferred = self.mastered_boundary_states() or mastered
         if not preferred:
@@ -530,16 +606,7 @@ class ReverseCurriculumManager:
                 int(self.goal_seed.generation_depth)
             ]
             return selected
-        count = max(
-            1,
-            math.ceil(
-                int(self.config["candidates_per_update"])
-                / int(self.walk["walks_per_seed"])
-            ),
-        )
-        indices = self.rng.choice(
-            len(preferred), size=min(count, len(preferred)), replace=False,
-        )
+        indices = self.rng.permutation(len(preferred))
         selected = [
             preferred[int(index)] for index in np.atleast_1d(indices)
         ]
@@ -550,6 +617,23 @@ class ReverseCurriculumManager:
             int(state.generation_depth) for state in selected
         ]
         return selected
+
+    def _next_expansion_scale(self, scale: float, category: str) -> float:
+        """Adapte uniquement l'amplitude de génération reverse.
+
+        Cette échelle ne mesure ni difficulté ni progression. Dans cette
+        version, seul le résultat ``mastered`` est immédiatement ré-expansé;
+        la valeur réduite calculable pour ``too_hard`` n'est donc pas réessayée
+        dans le même update.
+        """
+        settings = self._expansion_settings()
+        minimum = float(settings["min_scale"])
+        maximum = float(settings["max_scale"])
+        if category == "mastered":
+            scale *= float(settings["scale_up_factor"])
+        elif category == "too_hard":
+            scale *= float(settings["scale_down_factor"])
+        return float(np.clip(scale, minimum, maximum))
 
     def _is_duplicate(
         self, candidate: CurriculumState, additional: list[CurriculumState],
@@ -591,10 +675,254 @@ class ReverseCurriculumManager:
             generation_depth=seed_depth + 1,
         )
 
+    @staticmethod
+    def _candidate_snapshot_is_valid(candidate: CurriculumState) -> bool:
+        """Rejette les snapshots numériques non finis avant tout lineage.
+
+        MuJoCo et les contrôles de workspace traitent déjà les violations
+        physiques. Ce garde-fou couvre explicitement les NaN/Inf et les
+        quaternions dégénérés sans introduire de critère de difficulté.
+        """
+        for name in (
+            "mj_state", "fixed_body_position", "fixed_body_quaternion",
+            "contact_friction", "admittance_offset", "admittance_velocity",
+            "reference_position", "reference_quaternion",
+            "perception_bias_position", "perception_bias_quaternion",
+            "task_position", "task_quaternion",
+        ):
+            value = getattr(candidate, name, None)
+            if value is None:
+                continue
+            try:
+                array = np.asarray(value, dtype=float)
+            except (TypeError, ValueError):
+                return False
+            if not array.size or not np.all(np.isfinite(array)):
+                return False
+        for name in (
+            "friction_scale", "position_error", "rotation_error",
+            "pose_distance",
+        ):
+            if hasattr(candidate, name):
+                try:
+                    value = float(getattr(candidate, name))
+                except (TypeError, ValueError):
+                    return False
+                if not np.isfinite(value):
+                    return False
+        for name in (
+            "fixed_body_quaternion", "reference_quaternion",
+            "perception_bias_quaternion", "task_quaternion",
+        ):
+            quaternion = getattr(candidate, name, None)
+            if quaternion is not None and float(np.linalg.norm(quaternion)) <= 1e-12:
+                return False
+        return True
+
+    def _generate_hop_snapshot(
+        self, seed: CurriculumState, expansion_scale: float,
+        report: GenerationReport,
+    ) -> tuple[CurriculumState | None, str | None]:
+        """Exécute un reverse walk et retourne au plus son dernier état valide.
+
+        Le snapshot est capturé par l'environnement à l'instant physique exact.
+        Une violation unsafe/invalide annule tout le hop, même si un état
+        intermédiaire avait été sûr. Les sous-steps encore successful sont
+        traversés sans devenir des candidats. Un hop correspond à un seul walk;
+        ``walks_per_seed`` appartient uniquement au générateur legacy utilisé
+        par le bootstrap et les diagnostics.
+        """
+        self.env.restore_curriculum_state(
+            seed, reset_episode=False, restore_rng=True,
+        )
+        # L'action MuJoCo est bornée à [-1, 1]. Borner l'amplitude avant le
+        # tirage évite qu'un clipping ultérieur crée artificiellement une masse
+        # de probabilité exactement aux deux bornes.
+        amplitude = min(
+            float(self.walk["action_scale"]) * float(expansion_scale), 1.0,
+        )
+        last_candidate: CurriculumState | None = None
+        for _ in range(int(self.walk["max_steps"])):
+            action = self.rng.uniform(-amplitude, amplitude, size=6)
+            result = self.env.step_for_curriculum_generation(action)
+            report.generated += 1
+            if result.unsafe:
+                report.unsafe_rejected += 1
+                return None, "unsafe"
+            if not self._candidate_snapshot_is_valid(result.state):
+                report.invalid_rejected += 1
+                return None, "invalid"
+            if result.success:
+                report.successful_excluded += 1
+                continue
+            last_candidate = result.state
+        if last_candidate is None:
+            return None, "no_candidate"
+        return last_candidate, None
+
+    @staticmethod
+    def _record_expansion_stop(
+        report: GenerationReport, reason: str, count: int = 1,
+    ) -> None:
+        report.stop_reasons[reason] = report.stop_reasons.get(reason, 0) + count
+
+    def _expand_branches(
+        self, model: BaseAlgorithm,
+        seeds: list[CurriculumState] | None = None,
+    ) -> GenerationReport:
+        """Étend plusieurs branches en round-robin avec un budget global.
+
+        A branch is expanded repeatedly within one curriculum update while
+        newly generated states are already mastered by the current policy.
+
+        Expansion stops when a frontier or too-hard state is reached, when
+        the branch becomes invalid/duplicate, or when a configured budget is
+        exhausted. This lets the curriculum cross already-easy regions quickly
+        instead of waiting one curriculum update per generation.
+
+        Chaque hop part du snapshot exact du candidat précédent et crée au
+        plus un nouvel état. La queue remet une continuation mastered derrière
+        toutes les branches en attente : aucune profondeur ou distance n'est
+        privilégiée.
+        """
+        settings = self._expansion_settings()
+        max_hops = int(settings["max_hops_per_seed"])
+        candidate_budget = int(settings["max_candidates_per_update"])
+        initial_scale = float(np.clip(
+            float(settings["initial_scale"]),
+            float(settings["min_scale"]),
+            float(settings["max_scale"]),
+        ))
+        selected = self._expansion_seeds() if seeds is None else list(seeds)
+        if seeds is not None:
+            self.last_expansion_seed_distances = [
+                float(state.pose_distance) for state in selected
+            ]
+            self.last_expansion_seed_depths = [
+                int(state.generation_depth) for state in selected
+            ]
+
+        branches = [
+            _ExpansionBranch(seed, initial_scale) for seed in selected
+        ]
+        queue = deque(branches)
+        report = GenerationReport()
+        used_scales: list[float] = []
+        attempted_seeds: list[CurriculumState] = []
+        # Le pruning peut retirer un état entre deux hops. Garder toutes les
+        # poses connues pendant cet update empêche alors sa réintroduction sous
+        # un nouvel ID/lineage si une branche la rencontre de nouveau.
+        known_during_update = self.all_states()
+        rollouts_per_candidate = int(
+            self.config["evaluation_rollouts_per_candidate"]
+        )
+        low = float(self.config["success_rate_low"])
+        high = float(self.config["success_rate_high"])
+        started_at = time.perf_counter()
+
+        try:
+            while queue and report.expansion_candidates < candidate_budget:
+                branch = queue.popleft()
+                if branch.hops == 0:
+                    report.expansion_branches += 1
+                    attempted_seeds.append(branch.current)
+                # Une tentative est bornée avant toute génération et donc, a
+                # fortiori, avant ses rollouts de qualification.
+                branch.hops += 1
+                report.expansion_hops += 1
+                used_scales.append(float(branch.scale))
+
+                snapshot, stop_reason = self._generate_hop_snapshot(
+                    branch.current, branch.scale, report,
+                )
+                if snapshot is None:
+                    self._record_expansion_stop(
+                        report, stop_reason or "invalid",
+                    )
+                    continue
+
+                candidate = self._assign_lineage_to_candidate(
+                    snapshot, branch.current,
+                )
+                if self._is_duplicate(candidate, known_during_update):
+                    report.deduplicated_rejected += 1
+                    self._record_expansion_stop(report, "duplicate")
+                    continue
+
+                # L'identifiant n'est consommé que par un snapshot réellement
+                # nouveau. Le budget est encore disponible car il est testé en
+                # tête de boucle, avant cet unique appel de qualification.
+                self.next_state_id += 1
+                report.valid += 1
+                qualified = self.qualify_candidates(model, [candidate])
+                if len(qualified) != 1:
+                    raise RuntimeError(
+                        "La qualification d'un hop doit retourner exactement un état"
+                    )
+                state = qualified[0]
+                category = classify_success_rate(
+                    state.success_rate, low, high,
+                )
+                # Le pool peut être élagué ici. La continuation conserve
+                # néanmoins l'objet snapshot exact qualifié comme parent du
+                # prochain hop; elle ne reconstruit jamais sa pose.
+                self._insert([state])
+                known_during_update.append(state)
+                report.expansion_candidates += 1
+                report.expansion_rollouts += rollouts_per_candidate
+                if category == "mastered":
+                    report.new_mastered += 1
+                elif category == "frontier":
+                    report.new_frontier += 1
+                else:
+                    report.new_too_hard += 1
+
+                if category != "mastered":
+                    self._record_expansion_stop(report, category)
+                    continue
+                if branch.hops >= max_hops:
+                    self._record_expansion_stop(report, "max_hops")
+                    continue
+                branch.current = state
+                branch.scale = self._next_expansion_scale(
+                    branch.scale, category,
+                )
+                queue.append(branch)
+
+            if queue and report.expansion_candidates >= candidate_budget:
+                self._record_expansion_stop(report, "global_budget", len(queue))
+        finally:
+            report.expansion_wall_time = time.perf_counter() - started_at
+
+        hop_counts = [branch.hops for branch in branches if branch.hops]
+        if hop_counts:
+            report.mean_hops_per_branch = float(np.mean(hop_counts))
+            report.max_hops_reached = max(hop_counts)
+        if used_scales:
+            report.expansion_scale_mean = float(np.mean(used_scales))
+            report.expansion_scale_max = float(np.max(used_scales))
+        if report.expansion_candidates:
+            report.frontier_found_per_candidate = (
+                report.new_frontier / report.expansion_candidates
+            )
+        self.last_expansion_seed_distances = [
+            float(state.pose_distance) for state in attempted_seeds
+        ]
+        self.last_expansion_seed_depths = [
+            int(state.generation_depth) for state in attempted_seeds
+        ]
+        self.last_generation_report = report
+        return report
+
     def generate_candidates(
         self, seeds: list[CurriculumState] | None = None,
     ) -> tuple[list[CurriculumState], GenerationReport]:
-        """Effectue les marches 6D physiques sans aucun appel à la policy."""
+        """Générateur legacy du bootstrap/diagnostic, hors policy.
+
+        Son plafond ``candidates_per_update`` et ``walks_per_seed`` ne pilotent
+        pas un update multi-hop. Celui-ci est borné exclusivement par
+        ``expansion.max_candidates_per_update`` dans ``_expand_branches``.
+        """
         if not seeds:
             seeds = self._expansion_seeds()
         else:
@@ -895,6 +1223,7 @@ class ReverseCurriculumManager:
 
     def revalidate_existing(self, model: BaseAlgorithm) -> int:
         """Reclasse frontier, mastered sondés et too_hard proches du lineage."""
+        started_at = time.perf_counter()
         frontier_selected = list(self.pools["frontier"])
         selected = list(frontier_selected)
         mastered = self.pools["mastered"]
@@ -941,25 +1270,42 @@ class ReverseCurriculumManager:
                 for state in requalified
                 if self._state_selection_key(state) in too_hard_keys
             ]
-            report = RevalidationReport(
+            self._replace_revalidated_states(selected, requalified)
+            rollouts = int(self.config.get(
+                "evaluation_rollouts_per_candidate", 1,
+            ))
+            self.last_revalidation_report = RevalidationReport(
                 frontier_revalidated=len(frontier_selected),
                 mastered_revalidated=mastered_count,
                 too_hard_revalidated=len(too_hard_keys),
                 too_hard_to_frontier=too_hard_categories.count("frontier"),
                 too_hard_to_mastered=too_hard_categories.count("mastered"),
                 too_hard_remained_hard=too_hard_categories.count("too_hard"),
+                frontier_rollouts=len(frontier_selected) * rollouts,
+                mastered_rollouts=mastered_count * rollouts,
+                too_hard_rollouts=len(too_hard_keys) * rollouts,
+                wall_time=time.perf_counter() - started_at,
             )
-            self._replace_revalidated_states(selected, requalified)
-            self.last_revalidation_report = report
         else:
-            self.last_revalidation_report = RevalidationReport()
+            self.last_revalidation_report = RevalidationReport(
+                wall_time=time.perf_counter() - started_at,
+            )
         return len(selected)
 
     def update(self, model: BaseAlgorithm) -> GenerationReport:
-        """Requalifie la mémoire, puis prolonge les branches mastered."""
-        self.revalidate_existing(model)
-        candidates, report = self.generate_candidates()
-        self._insert(self.qualify_candidates(model, candidates))
+        """Revalide à sa cadence puis étend les branches en multi-hop.
+
+        ``update_count`` vaut zéro pour le premier update : celui-ci revalide
+        toujours, puis une fréquence N revalide les updates 1, 1+N, 1+2N, ...
+        vus par l'utilisateur.
+        """
+        revalidation = self.config.get("revalidation", {})
+        frequency = int(revalidation.get("every_n_curriculum_updates", 1))
+        if self.update_count % frequency == 0:
+            self.revalidate_existing(model)
+        else:
+            self.last_revalidation_report = RevalidationReport()
+        report = self._expand_branches(model)
         self.update_count += 1
         self.next_update_timesteps += int(self.config["update_interval_timesteps"])
         return report
@@ -1048,11 +1394,10 @@ class ReverseCurriculumManager:
                 walk.pop("min_pose_distance_increase", None)
                 if not walk:
                     config.pop("reverse_random_walk", None)
-            expansion = config.get("expansion")
-            if isinstance(expansion, dict):
-                expansion.pop("mastered_edge_fraction", None)
-                if not expansion:
-                    config.pop("expansion", None)
+            # Toute la section expansion décrit une stratégie de découverte,
+            # pas la structure des snapshots déjà sérialisés. Elle peut donc
+            # évoluer lors d'une reprise (y compris depuis un YAML sans section).
+            config.pop("expansion", None)
         return saved_core == current_core
 
     def state_dict(

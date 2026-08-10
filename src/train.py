@@ -187,14 +187,64 @@ class ReverseCurriculumCallback(BaseCallback):
             )
 
     def _record_update_metrics(self) -> None:
-        report = getattr(self.manager, "last_revalidation_report", None)
-        if report is not None:
+        revalidation_report = getattr(
+            self.manager, "last_revalidation_report", None,
+        )
+        if revalidation_report is not None:
             for name in (
                 "too_hard_revalidated", "too_hard_to_frontier",
                 "too_hard_to_mastered", "too_hard_remained_hard",
             ):
+                value = getattr(revalidation_report, name, None)
+                if value is None:
+                    continue
                 self.logger.record(
-                    f"curriculum/{name}", float(getattr(report, name)),
+                    f"curriculum/{name}", float(value),
+                )
+
+            # La revalidation et l'expansion utilisent toutes deux la policy,
+            # mais leurs coûts doivent rester distinguables. Ces longues clés
+            # sont conservées dans TensorBoard et exclues uniquement de stdout
+            # afin d'éviter les collisions de troncature de HumanOutputFormat.
+            for metric, attributes in (
+                ("revalidation_mastered_rollouts", ("mastered_rollouts",)),
+                ("revalidation_too_hard_rollouts", ("too_hard_rollouts",)),
+                (
+                    "revalidation_wall_time",
+                    ("revalidation_wall_time", "wall_time"),
+                ),
+            ):
+                value = next(
+                    (
+                        getattr(revalidation_report, attribute)
+                        for attribute in attributes
+                        if hasattr(revalidation_report, attribute)
+                    ),
+                    None,
+                )
+                if value is not None:
+                    self.logger.record(
+                        f"curriculum/{metric}", float(value),
+                        exclude="stdout",
+                    )
+
+        expansion_report = getattr(
+            self.manager, "last_generation_report", None,
+        )
+        if expansion_report is not None:
+            for name in (
+                "expansion_candidates", "expansion_hops",
+                "expansion_branches", "expansion_rollouts",
+                "new_mastered", "new_frontier", "new_too_hard",
+                "mean_hops_per_branch", "max_hops_reached",
+                "expansion_scale_mean", "expansion_scale_max",
+                "frontier_found_per_candidate", "expansion_wall_time",
+            ):
+                value = getattr(expansion_report, name, None)
+                if value is None:
+                    continue
+                self.logger.record(
+                    f"curriculum/{name}", float(value), exclude="stdout",
                 )
 
         distances = np.asarray(

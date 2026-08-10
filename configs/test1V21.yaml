@@ -15,7 +15,9 @@ curriculum:
 
   update_interval_timesteps: 50000 #tous les 50k steps d'entraînement, on met à jour le curriculum : génération de nouveaux états, qualification, mise à jour des pools.
 
-  candidates_per_update: 32 #à chaque mise à jour, on cherche à évaluer environ 32 nouveaux états candidats.
+  # Plafond du générateur legacy utilisé au bootstrap/diagnostic. Pendant
+  # l'entraînement, le plafond effectif est expansion.max_candidates_per_update.
+  candidates_per_update: 32
   evaluation_rollouts_per_candidate: 5 #cinq rollouts donnent les niveaux 0/20/40/60/80/100 %, plus stables que trois.
 
   max_pool_size: 2000 #au maximum 2000 états de départ stockés. C'est juste une protection mémoire et contre un curriculum énorme/redondant.
@@ -32,12 +34,27 @@ curriculum:
   revalidation:
     mastered_samples_per_update: 8
     too_hard_samples_per_update: 12
+    every_n_curriculum_updates: 1 # 1 conserve la revalidation à chaque update; 2 ou 3 permettraient de réduire sa fréquence.
+
+  # Une branche continue immédiatement tant que ses nouveaux candidats sont
+  # déjà mastered. Frontier, too_hard, duplicate ou état invalide l'arrêtent.
+  # Le budget de 24 est global à toutes les branches de l'update.
+  expansion:
+    max_hops_per_seed: 4
+    max_candidates_per_update: 24
+    initial_scale: 1.0
+    scale_up_factor: 1.25
+    scale_down_factor: 0.7
+    min_scale: 0.5
+    max_scale: 3.0
 
   # Les enfants prolongent le lineage physique; leur pose_distance peut
   # augmenter ou diminuer par rapport au parent.
   reverse_random_walk:
-    walks_per_seed: 8 #signifie qu'à partir d'un état servant de seed, on lance 8 petites explorations aléatoires différentes.
-    max_steps: 20 #ignifie que chaque petite exploration inverse fait au maximum 20 actions. Avec 50 Hz, ça correspond au maximum à environ 0,4 s de simulation.
+    # walks_per_seed reste utilisé au bootstrap/diagnostic legacy. Un hop
+    # multi-hop exécute un seul walk, borné par max_steps.
+    walks_per_seed: 8
+    max_steps: 20 #signifie que chaque exploration inverse fait au maximum 20 actions. Avec 50 Hz, ça correspond au maximum à environ 0,4 s de simulation.
     action_scale: 0.5 #signifie que les actions aléatoires utilisées pour générer les resets sont limitées à [-0.5,0.5], avec max_translation_step: 0.0005 ona  au max 0.25mm par step pdt la génération du curiculum
 
   deduplication: #sert à éviter les doublons.

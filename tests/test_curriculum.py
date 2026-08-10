@@ -13,7 +13,8 @@ import numpy as np
 from src.assembly_env import TenonMortaiseEnv
 from src.config import load_config
 from src.curriculum import (
-    ReverseCurriculumManager, classify_success_rate,
+    CurriculumState, GenerationReport, ReverseCurriculumManager,
+    classify_success_rate,
     historical_quantile_bins, mastered_boundary_states,
     mastered_edge_states, select_too_hard_by_lineage,
     select_training_start,
@@ -533,6 +534,63 @@ class ReverseCurriculumPhysicsTest(unittest.TestCase):
         self.assertEqual(restored.next_state_id, 23_004)
         self.assertEqual(restored.loaded_training_timesteps, 1_600_000)
 
+    def test_save_reload_preserves_a_graph_produced_by_multihop_expansion(self):
+        curriculum_config = deepcopy(self.config["curriculum"])
+        curriculum_config.setdefault("expansion", {}).update({
+            "max_hops_per_seed": 4,
+            "max_candidates_per_update": 24,
+            "initial_scale": 1.0,
+            "scale_up_factor": 1.25,
+            "scale_down_factor": .7,
+            "min_scale": .5,
+            "max_scale": 3.0,
+        })
+        source = ReverseCurriculumManager(
+            self.env, curriculum_config, seed=117,
+        )
+        root = replace(
+            self.candidates[0], state_id=24_001, parent_id=None,
+            generation_depth=1, success_rate=1.0,
+        )
+        source.pools["mastered"] = [root]
+        source.next_state_id = 24_002
+        snapshots = iter(self.candidates[1:4])
+        rates = iter([1.0, 1.0, .6])
+
+        def generate(seed, scale, report):
+            report.generated += 1
+            return next(snapshots), None
+
+        source._generate_hop_snapshot = generate
+        source._is_duplicate = lambda candidate, additional: False
+        source.qualify_candidates = lambda model, states: [
+            replace(states[0], success_rate=next(rates))
+        ]
+        report = source._expand_branches(object())
+        self.assertEqual(report.expansion_candidates, 3)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "curriculum_state.pkl"
+            source.save(path, training_timesteps=1_650_000)
+            restored = ReverseCurriculumManager(
+                self.env, curriculum_config, seed=118,
+            )
+            restored.load(path)
+
+        expected = {
+            24_001: (None, 1, "mastered"),
+            24_002: (24_001, 2, "mastered"),
+            24_003: (24_002, 3, "mastered"),
+            24_004: (24_003, 4, "frontier"),
+        }
+        actual = {
+            state.state_id: (state.parent_id, state.generation_depth, pool)
+            for pool, states in restored.pools.items()
+            for state in states
+        }
+        self.assertEqual(actual, expected)
+        self.assertEqual(restored.loaded_training_timesteps, 1_650_000)
+
     def test_resume_with_new_reset_probability_restores_pools_and_schedule(self):
         saved_config = deepcopy(self.config["curriculum"])
         saved_config["curriculum_reset_probability"] = .80
@@ -662,16 +720,28 @@ class ReverseCurriculumPureLogicTest(unittest.TestCase):
         manager = object.__new__(ReverseCurriculumManager)
         manager.config = {
             "candidates_per_update": 1,
+            "evaluation_rollouts_per_candidate": 5,
+            "update_interval_timesteps": 50_000,
             "success_rate_low": .10,
             "success_rate_high": .90,
             "max_pool_size": 100,
-            "expansion": {"mastered_edge_fraction": .25},
+            "expansion": {
+                "max_hops_per_seed": 4,
+                "max_candidates_per_update": 24,
+                "initial_scale": 1.0,
+                "scale_up_factor": 1.25,
+                "scale_down_factor": .7,
+                "min_scale": .5,
+                "max_scale": 3.0,
+            },
             "revalidation": {
                 "mastered_samples_per_update": 0,
                 "too_hard_samples_per_update": 1,
             },
         }
-        manager.walk = {"walks_per_seed": 1}
+        manager.walk = {
+            "walks_per_seed": 1, "max_steps": 2, "action_scale": .5,
+        }
         manager.rng = np.random.default_rng(seed)
         manager.pools = {
             "too_hard": [], "frontier": [], "mastered": [],
@@ -689,6 +759,70 @@ class ReverseCurriculumPureLogicTest(unittest.TestCase):
         return SimpleNamespace(**{
             **vars(state), "success_rate": float(success_rate),
         })
+
+    @staticmethod
+    def _snapshot(
+        state_id: int, *, parent_id: int | None = None,
+        depth: int = 0, x: float = 0.0, success_rate: float = np.nan,
+    ) -> CurriculumState:
+        """Construit un snapshot numérique minimal pour les tests multi-hop."""
+        return CurriculumState(
+            mj_state=np.array([x], dtype=float),
+            fixed_body_position=np.zeros(3),
+            fixed_body_quaternion=np.array([1.0, 0.0, 0.0, 0.0]),
+            contact_friction=np.ones((1, 3)), friction_scale=1.0,
+            admittance_offset=np.zeros(6), admittance_velocity=np.zeros(6),
+            reference_position=None, reference_quaternion=None,
+            perception_bias_position=np.zeros(3),
+            perception_bias_quaternion=np.array([1.0, 0.0, 0.0, 0.0]),
+            environment_rng_state=None,
+            task_position=np.array([x, 0.0, 0.0]),
+            task_quaternion=np.array([1.0, 0.0, 0.0, 0.0]),
+            position_error=abs(x), rotation_error=0.0,
+            pose_distance=abs(x), success_rate=success_rate,
+            state_id=state_id, parent_id=parent_id,
+            generation_depth=depth,
+        )
+
+    def _multihop_manager(
+        self, success_rates, *, seed_count=1, max_hops=4,
+        candidate_budget=24, scale_up=1.25, max_scale=3.0,
+    ):
+        manager = self._manager(seed=37)
+        manager.config["expansion"].update({
+            "max_hops_per_seed": max_hops,
+            "max_candidates_per_update": candidate_budget,
+            "scale_up_factor": scale_up,
+            "max_scale": max_scale,
+        })
+        seeds = [
+            self._snapshot(
+                index + 1, depth=1, x=.01 * (index + 1), success_rate=1.0,
+            )
+            for index in range(seed_count)
+        ]
+        manager.pools["mastered"] = list(seeds)
+        manager.goal_seed = self._snapshot(-1)
+        manager.next_state_id = 100
+        rates = iter(success_rates)
+        generated_from: list[int] = []
+        used_scales: list[float] = []
+        raw_index = 0
+
+        def generate(seed, scale, report):
+            nonlocal raw_index
+            generated_from.append(seed.state_id)
+            used_scales.append(scale)
+            raw_index += 1
+            report.generated += 1
+            return self._snapshot(-1, x=1.0 + raw_index), None
+
+        manager._generate_hop_snapshot = generate
+        manager._is_duplicate = lambda candidate, additional: False
+        manager.qualify_candidates = lambda model, states: [
+            replace(states[0], success_rate=float(next(rates)))
+        ]
+        return manager, seeds, generated_from, used_scales
 
     def test_a_sampling_distribution_is_derived_as_50_30_20(self):
         rng = np.random.default_rng(21)
@@ -772,6 +906,265 @@ class ReverseCurriculumPureLogicTest(unittest.TestCase):
                 self.assertEqual(
                     classify_success_rate(success_rate, 0.10, 0.90), category,
                 )
+
+    def test_multihop_crosses_mastered_states_until_frontier_with_exact_lineage(self):
+        manager, seeds, generated_from, scales = self._multihop_manager(
+            [1.0, 1.0, .6], max_hops=4,
+        )
+
+        report = manager._expand_branches(object())
+
+        self.assertEqual(report.expansion_candidates, 3)
+        self.assertEqual(report.expansion_hops, 3)
+        self.assertEqual(report.expansion_branches, 1)
+        self.assertEqual((report.new_mastered, report.new_frontier), (2, 1))
+        self.assertEqual(report.stop_reasons, {"frontier": 1})
+        self.assertEqual(generated_from, [seeds[0].state_id, 100, 101])
+        self.assertEqual(scales, [1.0, 1.25, 1.5625])
+        states = {state.state_id: state for state in manager.all_states()}
+        self.assertEqual(
+            [(states[state_id].parent_id, states[state_id].generation_depth)
+             for state_id in (100, 101, 102)],
+            [(seeds[0].state_id, 2), (100, 3), (101, 4)],
+        )
+
+    def test_multihop_too_hard_stops_without_a_third_candidate(self):
+        manager, _, generated_from, _ = self._multihop_manager(
+            [1.0, 0.0, 1.0], max_hops=4,
+        )
+
+        report = manager._expand_branches(object())
+
+        self.assertEqual(report.expansion_candidates, 2)
+        self.assertEqual(report.expansion_hops, 2)
+        self.assertEqual(report.new_too_hard, 1)
+        self.assertEqual(report.stop_reasons, {"too_hard": 1})
+        self.assertEqual(generated_from, [1, 100])
+
+    def test_multihop_max_hops_bounds_an_all_mastered_branch(self):
+        manager, _, _, scales = self._multihop_manager(
+            [1.0] * 10, max_hops=4,
+        )
+
+        report = manager._expand_branches(object())
+
+        self.assertEqual(report.expansion_candidates, 4)
+        self.assertEqual(report.expansion_hops, 4)
+        self.assertEqual(report.max_hops_reached, 4)
+        self.assertEqual(report.stop_reasons, {"max_hops": 1})
+        self.assertEqual(scales, [1.0, 1.25, 1.5625, 1.953125])
+
+    def test_multihop_global_budget_is_checked_before_qualification(self):
+        manager, _, _, _ = self._multihop_manager(
+            [1.0] * 20, seed_count=3, max_hops=4, candidate_budget=5,
+        )
+        qualification_calls = 0
+        original_qualify = manager.qualify_candidates
+
+        def qualify(model, states):
+            nonlocal qualification_calls
+            qualification_calls += 1
+            return original_qualify(model, states)
+
+        manager.qualify_candidates = qualify
+        report = manager._expand_branches(object())
+
+        self.assertEqual(report.expansion_candidates, 5)
+        self.assertEqual(report.expansion_rollouts, 25)
+        self.assertEqual(qualification_calls, 5)
+        self.assertEqual(report.expansion_hops, 5)
+        self.assertIn("global_budget", report.stop_reasons)
+
+    def test_round_robin_attempts_every_branch_before_any_second_hop(self):
+        manager, seeds, generated_from, _ = self._multihop_manager(
+            [1.0] * 20, seed_count=3, max_hops=4, candidate_budget=5,
+        )
+
+        manager._expand_branches(object())
+
+        self.assertEqual(set(generated_from[:3]), {
+            state.state_id for state in seeds
+        })
+        self.assertEqual(len(generated_from[:3]), 3)
+        self.assertTrue(all(state_id < 100 for state_id in generated_from[:3]))
+        self.assertTrue(all(state_id >= 100 for state_id in generated_from[3:]))
+
+    def test_expansion_scale_is_capped_and_is_not_a_difficulty_signal(self):
+        manager, _, _, scales = self._multihop_manager(
+            [1.0, 1.0, 1.0, .5], max_hops=4,
+            scale_up=2.0, max_scale=1.5,
+        )
+
+        report = manager._expand_branches(object())
+
+        self.assertEqual(scales, [1.0, 1.5, 1.5, 1.5])
+        self.assertEqual(report.expansion_scale_max, 1.5)
+        self.assertEqual(report.new_frontier, 1)
+
+    def test_too_hard_scale_down_is_bounded_but_not_retried_in_v1(self):
+        manager = self._manager()
+        self.assertAlmostEqual(
+            manager._next_expansion_scale(1.0, "too_hard"), .7,
+        )
+        self.assertEqual(
+            manager._next_expansion_scale(.5, "too_hard"), .5,
+        )
+
+    def test_invalid_and_duplicate_each_stop_the_branch_without_descendant(self):
+        for stop_kind in ("invalid", "duplicate"):
+            with self.subTest(stop_kind=stop_kind):
+                manager, seeds, _, _ = self._multihop_manager([1.0])
+                qualification_calls = 0
+
+                def qualify(model, states):
+                    nonlocal qualification_calls
+                    qualification_calls += 1
+                    return [replace(states[0], success_rate=1.0)]
+
+                manager.qualify_candidates = qualify
+                if stop_kind == "invalid":
+                    manager._generate_hop_snapshot = (
+                        lambda seed, scale, report: (None, "invalid")
+                    )
+                else:
+                    manager._is_duplicate = lambda candidate, additional: True
+
+                report = manager._expand_branches(object())
+
+                self.assertEqual(report.expansion_candidates, 0)
+                self.assertEqual(report.expansion_hops, 1)
+                self.assertEqual(qualification_calls, 0)
+                self.assertEqual(report.stop_reasons, {stop_kind: 1})
+                self.assertEqual(manager.pools["mastered"], seeds)
+                self.assertEqual(manager.next_state_id, 100)
+
+    def test_deduplication_remembers_an_accepted_state_pruned_during_update(self):
+        manager, seeds, _, _ = self._multihop_manager(
+            [1.0], max_hops=4,
+        )
+        manager.config["max_pool_size"] = 1
+        manager.deduplication = {
+            "position_tolerance": 1e-6,
+            "rotation_tolerance_deg": 1e-6,
+        }
+        repeated_snapshot = self._snapshot(-1, x=2.0)
+        qualification_calls = 0
+
+        def generate(seed, scale, report):
+            report.generated += 1
+            return repeated_snapshot, None
+
+        def qualify(model, states):
+            nonlocal qualification_calls
+            qualification_calls += 1
+            return [replace(states[0], success_rate=1.0)]
+
+        manager._generate_hop_snapshot = generate
+        manager._is_duplicate = ReverseCurriculumManager._is_duplicate.__get__(
+            manager, ReverseCurriculumManager,
+        )
+        manager.qualify_candidates = qualify
+
+        report = manager._expand_branches(object())
+
+        # Le premier candidat est accepté puis immédiatement pruné par la
+        # limite du pool. Sa pose reste néanmoins connue et stoppe le hop 2.
+        self.assertEqual(report.expansion_candidates, 1)
+        self.assertEqual(report.expansion_hops, 2)
+        self.assertEqual(report.deduplicated_rejected, 1)
+        self.assertEqual(report.stop_reasons, {"duplicate": 1})
+        self.assertEqual(qualification_calls, 1)
+        self.assertEqual(manager.next_state_id, 101)
+        self.assertEqual(manager.pools["mastered"], seeds)
+
+    def test_multihop_does_not_touch_model_or_replay_counters(self):
+        class Replay:
+            def size(self):
+                return 12
+
+        model = SimpleNamespace(num_timesteps=34, replay_buffer=Replay())
+        manager, _, _, _ = self._multihop_manager([1.0, .6])
+        before = (model.num_timesteps, model.replay_buffer.size())
+
+        manager._expand_branches(model)
+
+        self.assertEqual(
+            (model.num_timesteps, model.replay_buffer.size()), before,
+        )
+
+    def test_one_hop_keeps_only_the_last_safe_non_success_snapshot(self):
+        manager = self._manager(seed=91)
+        manager.walk = {
+            "walks_per_seed": 99, "max_steps": 3, "action_scale": .5,
+        }
+        snapshots = [
+            self._snapshot(-1, x=.1),
+            self._snapshot(-1, x=.2),
+            self._snapshot(-1, x=.3),
+        ]
+        results = iter([
+            SimpleNamespace(state=snapshots[0], unsafe=False, success=True),
+            SimpleNamespace(state=snapshots[1], unsafe=False, success=False),
+            SimpleNamespace(state=snapshots[2], unsafe=False, success=False),
+        ])
+        actions = []
+
+        class Env:
+            def restore_curriculum_state(self, *args, **kwargs):
+                return None
+
+            def step_for_curriculum_generation(self, action):
+                actions.append(action)
+                return next(results)
+
+        manager.env = Env()
+        report = GenerationReport()
+        state, reason = manager._generate_hop_snapshot(
+            self._snapshot(1, depth=1), 1.5, report,
+        )
+
+        self.assertIs(state, snapshots[2])
+        self.assertIsNone(reason)
+        self.assertEqual(report.generated, 3)
+        self.assertEqual(report.successful_excluded, 1)
+        self.assertEqual(len(actions), 3)  # walks_per_seed n'est pas utilisé ici.
+        self.assertLessEqual(float(np.max(np.abs(actions))), .75)
+
+    def test_non_finite_snapshot_is_invalid(self):
+        candidate = self._snapshot(-1)
+        candidate.task_position[0] = np.nan
+        self.assertFalse(
+            ReverseCurriculumManager._candidate_snapshot_is_valid(candidate)
+        )
+
+    def test_revalidation_frequency_runs_first_update_then_every_n_updates(self):
+        manager = self._manager()
+        manager.config["revalidation"]["every_n_curriculum_updates"] = 2
+        manager.update_count = 0
+        manager.next_update_timesteps = 50_000
+        calls = []
+
+        def revalidate(model):
+            calls.append(manager.update_count)
+            manager.last_revalidation_report = SimpleNamespace()
+            return 0
+
+        manager.revalidate_existing = revalidate
+        manager._expand_branches = lambda model: GenerationReport()
+
+        manager.update(object())
+        manager.update(object())
+        self.assertEqual(
+            manager.last_revalidation_report.total_revalidated, 0,
+        )
+        self.assertEqual(manager.last_revalidation_report.mastered_rollouts, 0)
+        self.assertEqual(manager.last_revalidation_report.too_hard_rollouts, 0)
+        self.assertEqual(manager.last_revalidation_report.wall_time, 0.0)
+        for _ in range(3):
+            manager.update(object())
+
+        self.assertEqual(calls, [0, 2, 4])
+        self.assertEqual(manager.update_count, 5)
 
     def test_mastered_boundary_follows_current_mastered_children(self):
         manager = self._manager()
@@ -926,6 +1319,8 @@ class ReverseCurriculumPureLogicTest(unittest.TestCase):
         )
         self.assertEqual(manager.last_revalidation_report.too_hard_revalidated, 1)
         self.assertEqual(manager.last_revalidation_report.too_hard_to_frontier, 1)
+        self.assertEqual(manager.last_revalidation_report.too_hard_rollouts, 5)
+        self.assertGreaterEqual(manager.last_revalidation_report.wall_time, 0.0)
 
     def test_too_hard_revalidation_moves_state_to_mastered(self):
         manager, state = self._manager_with_revalidated_too_hard(1.0)
@@ -986,14 +1381,40 @@ class ReverseCurriculumPureLogicTest(unittest.TestCase):
         }
         current = {
             "success_rate_low": .1,
-            "expansion": {"mastered_edge_fraction": .25},
+            "expansion": {
+                "mastered_edge_fraction": .25,
+                "max_hops_per_seed": 4,
+                "max_candidates_per_update": 24,
+                "initial_scale": 1.0,
+                "scale_up_factor": 1.25,
+                "scale_down_factor": .7,
+                "min_scale": .5,
+                "max_scale": 3.0,
+            },
+            "revalidation": {"every_n_curriculum_updates": 3},
         }
         self.assertTrue(
             ReverseCurriculumManager._curriculum_configs_compatible(
                 old, current,
             )
         )
-        current["expansion"]["future_semantic_change"] = True
+        saved_with_strategy = deepcopy(current)
+        changed_strategy = deepcopy(current)
+        changed_strategy["expansion"].update({
+            "max_hops_per_seed": 9,
+            "max_candidates_per_update": 7,
+            "initial_scale": .8,
+            "scale_up_factor": 1.1,
+            "scale_down_factor": .6,
+            "min_scale": .3,
+            "max_scale": 2.0,
+        })
+        self.assertTrue(
+            ReverseCurriculumManager._curriculum_configs_compatible(
+                saved_with_strategy, changed_strategy,
+            )
+        )
+        current["success_rate_low"] = .2
         self.assertFalse(
             ReverseCurriculumManager._curriculum_configs_compatible(
                 old, current,

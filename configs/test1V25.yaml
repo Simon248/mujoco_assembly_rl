@@ -1,0 +1,5 @@
+# Reverse Curriculum Generation autour du goal; tâche et reward héritées de V20.
+extends: test1V23.yaml
+
+
+

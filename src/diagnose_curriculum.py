@@ -291,6 +291,11 @@ def run_diagnostic(
                 "unsafe": False,
             },
             **report.as_dict(candidates),
+            # Les rapports d'efficacité sont volontairement des métriques
+            # éphémères de l'update (TensorBoard est leur source historique).
+            # Ils ne sont pas ajoutés au pickle curriculum uniquement pour ce
+            # diagnostic, afin de garder la reprise et sa migration simples.
+            "expansion_efficiency": None,
             "sampling_pool_source": sampling_pool_source,
             "pool_sizes": {
                 "frontier": len(frontier),
@@ -336,11 +341,47 @@ def format_diagnostic(result: dict[str, Any]) -> str:
     too_hard = result["too_hard_distance"]
     lineage = result["lineage"]
     sampling = result["sampling_test"]
+    efficiency = result.get("expansion_efficiency")
+
+    def efficiency_value(name: str) -> Any:
+        if not isinstance(efficiency, dict):
+            return "unavailable (not persisted)"
+        value = efficiency.get(name)
+        return "unavailable" if value is None else value
+
     lines = [
         "PHYSICAL GENERATION",
         f"generated: {result['generated']}",
         f"valid: {result['valid']}",
         f"restoration_failures: {result['restoration_failures']}",
+        "",
+        "EXPANSION EFFICIENCY",
+        "last update:",
+        f"  branches expanded: {efficiency_value('expansion_branches')}",
+        f"  candidates generated: {efficiency_value('expansion_candidates')}",
+        f"  hops: {efficiency_value('expansion_hops')}",
+        f"  new mastered: {efficiency_value('new_mastered')}",
+        f"  new frontier: {efficiency_value('new_frontier')}",
+        f"  new too_hard: {efficiency_value('new_too_hard')}",
+        "",
+        "rollouts:",
+        f"  expansion: {efficiency_value('expansion_rollouts')}",
+        "  mastered revalidation: "
+        f"{efficiency_value('revalidation_mastered_rollouts')}",
+        "  too-hard revalidation: "
+        f"{efficiency_value('revalidation_too_hard_rollouts')}",
+        "",
+        "scale:",
+        f"  mean: {efficiency_value('expansion_scale_mean')}",
+        f"  max: {efficiency_value('expansion_scale_max')}",
+        "",
+        "efficiency:",
+        "  frontier found per candidate: "
+        f"{efficiency_value('frontier_found_per_candidate')}",
+        "",
+        "wall time:",
+        f"  expansion: {efficiency_value('expansion_wall_time')}",
+        f"  revalidation: {efficiency_value('revalidation_wall_time')}",
         "",
         f"POOL SIZES ({result['sampling_pool_source']})",
         f"frontier: {sizes['frontier']}",

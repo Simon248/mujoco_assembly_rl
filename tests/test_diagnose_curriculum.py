@@ -99,6 +99,22 @@ class CurriculumSamplingDiagnosticTest(unittest.TestCase):
             "generated": 1,
             "valid": 1,
             "restoration_failures": 0,
+            "expansion_efficiency": {
+                "expansion_branches": 3,
+                "expansion_candidates": 8,
+                "expansion_hops": 10,
+                "new_mastered": 5,
+                "new_frontier": 2,
+                "new_too_hard": 1,
+                "expansion_rollouts": 40,
+                "revalidation_mastered_rollouts": 40,
+                "revalidation_too_hard_rollouts": 60,
+                "expansion_scale_mean": 1.25,
+                "expansion_scale_max": 1.5625,
+                "frontier_found_per_candidate": .25,
+                "expansion_wall_time": 2.5,
+                "revalidation_wall_time": 1.5,
+            },
             "sampling_pool_source": "fixture",
             "pool_sizes": {"frontier": 1, "mastered": 1, "too_hard": 0},
             "frontier_distance": {
@@ -156,7 +172,8 @@ class CurriculumSamplingDiagnosticTest(unittest.TestCase):
         }
         output = format_diagnostic(fixture)
         for heading in (
-            "POOL SIZES", "LINEAGE", "DEEPEST LINEAGES",
+            "EXPANSION EFFICIENCY", "POOL SIZES", "LINEAGE",
+            "DEEPEST LINEAGES",
             "GEOMETRY DIAGNOSTICS", "FRONTIER DISTANCE",
             "MASTERED/HISTORICAL DISTANCE", "TOO HARD DISTANCE",
             "SAMPLING TEST", "HISTORICAL DEPTH BINS",
@@ -164,6 +181,58 @@ class CurriculumSamplingDiagnosticTest(unittest.TestCase):
             self.assertIn(heading, output)
         self.assertIn("max generation depth: 2", output)
         self.assertIn("goal → state_1 → state_2", output)
+        self.assertIn("branches expanded: 3", output)
+        self.assertIn("candidates generated: 8", output)
+        self.assertIn("new frontier: 2", output)
+        self.assertIn("frontier found per candidate: 0.25", output)
+        self.assertIn("mastered revalidation: 40", output)
+        self.assertIn("too-hard revalidation: 60", output)
+
+    def test_expansion_efficiency_is_explicitly_unavailable_for_old_results(self):
+        fixture = {
+            "generated": 0,
+            "valid": 0,
+            "restoration_failures": 0,
+            "sampling_pool_source": "fixture",
+            "pool_sizes": {"frontier": 0, "mastered": 0, "too_hard": 0},
+            "frontier_distance": {
+                key: None for key in ("min", "q25", "median", "q75", "max")
+            },
+            "historical_distance": {
+                key: None for key in ("min", "q25", "median", "q75", "max")
+            },
+            "too_hard_distance": {
+                key: None for key in ("min", "q25", "median", "q75", "max")
+            },
+            "lineage": {
+                "total_states": 0,
+                "max_generation_depth": 0,
+                "pools": {
+                    name: {
+                        "count": 0,
+                        "depth": {"min": None, "median": None, "max": None},
+                    }
+                    for name in ("mastered", "frontier", "too_hard")
+                },
+                "mastered_boundary": {
+                    "count": 0,
+                    "depth": {"min": None, "median": None, "max": None},
+                },
+                "deepest_lineages": [],
+            },
+            "sampling_test": {
+                "draws": 0,
+                "fractions": {
+                    "frontier": 0.0, "historical": 0.0, "true_start": 1.0,
+                },
+                "historical_bins": [],
+            },
+        }
+
+        output = format_diagnostic(fixture)
+
+        self.assertIn("EXPANSION EFFICIENCY", output)
+        self.assertIn("branches expanded: unavailable (not persisted)", output)
 
 
 if __name__ == "__main__":

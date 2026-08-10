@@ -203,6 +203,16 @@ class ConfigTest(unittest.TestCase):
             "revalidation": {
                 "mastered_samples_per_update": 8,
                 "too_hard_samples_per_update": 12,
+                "every_n_curriculum_updates": 1,
+            },
+            "expansion": {
+                "max_hops_per_seed": 4,
+                "max_candidates_per_update": 24,
+                "initial_scale": 1.0,
+                "scale_up_factor": 1.25,
+                "scale_down_factor": 0.7,
+                "min_scale": 0.5,
+                "max_scale": 3.0,
             },
             "reverse_random_walk": {
                 "walks_per_seed": 8, "max_steps": 20,
@@ -221,7 +231,15 @@ class ConfigTest(unittest.TestCase):
         curi_max = load_config("configs/test1V21-curi_max.yaml")
 
         self.assertEqual(curi_max["curriculum"]["curriculum_reset_probability"], .95)
-        self.assertNotIn("expansion", curi_max["curriculum"])
+        self.assertEqual(curi_max["curriculum"]["expansion"], {
+            "max_hops_per_seed": 4,
+            "max_candidates_per_update": 24,
+            "initial_scale": 1.0,
+            "scale_up_factor": 1.25,
+            "scale_down_factor": 0.7,
+            "min_scale": 0.5,
+            "max_scale": 3.0,
+        })
         self.assertNotIn(
             "min_pose_distance_increase",
             curi_max["curriculum"]["reverse_random_walk"],
@@ -242,6 +260,7 @@ class ConfigTest(unittest.TestCase):
         config = load_config("configs/test1V21.yaml")
         config["curriculum"].pop("start_sampling")
         config["curriculum"].pop("revalidation")
+        config["curriculum"].pop("expansion")
         config["curriculum"]["evaluation_rollouts_per_candidate"] = 3
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "archived_v21.yaml"
@@ -252,10 +271,19 @@ class ConfigTest(unittest.TestCase):
             "historical_fraction": .375,
             "historical_bins": 4,
         })
-        self.assertNotIn("expansion", resolved["curriculum"])
+        self.assertEqual(resolved["curriculum"]["expansion"], {
+            "max_hops_per_seed": 4,
+            "max_candidates_per_update": 24,
+            "initial_scale": 1.0,
+            "scale_up_factor": 1.25,
+            "scale_down_factor": 0.7,
+            "min_scale": 0.5,
+            "max_scale": 3.0,
+        })
         self.assertEqual(resolved["curriculum"]["revalidation"], {
             "mastered_samples_per_update": 8,
             "too_hard_samples_per_update": 12,
+            "every_n_curriculum_updates": 1,
         })
         self.assertEqual(
             resolved["curriculum"]["evaluation_rollouts_per_candidate"], 3,
@@ -294,6 +322,24 @@ class ConfigTest(unittest.TestCase):
             (lambda cfg: cfg["curriculum"]["revalidation"].__setitem__(
                 "too_hard_samples_per_update", -1),
              "too_hard_samples_per_update"),
+            (lambda cfg: cfg["curriculum"]["revalidation"].__setitem__(
+                "every_n_curriculum_updates", 0),
+             "every_n_curriculum_updates"),
+            (lambda cfg: cfg["curriculum"]["expansion"].__setitem__(
+                "max_hops_per_seed", 0), "max_hops_per_seed"),
+            (lambda cfg: cfg["curriculum"]["expansion"].__setitem__(
+                "max_candidates_per_update", True),
+             "max_candidates_per_update"),
+            (lambda cfg: cfg["curriculum"]["expansion"].__setitem__(
+                "initial_scale", 0.1), "initial_scale"),
+            (lambda cfg: cfg["curriculum"]["expansion"].__setitem__(
+                "scale_up_factor", 0.9), "scale_up_factor"),
+            (lambda cfg: cfg["curriculum"]["expansion"].__setitem__(
+                "scale_down_factor", 1.1), "scale_down_factor"),
+            (lambda cfg: cfg["curriculum"]["expansion"].__setitem__(
+                "min_scale", 0.0), "min_scale"),
+            (lambda cfg: cfg["curriculum"]["expansion"].__setitem__(
+                "max_scale", 0.4), "max_scale"),
         )
         for mutate, expected_message in mutations:
             with self.subTest(field=expected_message), tempfile.TemporaryDirectory() as directory:
@@ -319,6 +365,9 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(
             resolved["curriculum"]["expansion"]["mastered_edge_fraction"],
             "deprecated-value",
+        )
+        self.assertEqual(
+            resolved["curriculum"]["expansion"]["max_hops_per_seed"], 4,
         )
         self.assertEqual(
             resolved["curriculum"]["reverse_random_walk"][
