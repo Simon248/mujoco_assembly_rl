@@ -36,16 +36,17 @@ MONITOR_FIELDS = (
     "action_x", "action_y", "action_z", "action_rx", "action_ry", "action_rz",
     "force", "torque", "max_force_substep", "max_torque_substep",
     "episode_max_force", "episode_max_torque", "friction_scale",
-    "pose_distance", "phi_current", "phi_next", "reward_potential",
+    "rotation_equivalent_distance", "pose_distance", "reward_pose",
     "reward_force", "reward_torque", "reward_action",
     "reward_step", "reward_success", "reward_unsafe", "reward_timeout",
-    "episode_reward_potential", "episode_reward_force", "episode_reward_torque",
+    "episode_reward_pose", "episode_reward_force", "episode_reward_torque",
     "episode_reward_action", "episode_reward_step",
     "episode_reward_success", "episode_reward_unsafe", "episode_reward_timeout",
 )
 
 EVAL_MONITOR_FIELDS = MONITOR_FIELDS + (
-    "final_position_error", "final_rotation_error", "max_force", "max_torque",
+    "final_position_error", "final_rotation_error",
+    "best_position_error", "best_rotation_error", "max_force", "max_torque",
     "training_timesteps",
 )
 

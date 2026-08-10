@@ -15,7 +15,7 @@ import numpy as np
 from src.admittance import AdmittanceController
 from src.config import load_config
 from src.mujoco_plugins import load_sdf_plugin
-from src.task_logic import assess_status, pose_distance, reward_components
+from src.task_logic import assess_status, reward_components
 from src.transforms import compose, euler_xyz_to_quat, inv, inverse, quat_to_rotvec, relative, rotvec_to_quat, rotate
 from src.wrench import contact_wrench_at_site
 
@@ -104,6 +104,7 @@ class TenonMortaiseEnv(gym.Env):
         # État réservé au mode historique; le mode réactif n'en dépend pas.
         self.reference_pose: tuple[np.ndarray, np.ndarray] | None = None
         self.episode_max_force = 0.0; self.episode_max_torque = 0.0
+        self.best_position_error = np.inf; self.best_rotation_error = np.inf
         self.episode_reward_components: dict[str, float] = {}
         self.friction_scale = 1.0
         # Set by the periodic evaluation callback; zero during training.
@@ -199,6 +200,8 @@ class TenonMortaiseEnv(gym.Env):
         p = self.cfg["perception"]
         self.perception_bias = (np.array(p["translation_bias"],float), euler_xyz_to_quat(np.deg2rad(p["rotation_bias_deg"])))
         true_error = self._error()
+        self.best_position_error = float(np.linalg.norm(true_error[:3]))
+        self.best_rotation_error = float(np.linalg.norm(true_error[3:]))
         return self._observation(), {
             "true_error": true_error, "friction_scale": self.friction_scale
         }
@@ -228,7 +231,6 @@ class TenonMortaiseEnv(gym.Env):
 
     def step(self, action):
         action = np.clip(np.asarray(action,float), -1, 1); a=self.cfg["action"]
-        current_true_error = self._error()
         nominal = np.r_[action[:3]*a["max_translation_step"], action[3:]*np.deg2rad(a["max_rotation_step_deg"])]
         delta_pose = (nominal[:3], rotvec_to_quat(nominal[3:]))
         actual_grasp_pose = (
@@ -278,23 +280,16 @@ class TenonMortaiseEnv(gym.Env):
         self.episode_max_force = max(self.episode_max_force, step_max_force)
         self.episode_max_torque = max(self.episode_max_torque, step_max_torque)
         true_error = self._error(); pos = float(np.linalg.norm(true_error[:3])); rot = float(np.linalg.norm(true_error[3:]))
+        self.best_position_error = min(self.best_position_error, pos)
+        self.best_rotation_error = min(self.best_rotation_error, rot)
         status = assess_status(
             position_error=pos, rotation_error=rot,
             max_force=step_max_force, max_torque=step_max_torque,
             workspace_error=pos, step_count=self.steps,
             config=safety, max_episode_steps=self.cfg["simulation"]["max_episode_steps"],
         )
-        rotation_length_scale = float(self.cfg["reward"]["rotation_length_scale"])
-        current_distance = pose_distance(
-            float(np.linalg.norm(current_true_error[:3])),
-            float(np.linalg.norm(current_true_error[3:])),
-            rotation_length_scale,
-        )
-        next_distance = pose_distance(pos, rot, rotation_length_scale)
         components = reward_components(
-            current_pose_distance=current_distance,
-            next_pose_distance=next_distance,
-            gamma=float(self.cfg["training"]["gamma"]),
+            position_error=pos, rotation_error=rot,
             max_force=step_max_force, action=action,
             status=status, config=self.cfg["reward"],
             max_torque=step_max_torque,
@@ -336,6 +331,8 @@ class TenonMortaiseEnv(gym.Env):
             "episode_max_torque": self.episode_max_torque,
             "final_position_error": pos,
             "final_rotation_error": rot,
+            "best_position_error": self.best_position_error,
+            "best_rotation_error": self.best_rotation_error,
             "max_force": self.episode_max_force,
             "max_torque": self.episode_max_torque,
             "training_timesteps": self.training_timesteps,

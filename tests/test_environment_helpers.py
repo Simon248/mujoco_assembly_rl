@@ -10,7 +10,7 @@ from src.assembly_env import TenonMortaiseEnv
 
 class EnvironmentHelpersTest(unittest.TestCase):
     def test_environment_reward_excludes_pose_logging_metrics(self):
-        env = TenonMortaiseEnv("configs/test1V19.yaml")
+        env = TenonMortaiseEnv("configs/test1V20.yaml")
         try:
             env.reset(seed=100)
             _, reward, _, _, info = env.step(np.zeros(6))
@@ -22,8 +22,8 @@ class EnvironmentHelpersTest(unittest.TestCase):
         )
         self.assertAlmostEqual(reward, expected)
         self.assertIn("pose_distance", info)
-        self.assertIn("phi_current", info)
-        self.assertIn("phi_next", info)
+        self.assertIn("rotation_equivalent_distance", info)
+        self.assertIn("reward_pose", info)
 
     def test_environment_timeout_is_terminal_on_exact_last_step(self):
         env = TenonMortaiseEnv("configs/test1V14.yaml")

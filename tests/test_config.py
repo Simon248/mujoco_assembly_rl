@@ -155,6 +155,7 @@ class ConfigTest(unittest.TestCase):
             "rotation_length_scale": 0.05,
             "potential_scale": 10.0,
             "potential_distance_scale": 0.010,
+            "pose_weight": 50.0,
             "step_penalty": 0.05,
             "force_weight": 0.01,
             "torque_weight": 0.08,
@@ -164,6 +165,21 @@ class ConfigTest(unittest.TestCase):
             "timeout_penalty": 150.0,
         })
         self.assertEqual(v19["training"]["gamma"], 0.99)
+
+    def test_v20_replaces_v19_reward_without_potential_parameters(self):
+        v20 = load_config("configs/test1V20.yaml")
+        self.assertEqual(v20["reward"], {
+            "rotation_length_scale": 0.05,
+            "pose_weight": 50.0,
+            "step_penalty": 0.05,
+            "force_weight": 0.01,
+            "torque_weight": 0.08,
+            "action_weight": 0.01,
+            "success_bonus": 300.0,
+            "unsafe_penalty": 300.0,
+            "timeout_penalty": 150.0,
+        })
+        self.assertEqual(v20["training"]["gamma"], 0.99)
 
     def test_total_timesteps_resolution_and_archived_effective_value(self):
         training = {"total_timesteps": 1_000_000}

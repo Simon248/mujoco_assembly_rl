@@ -33,9 +33,9 @@ def load_config(path: str | Path) -> dict[str, Any]:
         cfg = yaml.safe_load(f) or {}
     if not isinstance(cfg, dict):
         raise ValueError(f"La configuration doit être un mapping YAML: {path}")
-    explicit_potential_reward = (
+    explicit_reward_replacement = (
         isinstance(cfg.get("reward"), dict)
-        and "potential_scale" in cfg["reward"]
+        and "rotation_length_scale" in cfg["reward"]
     )
     parent = cfg.pop("extends", None)
     if parent:
@@ -47,7 +47,7 @@ def load_config(path: str | Path) -> dict[str, Any]:
                 "Cet essai utilise l'ancien format et doit être relancé."
             )
         parent_config = load_config(parent_path)
-        if explicit_potential_reward:
+        if explicit_reward_replacement:
             # La nouvelle formulation remplace intégralement l'ancien bloc reward.
             parent_config["reward"] = {}
         cfg = _merge(parent_config, cfg)
@@ -79,12 +79,11 @@ def load_config(path: str | Path) -> dict[str, Any]:
         raise ValueError("reward.torque_weight doit être positif ou nul")
     reward = cfg["reward"]
     reward.setdefault("rotation_length_scale", 0.05)
-    reward.setdefault("potential_scale", 10.0)
-    reward.setdefault("potential_distance_scale", 0.010)
+    reward.setdefault("pose_weight", 50.0)
     reward.setdefault("step_penalty", 0.0)
     reward.setdefault("timeout_penalty", 0.0)
     for key in (
-        "rotation_length_scale", "potential_scale", "potential_distance_scale",
+        "rotation_length_scale", "pose_weight",
     ):
         value = reward[key]
         if (isinstance(value, bool) or not isinstance(value, (int, float))

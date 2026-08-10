@@ -1,0 +1,12 @@
+# Reward dense de pose additive; physique et entraînement hérités de V19.
+extends: test1V19.yaml
+reward:
+  rotation_length_scale: 0.05
+  pose_weight: 50.0
+  step_penalty: 0.05
+  force_weight: 0.01
+  torque_weight: 0.08
+  action_weight: 0.01
+  success_bonus: 300.0
+  unsafe_penalty: 300.0
+  timeout_penalty: 150.0
