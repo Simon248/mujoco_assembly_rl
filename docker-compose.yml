@@ -19,6 +19,9 @@ x-base: &base
     EVAL_ALL_CHECKPOINTS: ${EVAL_ALL_CHECKPOINTS:-}
     EVAL_TRAJECTORY: ${EVAL_TRAJECTORY:-}
     TOTAL_TIMESTEPS: ${TOTAL_TIMESTEPS:-}
+    RESUME_MODEL: ${RESUME_MODEL:-}
+    RESUME_REPLAY_BUFFER: ${RESUME_REPLAY_BUFFER:-}
+    RESUME_CURRICULUM: ${RESUME_CURRICULUM:-}
 services:
   train:
     <<: *base
@@ -27,6 +30,12 @@ services:
       --run "${RUN_NAME:-test1}";
       if [ -n "$$TOTAL_TIMESTEPS" ]; then
       set -- "$$@" --timesteps "$$TOTAL_TIMESTEPS"; fi;
+      if [ -n "$$RESUME_MODEL" ]; then
+      set -- "$$@" --resume-model "$$RESUME_MODEL"; fi;
+      if [ -n "$$RESUME_REPLAY_BUFFER" ]; then
+      set -- "$$@" --resume-replay-buffer "$$RESUME_REPLAY_BUFFER"; fi;
+      if [ -n "$$RESUME_CURRICULUM" ]; then
+      set -- "$$@" --resume-curriculum "$$RESUME_CURRICULUM"; fi;
       exec "$$@"'
   evaluate:
     <<: *base

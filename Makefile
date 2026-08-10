@@ -1,4 +1,4 @@
-.PHONY: build test train evaluate evaluate-gui evaluate-scripted diagnose-sac-q diagnose-sac-branching debug tensorboard
+.PHONY: build test train evaluate evaluate-gui evaluate-scripted diagnose-sac-q diagnose-sac-branching diagnose-curriculum debug tensorboard
 build:
 	docker compose build
 test:
@@ -14,6 +14,8 @@ diagnose-sac-q:
 	docker compose run --rm --no-deps train python -m src.diagnose_sac_q --run data/output/$${RUN_NAME:-test1V14} $${MODEL_PATH:+--model $$MODEL_PATH}
 diagnose-sac-branching:
 	docker compose run --rm --no-deps train python -m src.diagnose_sac_branching --run data/output/$${RUN_NAME:-test1V14} $${MODEL_PATH:+--model $$MODEL_PATH}
+diagnose-curriculum:
+	docker compose run --rm --no-deps train python -m src.diagnose_curriculum --config $${CONFIG:-configs/test1V21.yaml} $${CURRICULUM_STATE:+--curriculum-state $$CURRICULUM_STATE}
 evaluate-gui:
 	xhost +local:root >/dev/null && docker compose run --rm --remove-orphans evaluate-gui; status=$$?; xhost -local:root >/dev/null; exit $$status
 
@@ -24,3 +26,9 @@ debug:
 	xhost +local:root >/dev/null && docker compose run --rm debug; xhost -local:root >/dev/null
 tensorboard:
 	docker compose up tensorboard
+
+
+# CONFIG=configs/test1V21.yaml \
+# RUN_NAME=test1V22-resume-713k \
+# RESUME_MODEL=data/output/test1V22/model_interrupted.zip \
+# make train

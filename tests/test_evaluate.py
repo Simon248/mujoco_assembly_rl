@@ -3,10 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
+
+import numpy as np
 
 from src.evaluate import (
     checkpoint_steps, configured_stochastic_sources, resolve_models,
-    summarize_episodes, trajectory_row,
+    evaluate_model, summarize_episodes, trajectory_row,
 )
 
 
@@ -93,6 +96,63 @@ class EvaluateTest(unittest.TestCase):
         self.assertEqual(row["action_rz"], 11.0)
         self.assertTrue(row["safe"])
         self.assertFalse(row["unsafe"])
+
+    @patch("src.evaluate.load_evaluation_model")
+    @patch("src.evaluate.TenonMortaiseEnv")
+    def test_evaluate_model_explicitly_forces_true_start_role(
+        self, environment_constructor, load_model,
+    ):
+        class FakeEnvironment:
+            cfg = {
+                "training": {"algorithm": "sac"},
+                "action": {"action_frame": "task"},
+                "randomization": {}, "perception": {},
+            }
+
+            def reset(self, *, seed):
+                return np.zeros(18), {"reset_source": "true_start"}
+
+            def step(self, action):
+                return np.zeros(18), 1.0, True, False, {
+                    "success": True, "safe_success": True,
+                    "geometric_success": True, "unsafe": False,
+                    "unsafe_force": False, "unsafe_torque": False,
+                    "unsafe_workspace": False, "termination_reason": "success",
+                    "position_error": 0.0, "rotation_error": 0.0,
+                    "episode_max_force": 0.0, "episode_max_torque": 0.0,
+                }
+
+            def close(self):
+                pass
+
+        class FakeModel:
+            num_timesteps = 10
+
+            def __init__(self):
+                self.deterministic = []
+
+            def predict(self, observation, deterministic):
+                self.deterministic.append(deterministic)
+                return np.zeros(6), None
+
+        fake_environment = FakeEnvironment()
+        fake_model = FakeModel()
+        environment_constructor.return_value = fake_environment
+        load_model.return_value = fake_model
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            model_path = run / "model.zip"
+            model_path.write_bytes(b"model")
+            summary = evaluate_model(
+                run=run, model_path=model_path, result_name="true_start",
+                episode_count=2, seed=100, render=False, render_speed=1.0,
+                write_trajectory=False,
+            )
+        self.assertEqual(summary["evaluation_reset_source"], "true_start")
+        self.assertEqual(fake_model.deterministic, [True, True])
+        self.assertFalse(
+            environment_constructor.call_args.kwargs["allow_curriculum_resets"]
+        )
 
     @staticmethod
     def _episode(

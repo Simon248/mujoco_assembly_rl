@@ -178,6 +178,153 @@ def load_config(path: str | Path) -> dict[str, Any]:
     eval_seed = evaluation["seed"]
     if isinstance(eval_seed, bool) or not isinstance(eval_seed, int) or eval_seed < 0:
         raise ValueError("evaluation.seed doit être un entier positif ou nul")
+
+    curriculum = cfg.setdefault("curriculum", {"enabled": False})
+    if not isinstance(curriculum, dict):
+        raise ValueError("curriculum doit être un mapping")
+    enabled = curriculum.setdefault("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("curriculum.enabled doit être un booléen")
+    if enabled:
+        required_curriculum = {
+            "curriculum_reset_probability", "success_rate_low",
+            "success_rate_high", "update_interval_timesteps",
+            "candidates_per_update", "evaluation_rollouts_per_candidate",
+            "max_pool_size", "reverse_random_walk", "deduplication",
+        }
+        missing_curriculum = required_curriculum - curriculum.keys()
+        if missing_curriculum:
+            raise ValueError(
+                "curriculum activé mais incomplet: champs manquants "
+                f"{sorted(missing_curriculum)}"
+            )
+        walk = curriculum["reverse_random_walk"]
+        deduplication = curriculum["deduplication"]
+        # Valeurs injectées uniquement pour charger les archives V21 créées
+        # avant la séparation frontier/historical. Le YAML source courant les
+        # déclare explicitement pour assurer la reproductibilité du nouveau run.
+        start_sampling = curriculum.setdefault("start_sampling", {})
+        revalidation = curriculum.setdefault("revalidation", {})
+        if not isinstance(walk, dict):
+            raise ValueError("curriculum.reverse_random_walk doit être un mapping")
+        if not isinstance(deduplication, dict):
+            raise ValueError("curriculum.deduplication doit être un mapping")
+        if not isinstance(start_sampling, dict):
+            raise ValueError("curriculum.start_sampling doit être un mapping")
+        if not isinstance(revalidation, dict):
+            raise ValueError("curriculum.revalidation doit être un mapping")
+        start_sampling.setdefault("frontier_fraction", 0.625)
+        start_sampling.setdefault("historical_fraction", 0.375)
+        start_sampling.setdefault("historical_bins", 4)
+        revalidation.setdefault("mastered_samples_per_update", 8)
+        revalidation.setdefault("too_hard_samples_per_update", 12)
+        missing_walk = {
+            "walks_per_seed", "max_steps", "action_scale",
+        } - walk.keys()
+        missing_deduplication = {
+            "position_tolerance", "rotation_tolerance_deg",
+        } - deduplication.keys()
+        if missing_walk:
+            raise ValueError(
+                "curriculum.reverse_random_walk incomplet: "
+                f"{sorted(missing_walk)}"
+            )
+        if missing_deduplication:
+            raise ValueError(
+                "curriculum.deduplication incomplet: "
+                f"{sorted(missing_deduplication)}"
+            )
+        def finite_number(value: Any, name: str) -> float:
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not np.isfinite(value)):
+                raise ValueError(f"{name} doit être un nombre fini")
+            return float(value)
+
+        reset_probability = finite_number(
+            curriculum["curriculum_reset_probability"],
+            "curriculum.curriculum_reset_probability",
+        )
+        if not 0.0 < reset_probability < 1.0:
+            raise ValueError(
+                "curriculum.curriculum_reset_probability doit être dans ]0, 1["
+            )
+        success_rate_low = finite_number(
+            curriculum["success_rate_low"], "curriculum.success_rate_low",
+        )
+        success_rate_high = finite_number(
+            curriculum["success_rate_high"], "curriculum.success_rate_high",
+        )
+        if not 0.0 <= success_rate_low < success_rate_high <= 1.0:
+            raise ValueError(
+                "curriculum exige 0 <= success_rate_low < success_rate_high <= 1"
+            )
+        frontier_fraction = finite_number(
+            start_sampling["frontier_fraction"],
+            "curriculum.start_sampling.frontier_fraction",
+        )
+        historical_fraction = finite_number(
+            start_sampling["historical_fraction"],
+            "curriculum.start_sampling.historical_fraction",
+        )
+        if not (0.0 <= frontier_fraction <= 1.0
+                and 0.0 <= historical_fraction <= 1.0):
+            raise ValueError(
+                "curriculum.start_sampling fractions doivent être dans [0, 1]"
+            )
+        if not np.isclose(
+            frontier_fraction + historical_fraction, 1.0,
+            rtol=0.0, atol=1e-12,
+        ):
+            raise ValueError(
+                "curriculum.start_sampling exige "
+                "frontier_fraction + historical_fraction = 1.0"
+            )
+        historical_bins = start_sampling["historical_bins"]
+        if (isinstance(historical_bins, bool)
+                or not isinstance(historical_bins, int)
+                or historical_bins <= 0):
+            raise ValueError(
+                "curriculum.start_sampling.historical_bins doit être un entier "
+                "strictement positif"
+            )
+        for key in (
+            "mastered_samples_per_update", "too_hard_samples_per_update",
+        ):
+            value = revalidation[key]
+            if (isinstance(value, bool) or not isinstance(value, int)
+                    or value < 0):
+                raise ValueError(
+                    f"curriculum.revalidation.{key} doit être un entier "
+                    "positif ou nul"
+                )
+        for key in (
+            "update_interval_timesteps", "candidates_per_update",
+            "evaluation_rollouts_per_candidate", "max_pool_size",
+        ):
+            value = curriculum[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(
+                    f"curriculum.{key} doit être un entier strictement positif"
+                )
+        for key in ("walks_per_seed", "max_steps"):
+            value = walk[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(
+                    "curriculum.reverse_random_walk."
+                    f"{key} doit être un entier strictement positif"
+                )
+        action_scale = finite_number(
+            walk["action_scale"],
+            "curriculum.reverse_random_walk.action_scale",
+        )
+        if not 0.0 < action_scale <= 1.0:
+            raise ValueError(
+                "curriculum.reverse_random_walk.action_scale doit être dans ]0, 1]"
+            )
+        for key in ("position_tolerance", "rotation_tolerance_deg"):
+            name = f"curriculum.deduplication.{key}"
+            if finite_number(deduplication[key], name) <= 0.0:
+                raise ValueError(f"{name} doit être strictement positif")
     return cfg
 
 

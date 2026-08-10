@@ -1,0 +1,8 @@
+# Reverse Curriculum Generation autour du goal; tâche et reward héritées de V20.
+extends: test1V21.yaml
+
+curriculum:
+  enabled: true
+
+  curriculum_reset_probability: 0.95 #probability to begin with the curiculum (otherwise start from true start state)
+

@@ -8,8 +8,10 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import tarfile
 from typing import Callable
+import warnings
 
 import gymnasium
 import mujoco
@@ -25,6 +27,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecEnv,
 
 from src.assembly_env import TenonMortaiseEnv
 from src.config import load_config, save_resolved_config
+from src.curriculum import ReverseCurriculumManager
 
 
 MONITOR_FIELDS = (
@@ -42,6 +45,9 @@ MONITOR_FIELDS = (
     "episode_reward_pose", "episode_reward_force", "episode_reward_torque",
     "episode_reward_action", "episode_reward_step",
     "episode_reward_success", "episode_reward_unsafe", "episode_reward_timeout",
+    "reset_source", "curriculum_start_position_error",
+    "curriculum_start_rotation_error", "curriculum_start_pose_distance",
+    "curriculum_start_success_rate", "is_curriculum_reset",
 )
 
 EVAL_MONITOR_FIELDS = MONITOR_FIELDS + (
@@ -64,6 +70,7 @@ class EpisodeMetricsCallback(BaseCallback):
             values = [
                 float(info[key]) for info in terminal_infos
                 if isinstance(info.get(key), (bool, int, float, np.number))
+                and np.isfinite(float(info[key]))
             ]
             if values:
                 self.logger.record(f"assembly/{key}", float(np.mean(values)))
@@ -76,15 +83,382 @@ class TrainingTimestepEvalCallback(EvalCallback):
     def _on_step(self) -> bool:
         if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
             self.eval_env.set_attr("training_timesteps", self.num_timesteps)
+            try:
+                curriculum_roles = self.eval_env.get_attr(
+                    "allow_curriculum_resets"
+                )
+            except AttributeError:
+                # Environnements synthétiques des tests, sans logique RCG.
+                curriculum_roles = []
+            if any(curriculum_roles):
+                raise RuntimeError("EvalCallback ne doit jamais autoriser le curriculum")
+            self.logger.record("eval/reset_source_true_start", 1.0)
         return super()._on_step()
 
 
-def make_env(config_path: Path, rank: int, base_seed: int) -> Callable[[], TenonMortaiseEnv]:
+class ReverseCurriculumCallback(BaseCallback):
+    """Met à jour le RCG hors workers et coordonne ses checkpoints avec SAC."""
+
+    RESET_SOURCES = (
+        "true_start", "curriculum_frontier", "curriculum_historical",
+    )
+    SOURCE_LABELS = {
+        "true_start": "true_start",
+        "curriculum_frontier": "frontier",
+        "curriculum_historical": "historical",
+    }
+    CURRICULUM_SOURCES = (
+        "curriculum_frontier", "curriculum_historical",
+    )
+
+    def __init__(
+        self, manager: ReverseCurriculumManager, training_env: VecEnv,
+        output: Path, algorithm: str, checkpoint_interval: int,
+    ) -> None:
+        super().__init__()
+        self.manager = manager
+        self.curriculum_workers = training_env
+        self.output = output
+        self.algorithm = algorithm
+        self.checkpoint_interval = int(checkpoint_interval)
+        self.next_checkpoint_timesteps: int | None = None
+        self.source_episode_counts = {
+            source: 0 for source in self.RESET_SOURCES
+        }
+        self.source_transition_counts = {
+            source: 0 for source in self.RESET_SOURCES
+        }
+        self.source_success_counts = {
+            source: 0 for source in self.RESET_SOURCES
+        }
+        self.source_episode_lengths: dict[str, list[float]] = {
+            source: [] for source in self.RESET_SOURCES
+        }
+        self.used_start_distances: dict[str, list[float]] = {
+            source: [] for source in self.CURRICULUM_SOURCES
+        }
+
+    def _broadcast_pool(self) -> None:
+        pools = self.manager.training_reset_pools()
+        self.curriculum_workers.env_method(
+            "set_curriculum_reset_pools",
+            pools["frontier"], pools["historical"],
+        )
+
+    def _restore_worker_rngs(self) -> None:
+        states = self.manager.worker_rng_states
+        if states is None:
+            return
+        worker_count = len(self.curriculum_workers.get_attr("worker_rank"))
+        if len(states) != worker_count:
+            warnings.warn(
+                "Le nombre d'états RNG curriculum ne correspond pas aux workers; "
+                "les seeds de workers seront réutilisés.", RuntimeWarning,
+            )
+            return
+        for index, state in enumerate(states):
+            self.curriculum_workers.env_method(
+                "set_worker_rng_state", state, indices=index,
+            )
+
+    def _worker_rng_states(self) -> list[dict]:
+        return self.curriculum_workers.env_method("get_worker_rng_state")
+
+    def _record_distance_distribution(
+        self, prefix: str, values: list[float], *, quartiles: bool,
+        exclude: str | tuple[str, ...] | None = None,
+    ) -> None:
+        array = np.asarray(values, dtype=float)
+        array = array[np.isfinite(array)]
+        if not array.size:
+            return
+        statistics = [
+            ("min", np.min(array)),
+            ("median", np.median(array)),
+            ("max", np.max(array)),
+        ]
+        if quartiles:
+            statistics[1:1] = [("q25", np.quantile(array, 0.25))]
+            statistics[-1:-1] = [("q75", np.quantile(array, 0.75))]
+        for statistic, value in statistics:
+            self.logger.record(
+                f"curriculum/{prefix}_{statistic}", float(value),
+                exclude=exclude,
+            )
+
+    def _record_update_metrics(self) -> None:
+        report = getattr(self.manager, "last_revalidation_report", None)
+        if report is not None:
+            for name in (
+                "too_hard_revalidated", "too_hard_to_frontier",
+                "too_hard_to_mastered", "too_hard_remained_hard",
+            ):
+                self.logger.record(
+                    f"curriculum/{name}", float(getattr(report, name)),
+                )
+
+        distances = np.asarray(
+            getattr(self.manager, "last_expansion_seed_distances", []),
+            dtype=float,
+        )
+        distances = distances[np.isfinite(distances)]
+        if distances.size:
+            for statistic, value in (
+                ("min", np.min(distances)),
+                ("mean", np.mean(distances)),
+                ("max", np.max(distances)),
+            ):
+                self.logger.record(
+                    f"curriculum/expansion_seed_distance_{statistic}",
+                    float(value), exclude="stdout",
+                )
+
+        depths = np.asarray(
+            getattr(self.manager, "last_expansion_seed_depths", []),
+            dtype=float,
+        )
+        depths = depths[np.isfinite(depths)]
+        if depths.size:
+            for statistic, value in (
+                ("mean", np.mean(depths)),
+                ("max", np.max(depths)),
+            ):
+                # Ces séries complètent les distances géométriques sans
+                # encombrer ni risquer de tronquer la table console SB3.
+                self.logger.record(
+                    f"curriculum/expansion_seed_depth_{statistic}",
+                    float(value), exclude="stdout",
+                )
+
+    def _record_metrics(
+        self, *, include_pool_metrics: bool = False,
+        include_update_metrics: bool = False,
+    ) -> None:
+        # Les listes d'épisodes peuvent contenir des dizaines de milliers de
+        # valeurs : ces agrégats sont volontairement calculés à la cadence des
+        # updates RCG, jamais à chaque transition d'entraînement.
+        if include_pool_metrics:
+            sizes = self.manager.pool_sizes()
+            all_depths: list[int] = []
+            for name, size in sizes.items():
+                label = "historical" if name == "mastered" else name
+                distances = [
+                    state.pose_distance for state in self.manager.pools[name]
+                ]
+                depths = [
+                    int(state.generation_depth)
+                    for state in self.manager.pools[name]
+                ]
+                all_depths.extend(depths)
+                self.logger.record(f"curriculum/{label}_pool_size", float(size))
+                self.logger.record(
+                    f"curriculum/{name}_max_depth",
+                    float(max(depths, default=0)),
+                )
+                self._record_distance_distribution(
+                    f"{label}_pose_distance", distances, quartiles=True,
+                )
+                if name == "mastered" and distances:
+                    maximum = float(np.max(distances))
+                    # Garder les deux libellés explicitement demandés tout en
+                    # conservant la série historique existante ci-dessus.
+                    self.logger.record(
+                        "curriculum/mastered_max_pose_distance", maximum,
+                        exclude="stdout",
+                    )
+                    self.logger.record(
+                        "curriculum/mastered_pose_distance_max", maximum,
+                        exclude="stdout",
+                    )
+
+            self.logger.record(
+                "curriculum/max_generation_depth",
+                float(max(all_depths, default=0)),
+            )
+            self.logger.record(
+                "curriculum/mastered_boundary_count",
+                float(len(self.manager.mastered_boundary_states())),
+            )
+
+        if include_update_metrics:
+            self._record_update_metrics()
+
+        total_resets = sum(self.source_episode_counts.values())
+        if total_resets:
+            curriculum_resets = sum(
+                self.source_episode_counts[source]
+                for source in self.CURRICULUM_SOURCES
+            )
+            self.logger.record(
+                "curriculum/reset_fraction_total",
+                curriculum_resets / total_resets,
+            )
+            for source in self.RESET_SOURCES:
+                self.logger.record(
+                    f"curriculum/reset_fraction_{self.SOURCE_LABELS[source]}",
+                    self.source_episode_counts[source] / total_resets,
+                )
+
+        total_transitions = sum(self.source_transition_counts.values())
+        if total_transitions:
+            for source in self.RESET_SOURCES:
+                self.logger.record(
+                    "curriculum/transition_fraction_"
+                    f"{self.SOURCE_LABELS[source]}",
+                    self.source_transition_counts[source] / total_transitions,
+                )
+
+        for source in self.RESET_SOURCES:
+            label = self.SOURCE_LABELS[source]
+            count = self.source_episode_counts[source]
+            if count:
+                self.logger.record(
+                    f"curriculum/success_rate_{label}",
+                    self.source_success_counts[source] / count,
+                )
+            lengths = np.asarray(
+                self.source_episode_lengths[source], dtype=float,
+            )
+            lengths = lengths[np.isfinite(lengths)]
+            if lengths.size:
+                self.logger.record(
+                    f"curriculum/episode_length_{label}_mean",
+                    float(np.mean(lengths)),
+                )
+                self.logger.record(
+                    f"curriculum/episode_length_{label}_median",
+                    float(np.median(lengths)),
+                )
+
+        for source in self.CURRICULUM_SOURCES:
+            label = self.SOURCE_LABELS[source]
+            values = self.used_start_distances[source]
+            self._record_distance_distribution(
+                f"used_start_distance_{label}", values, quartiles=False,
+                exclude="stdout",
+            )
+            if values:
+                self.logger.record(
+                    f"curriculum/used_start_distance_{label}_mean",
+                    float(np.mean(values)),
+                    exclude="stdout",
+                )
+
+        if include_pool_metrics:
+            frontier_mean = self.manager.frontier_success_rate_mean()
+            if np.isfinite(frontier_mean):
+                self.logger.record(
+                    "curriculum/frontier_success_rate_mean", frontier_mean,
+                )
+
+    def _reset_cycle_metrics(self) -> None:
+        for source in self.RESET_SOURCES:
+            self.source_episode_counts[source] = 0
+            self.source_transition_counts[source] = 0
+            self.source_success_counts[source] = 0
+            self.source_episode_lengths[source].clear()
+        for source in self.CURRICULUM_SOURCES:
+            self.used_start_distances[source].clear()
+
+    def _save_curriculum(self, path: Path) -> None:
+        self.manager.save(
+            path, self._worker_rng_states(),
+            training_timesteps=int(self.model.num_timesteps),
+        )
+
+    def _save_checkpoint(self) -> None:
+        steps = int(self.model.num_timesteps)
+        checkpoint_dir = self.output / "checkpoints"
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        stem = f"{self.algorithm}_{steps}_steps"
+        self.model.save(checkpoint_dir / stem)
+        self.model.save_replay_buffer(
+            checkpoint_dir / f"{stem}_replay_buffer.pkl"
+        )
+        self._save_curriculum(
+            checkpoint_dir / f"curriculum_{steps}_steps.pkl"
+        )
+        self._save_curriculum(self.output / "curriculum_state.pkl")
+
+    def _process_due_work(self) -> None:
+        while self.model.num_timesteps >= self.manager.next_update_timesteps:
+            self.manager.update(self.model)
+            self._broadcast_pool()
+            self._record_metrics(
+                include_pool_metrics=True, include_update_metrics=True,
+            )
+            self._reset_cycle_metrics()
+        if self.next_checkpoint_timesteps is None:
+            self.next_checkpoint_timesteps = (
+                (int(self.model.num_timesteps) // self.checkpoint_interval + 1)
+                * self.checkpoint_interval
+            )
+        if self.model.num_timesteps >= self.next_checkpoint_timesteps:
+            self._save_checkpoint()
+            while self.model.num_timesteps >= self.next_checkpoint_timesteps:
+                self.next_checkpoint_timesteps += self.checkpoint_interval
+
+    def _on_training_start(self) -> None:
+        self._broadcast_pool()
+        self._restore_worker_rngs()
+        self.next_checkpoint_timesteps = (
+            (int(self.model.num_timesteps) // self.checkpoint_interval + 1)
+            * self.checkpoint_interval
+        )
+        self._record_metrics(include_pool_metrics=True)
+
+    def _on_rollout_start(self) -> None:
+        # Ici, la transition et le gradient du rollout précédent sont terminés.
+        self._process_due_work()
+
+    def _on_step(self) -> bool:
+        for done, info in zip(
+            self.locals.get("dones", []), self.locals.get("infos", [])
+        ):
+            source = info.get("reset_source", "true_start")
+            if source not in self.source_episode_counts:
+                continue
+            self.source_transition_counts[source] += 1
+            if not done:
+                continue
+            self.source_episode_counts[source] += 1
+            self.source_success_counts[source] += int(bool(info.get("safe_success")))
+            episode = info.get("episode")
+            episode_length = (
+                episode.get("l") if isinstance(episode, dict) else None
+            )
+            if (isinstance(episode_length, (int, float, np.number))
+                    and np.isfinite(float(episode_length))):
+                self.source_episode_lengths[source].append(
+                    float(episode_length)
+                )
+            if source in self.used_start_distances:
+                distance = info.get("curriculum_start_pose_distance")
+                if (isinstance(distance, (int, float, np.number))
+                        and np.isfinite(float(distance))):
+                    self.used_start_distances[source].append(float(distance))
+        return True
+
+    def _on_training_end(self) -> None:
+        self._process_due_work()
+        self._record_metrics(include_pool_metrics=True)
+        # OffPolicyAlgorithm retourne après on_training_end sans dump final :
+        # flusher explicitement évite de perdre la dernière fenêtre RCG.
+        self.logger.dump(step=int(self.model.num_timesteps))
+        self._save_curriculum(self.output / "curriculum_state.pkl")
+
+
+def make_env(
+    config_path: Path, rank: int, base_seed: int, *,
+    allow_curriculum_resets: bool = False,
+) -> Callable[[], TenonMortaiseEnv]:
     """Retourne une factory picklable créant une simulation MuJoCo indépendante."""
     env_seed = base_seed + rank
 
     def initialize() -> TenonMortaiseEnv:
-        env = TenonMortaiseEnv(config_path)
+        env = TenonMortaiseEnv(
+            config_path, allow_curriculum_resets=allow_curriculum_resets,
+        )
         # Attributs de diagnostic utiles aux tests, sans effet sur step().
         env.worker_rank = rank
         env.worker_seed = env_seed
@@ -102,12 +476,19 @@ def build_vec_env(
     monitor_path: Path,
     *,
     monitor_fields: tuple[str, ...] = MONITOR_FIELDS,
+    allow_curriculum_resets: bool = False,
 ) -> VecMonitor:
     """Construit les workers puis un unique writer VecMonitor dans le parent."""
     if n_envs <= 0:
         raise ValueError("n_envs doit être strictement positif")
     config_path = config_path.resolve()
-    factories = [make_env(config_path, rank, base_seed) for rank in range(n_envs)]
+    factories = [
+        make_env(
+            config_path, rank, base_seed,
+            allow_curriculum_resets=allow_curriculum_resets,
+        )
+        for rank in range(n_envs)
+    ]
     if n_envs == 1:
         vector_env: VecEnv = DummyVecEnv(factories)
     else:
@@ -122,7 +503,8 @@ def build_vec_env(
 
 def scaled_callback_freq(transition_freq: int, n_envs: int) -> int:
     """Convertit une fréquence en transitions vers les appels vectorisés SB3."""
-    return max(transition_freq // n_envs, 1)
+    # Premier appel vectoriel atteignant (jamais précédant) le seuil demandé.
+    return max((transition_freq + n_envs - 1) // n_envs, 1)
 
 
 def resolve_total_timesteps(training: dict, cli_timesteps: int | None) -> int:
@@ -139,13 +521,18 @@ def resolve_total_timesteps(training: dict, cli_timesteps: int | None) -> int:
     return total_timesteps
 
 
-def learn_model(model: BaseAlgorithm, total_timesteps: int, callbacks: CallbackList) -> None:
+def learn_model(
+    model: BaseAlgorithm, total_timesteps: int, callbacks: CallbackList, *,
+    reset_num_timesteps: bool = True,
+) -> None:
     """Start SB3 with the already resolved transition budget."""
-    model.learn(
-        total_timesteps=total_timesteps,
-        callback=callbacks,
-        progress_bar=True,
+    kwargs = dict(
+        total_timesteps=total_timesteps, callback=callbacks, progress_bar=True,
     )
+    if reset_num_timesteps:
+        model.learn(**kwargs)
+    else:
+        model.learn(**kwargs, reset_num_timesteps=False)
 
 
 def create_sac_model(
@@ -223,6 +610,32 @@ def create_model(
     )
 
 
+def load_training_model(
+    path: Path, env: VecEnv, training: dict, *, device: str,
+) -> BaseAlgorithm:
+    algorithm = training["algorithm"]
+    model_class = SAC if algorithm == "sac" else TD3
+    return model_class.load(path, env=env, device=device)
+
+
+def derived_resume_paths(model_path: Path) -> tuple[Path, Path]:
+    """Retourne replay et curriculum coordonnés à un checkpoint nommé par step."""
+    match = re.search(r"_(\d+)_steps$", model_path.stem)
+    if match:
+        replay = model_path.with_name(f"{model_path.stem}_replay_buffer.pkl")
+        curriculum = model_path.with_name(
+            f"curriculum_{match.group(1)}_steps.pkl"
+        )
+    else:
+        replay = model_path.with_name(
+            "replay_buffer_interrupted.pkl"
+            if model_path.stem == "model_interrupted"
+            else "replay_buffer.pkl"
+        )
+        curriculum = model_path.with_name("curriculum_state.pkl")
+    return replay, curriculum
+
+
 def archive_run_context(
     output: Path, args: argparse.Namespace, total_timesteps: int, algorithm: str,
 ) -> None:
@@ -275,6 +688,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-freq", type=int, default=None,
                         help="Remplace training.checkpoint_freq pour ce run")
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--resume-model", type=Path, default=None,
+                        help="Checkpoint SAC/TD3 à reprendre dans un nouveau run")
+    parser.add_argument("--resume-replay-buffer", type=Path, default=None,
+                        help="Replay coordonné; dérivé du nom du checkpoint par défaut")
+    parser.add_argument("--resume-curriculum", type=Path, default=None,
+                        help="État RCG coordonné; bootstrap avec warning s'il manque")
     return parser.parse_args()
 
 
@@ -305,7 +724,11 @@ def main() -> None:
     save_resolved_config(resolved_config, output / "config.yaml")
     archive_run_context(output, args, total_timesteps, algorithm)
 
-    env = build_vec_env(output / "config.yaml", n_envs, base_seed, output / "monitor.csv")
+    curriculum_enabled = bool(resolved_config["curriculum"]["enabled"])
+    env = build_vec_env(
+        output / "config.yaml", n_envs, base_seed, output / "monitor.csv",
+        allow_curriculum_resets=curriculum_enabled,
+    )
     evaluation = resolved_config["evaluation"]
     eval_env = None
     eval_callback = None
@@ -315,6 +738,7 @@ def main() -> None:
         eval_env = build_vec_env(
             output / "config.yaml", 1, int(evaluation["seed"]),
             eval_dir / "monitor.csv", monitor_fields=EVAL_MONITOR_FIELDS,
+            allow_curriculum_resets=False,
         )
         eval_callback = TrainingTimestepEvalCallback(
             eval_env,
@@ -324,10 +748,103 @@ def main() -> None:
             best_model_save_path=str(eval_dir),
             log_path=str(eval_dir),
         )
-    model = create_model(
-        env, training, base_seed=base_seed,
-        tensorboard_log=output / "tensorboard", device=args.device,
-    )
+    resume_model = args.resume_model.resolve() if args.resume_model else None
+    if resume_model is not None:
+        if not resume_model.is_file():
+            raise FileNotFoundError(f"Checkpoint de reprise introuvable: {resume_model}")
+        model = load_training_model(
+            resume_model, env, training, device=args.device,
+        )
+        model.tensorboard_log = str(output / "tensorboard")
+        derived_replay, derived_curriculum = derived_resume_paths(resume_model)
+        replay_path = (
+            args.resume_replay_buffer.resolve()
+            if args.resume_replay_buffer else derived_replay
+        )
+        if not replay_path.is_file():
+            raise FileNotFoundError(
+                "Reprise fidèle impossible: replay buffer coordonné introuvable: "
+                f"{replay_path}"
+            )
+        model.load_replay_buffer(replay_path)
+        curriculum_resume_path = (
+            args.resume_curriculum.resolve()
+            if args.resume_curriculum else derived_curriculum
+        )
+    else:
+        model = create_model(
+            env, training, base_seed=base_seed,
+            tensorboard_log=output / "tensorboard", device=args.device,
+        )
+        curriculum_resume_path = None
+
+    curriculum_manager = None
+    curriculum_env = None
+    if curriculum_enabled:
+        curriculum_env = TenonMortaiseEnv(
+            output / "config.yaml", allow_curriculum_resets=False,
+        )
+        curriculum_manager = ReverseCurriculumManager(
+            curriculum_env, resolved_config["curriculum"], seed=base_seed,
+        )
+        if curriculum_resume_path is not None and curriculum_resume_path.is_file():
+            curriculum_manager.load(curriculum_resume_path)
+            print(f"Curriculum restauré: {curriculum_resume_path}")
+            saved_curriculum_step = curriculum_manager.loaded_training_timesteps
+            if saved_curriculum_step is None:
+                warnings.warn(
+                    "Cet ancien curriculum_state.pkl ne contient pas le timestep "
+                    "SAC coordonné; sa synchronisation avec le modèle repris ne "
+                    "peut pas être vérifiée.", RuntimeWarning,
+                )
+            elif int(saved_curriculum_step) != int(model.num_timesteps):
+                warnings.warn(
+                    "Curriculum potentiellement stale: sauvegardé à "
+                    f"{saved_curriculum_step} transitions, mais le modèle repris "
+                    f"est à {model.num_timesteps}.", RuntimeWarning,
+                )
+        else:
+            if curriculum_resume_path is not None:
+                warnings.warn(
+                    "curriculum_state.pkl absent pour la reprise; bootstrap depuis "
+                    "le goal seed.", RuntimeWarning,
+                )
+            print(
+                "Bootstrap RCG: génération physique et qualification "
+                "stochastique hors replay...",
+                flush=True,
+            )
+            report = curriculum_manager.bootstrap(model)
+            if resume_model is not None:
+                curriculum_manager.next_update_timesteps = (
+                    int(model.num_timesteps)
+                    + int(resolved_config["curriculum"][
+                        "update_interval_timesteps"
+                    ])
+                )
+            print(
+                "Bootstrap curriculum: "
+                f"generated={report.generated}, valid={report.valid}, "
+                f"unsafe_rejected={report.unsafe_rejected}, "
+                f"successful_excluded={report.successful_excluded}"
+            )
+    if (resume_model is not None and curriculum_manager is not None
+            and curriculum_manager.worker_rng_states is not None):
+        saved_worker_rngs = curriculum_manager.worker_rng_states
+        if len(saved_worker_rngs) == n_envs:
+            # Consommer les seeds VecEnv en attente, puis installer l'état du
+            # checkpoint avant le reset effectué par _setup_learn. Le premier
+            # épisode repris suit ainsi lui aussi le flux RNG sauvegardé.
+            env.reset()
+            for index, state in enumerate(saved_worker_rngs):
+                env.env_method("set_worker_rng_state", state, indices=index)
+            curriculum_manager.worker_rng_states = None
+            model._last_obs = None
+        else:
+            warnings.warn(
+                "Le nombre d'états RNG curriculum ne correspond pas à n_envs; "
+                "la reprise utilisera les seeds de workers.", RuntimeWarning,
+            )
     print(f"RL algorithm: {algorithm.upper()}")
     print(f"total_timesteps: {total_timesteps}")
     print(f"buffer_size: {training['buffer_size']}")
@@ -338,27 +855,63 @@ def main() -> None:
         print(f"target_entropy: {training['target_entropy']}")
     else:
         print(f"action_noise_std: {training['td3']['action_noise_std']}")
-    callback_items = [
-        CheckpointCallback(
+    callback_items: list[BaseCallback] = []
+    if curriculum_manager is not None:
+        callback_items.append(ReverseCurriculumCallback(
+            curriculum_manager, env, output, algorithm, checkpoint_freq,
+        ))
+    else:
+        callback_items.append(CheckpointCallback(
             scaled_callback_freq(checkpoint_freq, n_envs),
             str(output / "checkpoints"), name_prefix=algorithm,
-        ),
-        EpisodeMetricsCallback(),
-    ]
+        ))
+    callback_items.append(EpisodeMetricsCallback())
     if eval_callback is not None:
         callback_items.append(eval_callback)
     callbacks = CallbackList(callback_items)
+    if curriculum_manager is not None:
+        # SB3 appelle env.reset() avant on_training_start : diffuser maintenant
+        # évite de forcer les 16 premiers épisodes au vrai départ.
+        reset_pools = curriculum_manager.training_reset_pools()
+        env.env_method(
+            "set_curriculum_reset_pools",
+            reset_pools["frontier"], reset_pools["historical"],
+        )
+    learning_timesteps = total_timesteps
+    reset_num_timesteps = True
+    if resume_model is not None:
+        learning_timesteps = total_timesteps - int(model.num_timesteps)
+        if learning_timesteps <= 0:
+            raise ValueError(
+                "Le checkpoint a déjà atteint le budget total demandé: "
+                f"{model.num_timesteps} >= {total_timesteps}"
+            )
+        reset_num_timesteps = False
     try:
-        learn_model(model, total_timesteps, callbacks)
+        learn_model(
+            model, learning_timesteps, callbacks,
+            reset_num_timesteps=reset_num_timesteps,
+        )
         model.save(output / "model")
+        if curriculum_manager is not None:
+            model.save_replay_buffer(output / "replay_buffer.pkl")
         print(f"Essai sauvegardé: {output}")
     except KeyboardInterrupt:
         model.save(output / "model_interrupted")
+        if curriculum_manager is not None:
+            model.save_replay_buffer(output / "replay_buffer_interrupted.pkl")
+            curriculum_manager.save(
+                output / "curriculum_state.pkl",
+                env.env_method("get_worker_rng_state"),
+                training_timesteps=int(model.num_timesteps),
+            )
         print(f"Entraînement interrompu; modèle partiel sauvegardé: {output / 'model_interrupted.zip'}")
     finally:
         env.close()
         if eval_env is not None:
             eval_env.close()
+        if curriculum_env is not None:
+            curriculum_env.close()
 
 
 if __name__ == "__main__":

@@ -15,7 +15,8 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMoni
 
 from src.train import (
     EVAL_MONITOR_FIELDS, MONITOR_FIELDS, TrainingTimestepEvalCallback,
-    build_vec_env, create_sac_model, scaled_callback_freq,
+    ReverseCurriculumCallback, build_vec_env, create_sac_model,
+    derived_resume_paths, scaled_callback_freq,
 )
 from src.config import load_config
 
@@ -97,7 +98,7 @@ class ParallelTrainingTest(unittest.TestCase):
                 env, training, base_seed=7,
                 tensorboard_log=Path("tensorboard"), device="cpu",
             )
-            self.assertEqual(model.replay_buffer.buffer_size, 250_000)
+            self.assertEqual(model.replay_buffer.buffer_size, 500_000)
             self.assertAlmostEqual(model.lr_schedule(1.0), 1e-4)
         finally:
             env.close()
@@ -105,6 +106,7 @@ class ParallelTrainingTest(unittest.TestCase):
     def test_callback_frequency_is_expressed_in_transitions(self):
         self.assertEqual(scaled_callback_freq(50_000, 1), 50_000)
         self.assertEqual(scaled_callback_freq(50_000, 4), 12_500)
+        self.assertEqual(scaled_callback_freq(25_000, 16), 1_563)
         self.assertEqual(scaled_callback_freq(2, 8), 1)
 
     def test_one_env_uses_dummy_vec_env(self):
@@ -245,6 +247,63 @@ class ParallelTrainingTest(unittest.TestCase):
             self.assertEqual(
                 {int(float(row["training_timesteps"])) for row in rows}, {2, 4}
             )
+
+    def test_eval_callback_v21_environment_cannot_use_curriculum_resets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env = build_vec_env(
+                Path("configs/test1V21.yaml"), 1, 10_007,
+                Path(directory) / "eval_monitor.csv",
+                monitor_fields=EVAL_MONITOR_FIELDS,
+                allow_curriculum_resets=False,
+            )
+            try:
+                callback = TrainingTimestepEvalCallback(
+                    env, eval_freq=1, n_eval_episodes=1,
+                    deterministic=True, warn=False,
+                )
+                self.assertTrue(callback.deterministic)
+                self.assertEqual(
+                    env.get_attr("allow_curriculum_resets"), [False],
+                )
+                env.reset()
+                self.assertEqual(env.get_attr("reset_source"), ["true_start"])
+            finally:
+                env.close()
+
+    def test_curriculum_checkpoint_writes_model_replay_and_matching_state(self):
+        class Manager:
+            def save(self, path, worker_rng_states, training_timesteps=None):
+                self.training_timesteps = training_timesteps
+                Path(path).touch()
+
+        class Workers:
+            def env_method(self, method, *args, **kwargs):
+                self.asserted_method = method
+                return [{"curriculum": {}, "environment": {}}]
+
+        class Model:
+            num_timesteps = 50_000
+
+            def save(self, path):
+                Path(f"{path}.zip").touch()
+
+            def save_replay_buffer(self, path):
+                Path(path).touch()
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            callback = ReverseCurriculumCallback(
+                Manager(), Workers(), output, "sac", 50_000,
+            )
+            callback.model = Model()
+            callback._save_checkpoint()
+            checkpoint = output / "checkpoints" / "sac_50000_steps.zip"
+            replay, curriculum = derived_resume_paths(checkpoint)
+            self.assertTrue(checkpoint.is_file())
+            self.assertTrue(replay.is_file())
+            self.assertTrue(curriculum.is_file())
+            self.assertTrue((output / "curriculum_state.pkl").is_file())
+            self.assertEqual(callback.manager.training_timesteps, 50_000)
 
 
 if __name__ == "__main__":

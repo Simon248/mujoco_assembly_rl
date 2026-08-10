@@ -199,7 +199,8 @@ def evaluate_model(
     write_trajectory: bool,
 ) -> dict:
     env = TenonMortaiseEnv(
-        run / "config.yaml", "human" if render else None, render_speed
+        run / "config.yaml", "human" if render else None, render_speed,
+        allow_curriculum_resets=False,
     )
     algorithm = env.cfg["training"].get("algorithm", "sac").lower()
     model = load_evaluation_model(model_path, env, algorithm)
@@ -207,7 +208,12 @@ def evaluate_model(
     trajectory: list[dict] = []
     try:
         for episode in range(episode_count):
-            obs, _ = env.reset(seed=seed + episode)
+            obs, reset_info = env.reset(seed=seed + episode)
+            if reset_info.get("reset_source") != "true_start":
+                raise RuntimeError(
+                    "Une évaluation a tenté un reset curriculum; abandon pour "
+                    "éviter une métrique artificiellement optimiste."
+                )
             done = False; episode_reward = 0.0; step = 0
             while not done:
                 action, _ = model.predict(obs, deterministic=True)
@@ -274,6 +280,7 @@ def evaluate_model(
             "Politique déterministe évaluée sur des scénarios pseudo-aléatoires seedés."
         ),
         "action_frame": action_frame,
+        "evaluation_reset_source": "true_start",
         "episodes_csv": str(episode_path),
         "trajectory_csv": str(trajectory_path) if trajectory_path else None,
     }

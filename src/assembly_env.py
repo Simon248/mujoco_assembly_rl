@@ -4,6 +4,7 @@ Convention centrale: T_fixed_to_mobile décrit la pose du repère CAD du tenon
 dans le repère CAD de la mortaise. L'erreur est T_target^-1 T_relative.
 """
 from __future__ import annotations
+from copy import deepcopy
 from pathlib import Path
 import time
 from xml.sax.saxutils import escape
@@ -14,8 +15,12 @@ import numpy as np
 
 from src.admittance import AdmittanceController
 from src.config import load_config
+from src.curriculum import (
+    CurriculumGenerationResult, CurriculumResetSelection, CurriculumState,
+    PhysicsStepResult, historical_quantile_bins, select_training_start,
+)
 from src.mujoco_plugins import load_sdf_plugin
-from src.task_logic import assess_status, reward_components
+from src.task_logic import assess_status, pose_distance, reward_components
 from src.transforms import compose, euler_xyz_to_quat, inv, inverse, quat_to_rotvec, relative, rotvec_to_quat, rotate
 from src.wrench import contact_wrench_at_site
 
@@ -65,7 +70,8 @@ def admittance_change_pose(
 class TenonMortaiseEnv(gym.Env):
     metadata = {"render_modes": ["human"], "render_fps": 50}
     def __init__(self, config_path: str | Path = "configs/test1.yaml", render_mode: str | None = None,
-                 render_speed: float = 1.0):
+                 render_speed: float = 1.0, *,
+                 allow_curriculum_resets: bool = False):
         if render_mode not in (None, "human"): raise ValueError("render_mode doit être None ou human")
         if render_speed <= 0: raise ValueError("render_speed doit être strictement positif")
         self.cfg, self.render_mode = load_config(config_path), render_mode
@@ -109,6 +115,19 @@ class TenonMortaiseEnv(gym.Env):
         self.friction_scale = 1.0
         # Set by the periodic evaluation callback; zero during training.
         self.training_timesteps = 0
+        # Le défaut sûr est le vrai départ. Seule la factory d'entraînement
+        # active ce rôle; evaluate.py et EvalCallback restent donc immunisés.
+        self.allow_curriculum_resets = bool(allow_curriculum_resets)
+        self.curriculum_frontier_pool: list[CurriculumState] = []
+        self.curriculum_historical_pool: list[CurriculumState] = []
+        self.curriculum_historical_bins: list[list[CurriculumState]] = []
+        self.curriculum_rng = np.random.default_rng(0)
+        self.reset_source = "true_start"
+        self.curriculum_start_position_error = np.nan
+        self.curriculum_start_rotation_error = np.nan
+        self.curriculum_start_pose_distance = np.nan
+        self.curriculum_start_success_rate = np.nan
+        self.is_curriculum_reset = False
 
     def _id(self, kind, name):
         result = mujoco.mj_name2id(self.model, kind, name)
@@ -175,10 +194,44 @@ class TenonMortaiseEnv(gym.Env):
             values.append(self.admittance.offset / self.admittance.offset_limit)
         return np.clip(np.concatenate(values), -20, 20).astype(np.float32)
 
-    def reset(self, *, seed=None, options=None):
-        super().reset(seed=seed); self.steps = 0; self.admittance.reset()
+    def _reset_episode_statistics(self) -> None:
+        self.steps = 0
         self.episode_max_force = 0.0; self.episode_max_torque = 0.0
         self.episode_reward_components = {}
+        self.best_position_error = np.inf; self.best_rotation_error = np.inf
+
+    def _set_episode_start_metadata(
+        self, reset_source: str, state: CurriculumState | None = None,
+    ) -> None:
+        self.reset_source = reset_source
+        self.is_curriculum_reset = reset_source in {
+            "curriculum_frontier", "curriculum_historical",
+        }
+        if state is None:
+            self.curriculum_start_position_error = np.nan
+            self.curriculum_start_rotation_error = np.nan
+            self.curriculum_start_pose_distance = np.nan
+            self.curriculum_start_success_rate = np.nan
+        else:
+            self.curriculum_start_position_error = float(state.position_error)
+            self.curriculum_start_rotation_error = float(state.rotation_error)
+            self.curriculum_start_pose_distance = float(state.pose_distance)
+            self.curriculum_start_success_rate = float(state.success_rate)
+
+    def _start_info(self, true_error: np.ndarray) -> dict:
+        return {
+            "true_error": true_error,
+            "friction_scale": self.friction_scale,
+            "reset_source": self.reset_source,
+            "is_curriculum_reset": self.is_curriculum_reset,
+            "curriculum_start_position_error": self.curriculum_start_position_error,
+            "curriculum_start_rotation_error": self.curriculum_start_rotation_error,
+            "curriculum_start_pose_distance": self.curriculum_start_pose_distance,
+            "curriculum_start_success_rate": self.curriculum_start_success_rate,
+        }
+
+    def _initialize_true_start(self) -> np.ndarray:
+        self._reset_episode_statistics(); self.admittance.reset()
         mujoco.mj_resetData(self.model, self.data)
         r = self.cfg["randomization"]; initial = self.cfg["initial_pose_fixed_to_mobile"]
         ip = np.array(initial["position"],float) + self.np_random.uniform(-np.array(r["mobile_translation"]), np.array(r["mobile_translation"]))
@@ -202,9 +255,94 @@ class TenonMortaiseEnv(gym.Env):
         true_error = self._error()
         self.best_position_error = float(np.linalg.norm(true_error[:3]))
         self.best_rotation_error = float(np.linalg.norm(true_error[3:]))
-        return self._observation(), {
-            "true_error": true_error, "friction_scale": self.friction_scale
+        self._set_episode_start_metadata("true_start")
+        return true_error
+
+    def _select_reset(self, requested: str) -> CurriculumResetSelection:
+        if requested not in {
+            "auto", "curriculum", "true_start",
+            "curriculum_frontier", "curriculum_historical",
+        }:
+            raise ValueError(
+                "options.reset_source doit être 'auto', 'curriculum', "
+                "'true_start', 'curriculum_frontier' ou "
+                "'curriculum_historical'"
+            )
+        if (not self.allow_curriculum_resets
+                or not bool(self.cfg["curriculum"]["enabled"])):
+            # Le rôle d'évaluation reste prioritaire, même si des pools ont été
+            # installés ou qu'un appelant demande explicitement le curriculum.
+            return CurriculumResetSelection("true_start", None)
+        curriculum = self.cfg["curriculum"]
+        sampling = curriculum["start_sampling"]
+        return select_training_start(
+            self.curriculum_rng,
+            curriculum_probability=float(
+                curriculum["curriculum_reset_probability"]
+            ),
+            frontier_fraction=float(sampling["frontier_fraction"]),
+            historical_fraction=float(sampling["historical_fraction"]),
+            historical_bins=int(sampling["historical_bins"]),
+            frontier=self.curriculum_frontier_pool,
+            historical=self.curriculum_historical_pool,
+            requested=requested,
+            historical_bin_groups=self.curriculum_historical_bins,
+        )
+
+    def _choose_reset_source(self, requested: str) -> str:
+        """Compatibilité pour les diagnostics/tests qui ne restaurent pas l'état."""
+        return self._select_reset(requested).source
+
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)
+        if seed is not None:
+            self.curriculum_rng = np.random.default_rng(
+                np.random.SeedSequence([int(seed), 22])
+            )
+        requested = (options or {}).get("reset_source", "auto")
+        selection = self._select_reset(requested)
+        if selection.state is not None:
+            return self.restore_curriculum_state(
+                selection.state, reset_episode=True,
+                restore_rng=False, reset_source=selection.source,
+            )
+        true_error = self._initialize_true_start()
+        return self._observation(), self._start_info(true_error)
+
+    def set_curriculum_reset_pools(
+        self, frontier: list[CurriculumState], historical: list[CurriculumState],
+    ) -> None:
+        """Remplace les deux mémoires de reset; too-hard n'est jamais diffusé."""
+        self.curriculum_frontier_pool = list(frontier)
+        self.curriculum_historical_pool = list(historical)
+        self.curriculum_historical_bins = historical_quantile_bins(
+            self.curriculum_historical_pool,
+            int(self.cfg["curriculum"]["start_sampling"]["historical_bins"]),
+        )
+
+    def set_curriculum_reset_pool(self, states: list[CurriculumState]) -> None:
+        """Compatibilité avec l'ancienne API : le pool fourni devient frontier."""
+        self.set_curriculum_reset_pools(states, [])
+
+    def get_curriculum_rng_state(self) -> dict:
+        return deepcopy(self.curriculum_rng.bit_generator.state)
+
+    def set_curriculum_rng_state(self, state: dict) -> None:
+        self.curriculum_rng.bit_generator.state = deepcopy(state)
+
+    def get_worker_rng_state(self) -> dict:
+        return {
+            "curriculum": self.get_curriculum_rng_state(),
+            "environment": deepcopy(self.np_random.bit_generator.state),
         }
+
+    def set_worker_rng_state(self, state: dict) -> None:
+        # Compatibilité avec les premiers snapshots ne contenant que le RCG.
+        if "curriculum" not in state:
+            self.set_curriculum_rng_state(state)
+            return
+        self.set_curriculum_rng_state(state["curriculum"])
+        self.np_random.bit_generator.state = deepcopy(state["environment"])
 
     def _site_quat(self):
         q=np.zeros(4); mujoco.mju_mat2Quat(q, self.data.site_xmat[self.grasp_site]); return q
@@ -214,6 +352,190 @@ class TenonMortaiseEnv(gym.Env):
         scale = float(self.np_random.uniform(low, high))
         self.model.geom_friction[self._contact_geom_ids] = self._base_contact_friction * scale
         return scale
+
+    def _integration_state(self) -> np.ndarray:
+        specification = mujoco.mjtState.mjSTATE_INTEGRATION
+        state = np.empty(mujoco.mj_stateSize(self.model, specification), dtype=float)
+        mujoco.mj_getState(self.model, self.data, state, specification)
+        return state
+
+    def capture_curriculum_state(
+        self, *, success_rate: float = np.nan,
+    ) -> CurriculumState:
+        """Capture l'état physique restaurable, sans statistiques d'épisode."""
+        true_error = self._error()
+        position_error = float(np.linalg.norm(true_error[:3]))
+        rotation_error = float(np.linalg.norm(true_error[3:]))
+        task_pose = relative(
+            self._pose(self.fixed_body), self._pose(self.mobile_body),
+        )
+        reference_position = (
+            None if self.reference_pose is None else self.reference_pose[0].copy()
+        )
+        reference_quaternion = (
+            None if self.reference_pose is None else self.reference_pose[1].copy()
+        )
+        rng_state = (
+            deepcopy(self.np_random.bit_generator.state)
+            if hasattr(self, "np_random") else None
+        )
+        return CurriculumState(
+            mj_state=self._integration_state(),
+            fixed_body_position=self.model.body_pos[self.fixed_body].copy(),
+            fixed_body_quaternion=self.model.body_quat[self.fixed_body].copy(),
+            contact_friction=self.model.geom_friction[
+                self._contact_geom_ids
+            ].copy(),
+            friction_scale=float(self.friction_scale),
+            admittance_offset=self.admittance.offset.copy(),
+            admittance_velocity=self.admittance.velocity.copy(),
+            reference_position=reference_position,
+            reference_quaternion=reference_quaternion,
+            perception_bias_position=self.perception_bias[0].copy(),
+            perception_bias_quaternion=self.perception_bias[1].copy(),
+            environment_rng_state=rng_state,
+            task_position=task_pose[0].copy(),
+            task_quaternion=task_pose[1].copy(),
+            position_error=position_error,
+            rotation_error=rotation_error,
+            pose_distance=pose_distance(
+                position_error, rotation_error,
+                float(self.cfg["reward"]["rotation_length_scale"]),
+            ),
+            success_rate=float(success_rate),
+        )
+
+    def restore_curriculum_state(
+        self, state: CurriculumState, *, reset_episode: bool = True,
+        restore_rng: bool = True, reset_source: str = "curriculum_frontier",
+    ) -> tuple[np.ndarray, dict]:
+        """Restaure exactement un snapshot puis recalcule les quantités dérivées."""
+        self.model.body_pos[self.fixed_body] = state.fixed_body_position
+        self.model.body_quat[self.fixed_body] = state.fixed_body_quaternion
+        self.model.geom_friction[self._contact_geom_ids] = state.contact_friction
+        self.friction_scale = float(state.friction_scale)
+        mujoco.mj_setState(
+            self.model, self.data, state.mj_state,
+            mujoco.mjtState.mjSTATE_INTEGRATION,
+        )
+        self.admittance.offset = state.admittance_offset.copy()
+        self.admittance.velocity = state.admittance_velocity.copy()
+        self.reference_pose = (
+            None
+            if state.reference_position is None
+            else (
+                state.reference_position.copy(),
+                state.reference_quaternion.copy(),
+            )
+        )
+        self.perception_bias = (
+            state.perception_bias_position.copy(),
+            state.perception_bias_quaternion.copy(),
+        )
+        if restore_rng and state.environment_rng_state is not None:
+            self.np_random.bit_generator.state = deepcopy(
+                state.environment_rng_state
+            )
+        mujoco.mj_forward(self.model, self.data)
+        # mj_forward recalcule correctement les poses/contact dérivés mais
+        # remplace qacc_warmstart. Le second setState remet ce warm-start exact;
+        # les quantités dérivées restent valides puisque qpos n'a pas changé.
+        mujoco.mj_setState(
+            self.model, self.data, state.mj_state,
+            mujoco.mjtState.mjSTATE_INTEGRATION,
+        )
+        true_error = self._error()
+        if reset_episode:
+            self._reset_episode_statistics()
+            position_error = float(np.linalg.norm(true_error[:3]))
+            rotation_error = float(np.linalg.norm(true_error[3:]))
+            self.best_position_error = position_error
+            self.best_rotation_error = rotation_error
+            self._set_episode_start_metadata(reset_source, state)
+        return self._observation(), self._start_info(true_error)
+
+    def build_goal_seed(self, *, seed: int | None = None) -> CurriculumState:
+        """Construit et valide la pose finale exacte, réservée à l'expansion."""
+        super().reset(seed=seed)
+        self._reset_episode_statistics(); self.admittance.reset()
+        mujoco.mj_resetData(self.model, self.data)
+        fixed_pose = (
+            np.zeros(3, dtype=float), np.array([1.0, 0.0, 0.0, 0.0]),
+        )
+        self.model.body_pos[self.fixed_body] = fixed_pose[0]
+        self.model.body_quat[self.fixed_body] = fixed_pose[1]
+        self.model.geom_friction[self._contact_geom_ids] = self._base_contact_friction
+        self.friction_scale = 1.0
+        mobile_pose = compose(fixed_pose, self._target())
+        self.data.qpos[self.qadr:self.qadr + 3] = mobile_pose[0]
+        self.data.qpos[self.qadr + 3:self.qadr + 7] = mobile_pose[1]
+        self.data.qvel[:] = 0.0
+        mujoco.mj_forward(self.model, self.data)
+        grasp = (
+            self.data.site_xpos[self.grasp_site].copy(), self._site_quat(),
+        )
+        self.reference_pose = (
+            (grasp[0].copy(), grasp[1].copy())
+            if self.cfg["action"]["control_mode"] == "accumulated_reference"
+            else None
+        )
+        mocap = self.model.body_mocapid[self.target_mocap]
+        self.data.mocap_pos[mocap] = grasp[0]
+        self.data.mocap_quat[mocap] = grasp[1]
+        perception = self.cfg["perception"]
+        self.perception_bias = (
+            np.asarray(perception["translation_bias"], dtype=float),
+            euler_xyz_to_quat(np.deg2rad(perception["rotation_bias_deg"])),
+        )
+        mujoco.mj_forward(self.model, self.data)
+
+        true_error = self._error()
+        position_error = float(np.linalg.norm(true_error[:3]))
+        rotation_error = float(np.linalg.norm(true_error[3:]))
+        wrench = self._true_wrench()
+        safety = self.cfg["success"]
+        status = assess_status(
+            position_error=position_error, rotation_error=rotation_error,
+            max_force=float(np.linalg.norm(wrench[:3])),
+            max_torque=float(np.linalg.norm(wrench[3:])),
+            workspace_error=position_error, step_count=0,
+            config=safety,
+            max_episode_steps=self.cfg["simulation"]["max_episode_steps"],
+        )
+        if not status.success or status.unsafe:
+            raise RuntimeError(
+                "Goal seed RCG invalide: "
+                f"position_error={position_error:.9g}, "
+                f"rotation_error={rotation_error:.9g}, "
+                f"unsafe={status.unsafe}, reason={status.termination_reason}"
+            )
+        self.best_position_error = position_error
+        self.best_rotation_error = rotation_error
+        self._set_episode_start_metadata("goal_seed")
+        goal_seed = self.capture_curriculum_state(success_rate=1.0)
+
+        # Vérification de stabilité sur un cycle de contrôle, puis restauration
+        # de la pose exacte servant de seed.
+        stable_force, stable_torque = self._run_control_substeps(safety)
+        stable_error = self._error()
+        stable_status = assess_status(
+            position_error=float(np.linalg.norm(stable_error[:3])),
+            rotation_error=float(np.linalg.norm(stable_error[3:])),
+            max_force=stable_force, max_torque=stable_torque,
+            workspace_error=float(np.linalg.norm(stable_error[:3])),
+            step_count=0, config=safety,
+            max_episode_steps=self.cfg["simulation"]["max_episode_steps"],
+        )
+        if not stable_status.success or stable_status.unsafe:
+            raise RuntimeError(
+                "Goal seed RCG instable après un cycle de contrôle: "
+                f"reason={stable_status.termination_reason}"
+            )
+        self.restore_curriculum_state(
+            goal_seed, reset_episode=False, restore_rng=True,
+            reset_source="goal_seed",
+        )
+        return goal_seed
 
     def _run_control_substeps(self, safety: dict) -> tuple[float, float]:
         """Avance MuJoCo en latchant les pics vrais et en stoppant au seuil dur."""
@@ -229,7 +551,8 @@ class TenonMortaiseEnv(gym.Env):
                 break
         return max_force, max_torque
 
-    def step(self, action):
+    def _advance_physics(self, action) -> PhysicsStepResult:
+        """Chaîne physique commune aux épisodes RL et aux marches RCG."""
         action = np.clip(np.asarray(action,float), -1, 1); a=self.cfg["action"]
         nominal = np.r_[action[:3]*a["max_translation_step"], action[3:]*np.deg2rad(a["max_rotation_step_deg"])]
         delta_pose = (nominal[:3], rotvec_to_quat(nominal[3:]))
@@ -275,18 +598,68 @@ class TenonMortaiseEnv(gym.Env):
         mocap = self.model.body_mocapid[self.target_mocap]; self.data.mocap_pos[mocap], self.data.mocap_quat[mocap] = target
         safety = self.cfg["success"]
         step_max_force, step_max_torque = self._run_control_substeps(safety)
+        return PhysicsStepResult(
+            action=action,
+            true_error=self._error(),
+            final_wrench=self._true_wrench(),
+            max_force=step_max_force,
+            max_torque=step_max_torque,
+        )
+
+    def step_for_curriculum_generation(
+        self, action,
+    ) -> CurriculumGenerationResult:
+        """Avance la vraie physique sans reward, statistiques RL ni timeout.
+
+        Le succès est rapporté mais n'interrompt pas la marche; l'orchestrateur
+        n'abandonne que sur une violation de sécurité.
+        """
+        result = self._advance_physics(action)
+        position_error = float(np.linalg.norm(result.true_error[:3]))
+        rotation_error = float(np.linalg.norm(result.true_error[3:]))
+        status = assess_status(
+            position_error=position_error, rotation_error=rotation_error,
+            max_force=result.max_force, max_torque=result.max_torque,
+            workspace_error=position_error, step_count=0,
+            config=self.cfg["success"],
+            max_episode_steps=self.cfg["simulation"]["max_episode_steps"],
+        )
+        distance = pose_distance(
+            position_error, rotation_error,
+            float(self.cfg["reward"]["rotation_length_scale"]),
+        )
+        state = self.capture_curriculum_state()
+        return CurriculumGenerationResult(
+            state=state,
+            geometric_success=status.geometric_success,
+            success=status.success,
+            unsafe=status.unsafe,
+            unsafe_force=status.unsafe_force,
+            unsafe_torque=status.unsafe_torque,
+            unsafe_workspace=status.unsafe_workspace,
+            position_error=position_error,
+            rotation_error=rotation_error,
+            pose_distance=distance,
+        )
+
+    def step(self, action):
+        result = self._advance_physics(action)
+        action = result.action
+        step_max_force = result.max_force
+        step_max_torque = result.max_torque
 
         self.steps += 1
         self.episode_max_force = max(self.episode_max_force, step_max_force)
         self.episode_max_torque = max(self.episode_max_torque, step_max_torque)
-        true_error = self._error(); pos = float(np.linalg.norm(true_error[:3])); rot = float(np.linalg.norm(true_error[3:]))
+        true_error = result.true_error
+        pos = float(np.linalg.norm(true_error[:3])); rot = float(np.linalg.norm(true_error[3:]))
         self.best_position_error = min(self.best_position_error, pos)
         self.best_rotation_error = min(self.best_rotation_error, rot)
         status = assess_status(
             position_error=pos, rotation_error=rot,
             max_force=step_max_force, max_torque=step_max_torque,
             workspace_error=pos, step_count=self.steps,
-            config=safety, max_episode_steps=self.cfg["simulation"]["max_episode_steps"],
+            config=self.cfg["success"], max_episode_steps=self.cfg["simulation"]["max_episode_steps"],
         )
         components = reward_components(
             position_error=pos, rotation_error=rot,
@@ -297,12 +670,13 @@ class TenonMortaiseEnv(gym.Env):
         for key, value in components.items():
             if key.startswith("reward_"):
                 self.episode_reward_components[key] = self.episode_reward_components.get(key, 0.0) + value
-        final_wrench = self._true_wrench()
+        final_wrench = result.final_wrench
         info = {
             **components,
             "geometric_success": status.geometric_success,
             "success": status.success,
             "safe_success": status.success,
+            "is_success": status.success,
             "unsafe": status.unsafe,
             "unsafe_force": status.unsafe_force,
             "unsafe_torque": status.unsafe_torque,
@@ -337,6 +711,12 @@ class TenonMortaiseEnv(gym.Env):
             "max_torque": self.episode_max_torque,
             "training_timesteps": self.training_timesteps,
             "friction_scale": self.friction_scale,
+            "reset_source": self.reset_source,
+            "is_curriculum_reset": self.is_curriculum_reset,
+            "curriculum_start_position_error": self.curriculum_start_position_error,
+            "curriculum_start_rotation_error": self.curriculum_start_rotation_error,
+            "curriculum_start_pose_distance": self.curriculum_start_pose_distance,
+            "curriculum_start_success_rate": self.curriculum_start_success_rate,
         }
         info.update({f"episode_{key}": value for key, value in self.episode_reward_components.items()})
         if self.render_mode=="human": self.render()

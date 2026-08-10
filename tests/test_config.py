@@ -91,7 +91,8 @@ class ConfigTest(unittest.TestCase):
                 load_config(path)
 
     def test_test1_v10_only_switches_control_mode_from_test1_v9(self):
-        reference = load_config("data/output/test1V9/config.yaml")
+        # V9 n'est pas un artefact suivi; sa configuration était celle de V5.
+        reference = load_config("configs/test1V5.yaml")
         reactive = load_config("configs/test1V10.yaml")
         self.assertEqual(reference["action"]["control_mode"], "accumulated_reference")
         self.assertEqual(reactive["action"]["control_mode"], "reactive_actual_pose")
@@ -181,6 +182,151 @@ class ConfigTest(unittest.TestCase):
         })
         self.assertEqual(v20["training"]["gamma"], 0.99)
 
+    def test_v21_adds_only_the_explicit_reverse_curriculum_block(self):
+        v20 = load_config("configs/test1V20.yaml")
+        v21 = load_config("configs/test1V21.yaml")
+        self.assertTrue(v21["curriculum"]["enabled"])
+        self.assertEqual(v21["curriculum"], {
+            "enabled": True,
+            "curriculum_reset_probability": 0.80,
+            "success_rate_low": 0.10,
+            "success_rate_high": 0.90,
+            "update_interval_timesteps": 50_000,
+            "candidates_per_update": 32,
+            "evaluation_rollouts_per_candidate": 5,
+            "max_pool_size": 2_000,
+            "start_sampling": {
+                "frontier_fraction": 0.625,
+                "historical_fraction": 0.375,
+                "historical_bins": 4,
+            },
+            "revalidation": {
+                "mastered_samples_per_update": 8,
+                "too_hard_samples_per_update": 12,
+            },
+            "reverse_random_walk": {
+                "walks_per_seed": 8, "max_steps": 20,
+                "action_scale": 0.5,
+            },
+            "deduplication": {
+                "position_tolerance": 0.0005,
+                "rotation_tolerance_deg": 0.5,
+            },
+        })
+        v20["curriculum"] = deepcopy(v21["curriculum"])
+        self.assertEqual(v20, v21)
+
+    def test_v21_curi_max_only_keeps_its_explicit_reset_probability(self):
+        baseline = load_config("configs/test1V21.yaml")
+        curi_max = load_config("configs/test1V21-curi_max.yaml")
+
+        self.assertEqual(curi_max["curriculum"]["curriculum_reset_probability"], .95)
+        self.assertNotIn("expansion", curi_max["curriculum"])
+        self.assertNotIn(
+            "min_pose_distance_increase",
+            curi_max["curriculum"]["reverse_random_walk"],
+        )
+        baseline["curriculum"]["curriculum_reset_probability"] = .95
+        self.assertEqual(curi_max, baseline)
+
+    def test_old_config_without_curriculum_defaults_to_disabled(self):
+        config = load_config("configs/test1V20.yaml")
+        config.pop("curriculum")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "archived_config.yaml"
+            save_resolved_config(config, path)
+            resolved = load_config(path)
+        self.assertEqual(resolved["curriculum"], {"enabled": False})
+
+    def test_archived_v21_gets_backward_compatible_sampling_defaults(self):
+        config = load_config("configs/test1V21.yaml")
+        config["curriculum"].pop("start_sampling")
+        config["curriculum"].pop("revalidation")
+        config["curriculum"]["evaluation_rollouts_per_candidate"] = 3
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "archived_v21.yaml"
+            save_resolved_config(config, path)
+            resolved = load_config(path)
+        self.assertEqual(resolved["curriculum"]["start_sampling"], {
+            "frontier_fraction": .625,
+            "historical_fraction": .375,
+            "historical_bins": 4,
+        })
+        self.assertNotIn("expansion", resolved["curriculum"])
+        self.assertEqual(resolved["curriculum"]["revalidation"], {
+            "mastered_samples_per_update": 8,
+            "too_hard_samples_per_update": 12,
+        })
+        self.assertEqual(
+            resolved["curriculum"]["evaluation_rollouts_per_candidate"], 3,
+        )
+
+    def test_historical_bin_count_defaults_to_four_in_partial_sampling_block(self):
+        config = load_config("configs/test1V21.yaml")
+        config["curriculum"]["start_sampling"].pop("historical_bins")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "partial_sampling.yaml"
+            save_resolved_config(config, path)
+            resolved = load_config(path)
+        self.assertEqual(
+            resolved["curriculum"]["start_sampling"]["historical_bins"], 4,
+        )
+
+    def test_enabled_curriculum_is_strictly_validated(self):
+        base = load_config("configs/test1V21.yaml")
+        mutations = (
+            (lambda cfg: cfg["curriculum"].__setitem__(
+                "curriculum_reset_probability", 1.0),
+             "curriculum_reset_probability"),
+            (lambda cfg: cfg["curriculum"].__setitem__(
+                "success_rate_low", 0.95), "success_rate_low"),
+            (lambda cfg: cfg["curriculum"]["reverse_random_walk"].__setitem__(
+                "action_scale", 1.5), "action_scale"),
+            (lambda cfg: cfg["curriculum"]["deduplication"].__setitem__(
+                "position_tolerance", 0.0), "position_tolerance"),
+            (lambda cfg: cfg["curriculum"]["start_sampling"].__setitem__(
+                "historical_fraction", 0.5), "frontier_fraction"),
+            (lambda cfg: cfg["curriculum"]["start_sampling"].__setitem__(
+                "historical_bins", 0), "historical_bins"),
+            (lambda cfg: cfg["curriculum"]["revalidation"].__setitem__(
+                "mastered_samples_per_update", -1),
+             "mastered_samples_per_update"),
+            (lambda cfg: cfg["curriculum"]["revalidation"].__setitem__(
+                "too_hard_samples_per_update", -1),
+             "too_hard_samples_per_update"),
+        )
+        for mutate, expected_message in mutations:
+            with self.subTest(field=expected_message), tempfile.TemporaryDirectory() as directory:
+                invalid = deepcopy(base); mutate(invalid)
+                path = Path(directory) / "config.yaml"
+                save_resolved_config(invalid, path)
+                with self.assertRaisesRegex(ValueError, expected_message):
+                    load_config(path)
+
+    def test_deprecated_geometry_fields_are_accepted_without_validation(self):
+        config = load_config("configs/test1V21.yaml")
+        config["curriculum"]["expansion"] = {
+            "mastered_edge_fraction": "deprecated-value",
+        }
+        config["curriculum"]["reverse_random_walk"][
+            "min_pose_distance_increase"
+        ] = "deprecated-value"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy_config.yaml"
+            save_resolved_config(config, path)
+            resolved = load_config(path)
+
+        self.assertEqual(
+            resolved["curriculum"]["expansion"]["mastered_edge_fraction"],
+            "deprecated-value",
+        )
+        self.assertEqual(
+            resolved["curriculum"]["reverse_random_walk"][
+                "min_pose_distance_increase"
+            ],
+            "deprecated-value",
+        )
+
     def test_total_timesteps_resolution_and_archived_effective_value(self):
         training = {"total_timesteps": 1_000_000}
         self.assertEqual(resolve_total_timesteps(training, None), 1_000_000)
@@ -211,10 +357,10 @@ class ConfigTest(unittest.TestCase):
     def test_test1_v13_only_changes_budget_and_learning_rate_from_v12(self):
         v12 = load_config("configs/test1V12.yaml")
         v13 = load_config("configs/test1V13.yaml")
-        self.assertEqual(v13["training"]["total_timesteps"], 1_000_000)
+        self.assertEqual(v13["training"]["total_timesteps"], 6_000_000)
         self.assertEqual(v13["training"]["buffer_size"], 250_000)
         self.assertEqual(v13["training"]["learning_rate"], 1e-4)
-        v12["training"]["total_timesteps"] = 1_000_000
+        v12["training"]["total_timesteps"] = 6_000_000
         v12["training"]["learning_rate"] = 1e-4
         self.assertEqual(v13, v12)
 
@@ -222,9 +368,9 @@ class ConfigTest(unittest.TestCase):
         v10 = load_config("configs/test1V10.yaml")
         v11 = load_config("configs/test1V11.yaml")
         self.assertEqual(v10["training"]["buffer_size"], 50_000)
-        self.assertEqual(v11["training"]["buffer_size"], 250_000)
+        self.assertEqual(v11["training"]["buffer_size"], 500_000)
         self.assertEqual(v11["training"]["learning_rate"], 3e-4)
-        v10["training"]["buffer_size"] = 250_000
+        v10["training"]["buffer_size"] = 500_000
         self.assertEqual(v11, v10)
 
     def test_sac_buffer_and_learning_rate_must_be_positive(self):
