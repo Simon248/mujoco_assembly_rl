@@ -53,6 +53,25 @@ class _Manager:
             expansion_scale_max=1.5625,
             frontier_found_per_candidate=.25,
             expansion_wall_time=2.5,
+            stop_reasons={"duplicate": 2, "frontier": 1},
+            raw_candidates_generated=7,
+            valid_candidates=6,
+            nonduplicate_candidates=4,
+            qualified_candidates=4,
+            raw_parent_translation_mm=[.2, .4],
+            raw_parent_rotation_deg=[1.0, 3.0],
+            duplicate_parent_translation_mm=[.2],
+            duplicate_parent_rotation_deg=[1.0],
+            duplicate_nearest_position_mm=[.1],
+            duplicate_nearest_rotation_deg=[.5],
+            reverse_steps=[2, 4],
+            safe_prefix_steps=[2],
+            persistent_attempts=6, independent_attempts=4,
+            branch_heading_changes=[.1, .3],
+            attempt_to_heading_deviations=[.2, .4],
+            successive_hop_heading_opposition=1,
+            guided_memory_insertions=4,
+            guided_memory_rejected_duplicates=2,
         )
         self.last_revalidation_report = SimpleNamespace(
             too_hard_revalidated=12,
@@ -216,6 +235,41 @@ class ReverseCurriculumCallbackTest(unittest.TestCase):
         }
         for name, expected in expected_update_metrics.items():
             self.assertAlmostEqual(values[f"curriculum/{name}"], expected)
+        self.assertEqual(values["curriculum/stop_duplicate"], 2)
+        self.assertEqual(values["curriculum/stop_frontier"], 1)
+        self.assertEqual(values["curriculum/stop_workspace"], 0)
+        self.assertEqual(values["curriculum/raw_candidates_generated"], 7)
+        self.assertEqual(values["curriculum/valid_candidates"], 6)
+        self.assertEqual(values["curriculum/nonduplicate_candidates"], 4)
+        self.assertEqual(values["curriculum/qualified_candidates"], 4)
+        self.assertAlmostEqual(values["curriculum/raw_candidate_rate"], .7)
+        self.assertAlmostEqual(values["curriculum/qualification_rate"], .4)
+        self.assertAlmostEqual(
+            values["curriculum/raw_parent_translation_mm_mean"], .3,
+        )
+        self.assertEqual(values["curriculum/raw_parent_rotation_deg_max"], 3)
+        self.assertEqual(values["curriculum/reverse_steps_min"], 2)
+        self.assertEqual(values["curriculum/persistent_attempts"], 6)
+        self.assertEqual(values["curriculum/independent_attempts"], 4)
+        self.assertAlmostEqual(
+            values["curriculum/branch_heading_changes_mean"], .2,
+        )
+        self.assertEqual(
+            values["curriculum/attempt_to_heading_deviation_max"], .4,
+        )
+        self.assertEqual(
+            values["curriculum/successive_hop_heading_opposition"], 1,
+        )
+        self.assertEqual(values["curriculum/guided_memory_insertions"], 4)
+        self.assertEqual(
+            values["curriculum/guided_memory_rejected_duplicates"], 2,
+        )
+        self.assertAlmostEqual(
+            values[
+                "curriculum/reverse_candidate_parent_delta_position_mm_mean"
+            ],
+            .3,
+        )
 
     def test_training_end_flushes_the_last_tensorboard_window(self):
         self.callback._process_due_work = lambda: None
@@ -223,6 +277,103 @@ class ReverseCurriculumCallbackTest(unittest.TestCase):
         self.callback.model.num_timesteps = 12_345
         self.callback._on_training_end()
         self.assertEqual(self.logger.dumps, [12_345])
+
+    def test_true_start_progress_uses_simultaneous_pose_and_milestones(self):
+        self.callback.locals = {
+            "dones": [True],
+            "infos": [{
+                "reset_source": "true_start", "safe_success": False,
+                "episode": {"l": 12}, "best_position_error": .006,
+                "best_pose_metric": .009,
+                "position_error_at_best_pose": .007,
+                "rotation_error_at_best_pose": .02,
+                "reached_20mm": 1.0, "reached_10mm": 1.0,
+                "reached_5mm": 0.0, "reached_2mm": 0.0,
+            }],
+        }
+        self.callback._on_step()
+        self.callback._record_metrics()
+        self.assertEqual(self.logger.values["true_start/best_position_error"], .006)
+        self.assertEqual(self.logger.values["true_start/best_pose_metric"], .009)
+        self.assertEqual(self.logger.values["true_start/reached_10mm"], 1.0)
+        self.assertEqual(self.logger.values["true_start/reached_5mm"], 0.0)
+
+    def test_frontier_start_repetition_is_counted_by_state_id_per_window(self):
+        infos = [
+            {
+                "reset_source": "curriculum_frontier", "safe_success": False,
+                "curriculum_start_state_id": state_id, "episode": {"l": 2},
+            }
+            for state_id in (7, 7, 8)
+        ]
+        self.callback.locals = {"dones": [True] * 3, "infos": infos}
+        self.callback._on_step()
+        self.callback._record_metrics()
+        self.assertEqual(
+            self.logger.values["curriculum/frontier_unique_states_sampled"], 2,
+        )
+        self.assertEqual(
+            self.logger.values["curriculum/frontier_resets_per_state_max"], 2,
+        )
+        self.assertEqual(
+            self.logger.values["curriculum/frontier_resets_per_state_mean"], 1.5,
+        )
+
+    def test_sampling_targets_are_bound_to_the_correct_update_window(self):
+        self.manager.pools["frontier"] = []
+        self.manager.pools["mastered"] = []
+        self.manager.mastered_boundary_states = lambda: []
+        self.manager.config = {
+            "curriculum_reset_probability": .95,
+            "start_sampling": {
+                "strategy": "adaptive_three_way",
+                "historical_bins": 4,
+                "frontier": {
+                    "fraction_per_state": .10, "fraction_max": .45,
+                },
+                "historical": {
+                    "fraction_per_state": .01, "fraction_max": .25,
+                },
+                "true_start": {"fraction_min": .30},
+            },
+        }
+        self.callback.sampling_targets_used = self.callback._sampling_targets()
+        self.callback.source_episode_counts["true_start"] = 5
+        captured = {}
+
+        def update(model):
+            self.manager.pools["frontier"] = [
+                SimpleNamespace(pose_distance=.01, generation_depth=index)
+                for index in (1, 2)
+            ]
+            self.manager.next_update_timesteps = 100_000
+
+        def write(targets_used, targets_next):
+            captured["used"] = targets_used
+            captured["next"] = targets_next
+
+        self.manager.update = update
+        self.callback._write_curriculum_diagnostics = write
+        self.callback.model.num_timesteps = 50_000
+        self.callback._process_due_work()
+
+        self.assertEqual(captured["used"].frontier, 0.0)
+        self.assertEqual(captured["used"].true_start, 1.0)
+        self.assertEqual(captured["next"].frontier, .20)
+        self.assertEqual(captured["next"].true_start, .80)
+        self.assertEqual(
+            self.logger.values["curriculum/sampling/target_used/frontier"],
+            0.0,
+        )
+        self.assertEqual(
+            self.logger.values["curriculum/sampling/observed/frontier"],
+            0.0,
+        )
+        self.assertEqual(
+            self.logger.values["curriculum/sampling/target_next/frontier"],
+            .20,
+        )
+        self.assertEqual(self.callback.sampling_targets_used.frontier, .20)
 
     def test_long_used_start_metrics_do_not_collide_in_human_logger(self):
         stream = io.StringIO()

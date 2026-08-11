@@ -1,0 +1,722 @@
+# ============================================================================
+# CONFIGURATION DE RÉFÉRENCE — MuJoCo Assembly RL
+# ============================================================================
+#
+# Ce fichier consolide les paramètres rencontrés dans les configs fournies
+# (test0.yaml -> test1V34.yaml).
+#
+# Valeurs actives :
+#   - les valeurs ci-dessous reprennent autant que possible le run test1V34
+#     après résolution de son héritage depuis test1V20/test0 ;
+#   - les paramètres anciens encore hérités sont conservés et marqués LEGACY.
+#
+# Paramètres optionnels :
+#   - les paramètres TD3 et l'ancien sampler de curriculum sont laissés
+#     commentés pour documenter tous les paramètres rencontrés sans modifier
+#     accidentellement un run SAC / adaptive_three_way.
+#
+# Unités :
+#   - distances : m
+#   - angles de configuration : degrés lorsqu'indiqué "_deg"
+#   - temps : s
+#   - forces : N
+#   - couples : N.m
+#   - quaternions : [w, x, y, z]
+#
+# ATTENTION :
+#   Ce fichier documente les CONFIGS fournies. Pour quelques paramètres legacy,
+#   leur utilisation exacte dépend de la version du code qui charge la config.
+# ============================================================================
+
+
+# ----------------------------------------------------------------------------
+# HÉRITAGE / CAS
+# ----------------------------------------------------------------------------
+
+# Permet à une config d'en surcharger une autre.
+# Exemple rencontré : extends: test1V20.yaml
+# Pour une config de référence entièrement explicite, on peut ne pas utiliser
+# "extends" et conserver toutes les valeurs dans le même fichier.
+# extends: test1V20.yaml
+
+# Cas CAO / assemblage chargé.
+# Valeurs documentées dans test0 :
+#   tenon_1 = tenon_visual.stl
+#   tenon_2 = tenon-2.stl
+case: tenon_1
+
+
+# ----------------------------------------------------------------------------
+# SIMULATION
+# ----------------------------------------------------------------------------
+
+simulation:
+  # Pas interne de MuJoCo.
+  # 0.002 s = simulation physique à 500 Hz.
+  timestep: 0.002
+
+  # Période entre deux décisions/actions de la policy.
+  # 0.02 s = contrôle RL à 50 Hz.
+  control_dt: 0.02
+
+  # Nombre maximal de décisions RL dans un épisode.
+  # Avec control_dt=0.02, 300 steps = 6 s maximum d'épisode.
+  max_episode_steps: 300
+
+
+# ----------------------------------------------------------------------------
+# ENTRAÎNEMENT RL
+# ----------------------------------------------------------------------------
+
+training:
+  # Algorithme Stable-Baselines3.
+  # Valeurs rencontrées : sac, td3.
+  algorithm: sac
+
+  # Nombre total de transitions SB3 visé pour le run.
+  # Valeurs testées : 500_000, 5_000_000, 6_000_000.
+  total_timesteps: 5000000
+
+  # Nombre d'environnements parallèles.
+  n_envs: 16
+
+  # Seed de base pour rendre les expériences aussi reproductibles que possible.
+  base_seed: 7
+
+  # Fréquence de sauvegarde des checkpoints en transitions globales SB3.
+  checkpoint_freq: 50000
+
+  # SAC : coefficient d'entropie.
+  # "auto" laisse SAC ajuster automatiquement le compromis exploration/exploitation.
+  ent_coef: auto
+
+  # SAC : entropie cible.
+  # Valeurs testées dans les configs : auto, -3.0, -9.0.
+  target_entropy: auto
+
+  # Taille maximale du replay buffer.
+  # Valeurs testées : 50_000, 250_000, 500_000.
+  buffer_size: 250000
+
+  # Learning rate des réseaux/optimiseurs RL.
+  # Valeurs testées : 1e-4 et 3e-4.
+  learning_rate: 0.0003
+
+  # Facteur d'actualisation du retour futur.
+  gamma: 0.99
+
+  # --------------------------------------------------------------------------
+  # TD3 — uniquement utilisé si training.algorithm: td3
+  # Paramètres rencontrés dans test1V15.
+  # --------------------------------------------------------------------------
+  # td3:
+  #   # Écart-type du bruit ajouté aux actions pour l'exploration.
+  #   action_noise_std: 0.1
+  #
+  #   # Nombre d'updates du critic entre deux updates de la policy.
+  #   policy_delay: 2
+  #
+  #   # Bruit appliqué à l'action cible lors du calcul de la target Q.
+  #   target_policy_noise: 0.2
+  #
+  #   # Clip du bruit de target policy.
+  #   target_noise_clip: 0.5
+
+
+# ----------------------------------------------------------------------------
+# ÉVALUATION DE LA POLICY
+# ----------------------------------------------------------------------------
+
+evaluation:
+  # Active les évaluations périodiques indépendantes de l'entraînement.
+  enabled: true
+
+  # Fréquence en transitions globales SB3, indépendante de n_envs.
+  eval_freq: 25000
+
+  # Nombre d'épisodes par évaluation.
+  # 1 est rapide mais donne une estimation très bruitée.
+  n_eval_episodes: 1
+
+  # true = policy déterministe lors de l'évaluation.
+  deterministic: true
+
+  # Seed dédiée à l'évaluation.
+  seed: 10007
+
+
+# ----------------------------------------------------------------------------
+# POSE CIBLE ET POSE INITIALE
+# ----------------------------------------------------------------------------
+
+# Pose finale désirée de la pièce mobile par rapport à la pièce fixe.
+target_pose_fixed_to_mobile:
+  # Translation [x, y, z] en mètres.
+  position: [0.0, 0.0, 0.0]
+
+  # Orientation quaternion [w, x, y, z].
+  orientation_quat: [1.0, 0.0, 0.0, 0.0]
+
+
+# Pose nominale de départ de la pièce mobile par rapport à la pièce fixe.
+initial_pose_fixed_to_mobile:
+  # Ici : départ 40 mm au-dessus de la cible.
+  position: [0.0, 0.0, 0.04]
+
+  orientation_quat: [1.0, 0.0, 0.0, 0.0]
+
+
+# ----------------------------------------------------------------------------
+# DOMAIN RANDOMIZATION
+# ----------------------------------------------------------------------------
+
+randomization:
+  # Amplitude de randomisation de translation de la pièce mobile [x,y,z].
+  # test2 a utilisé [0.005, 0.005, 0.005].
+  mobile_translation: [0.0, 0.0, 0.0]
+
+  # Amplitude de randomisation de rotation de la pièce mobile [rx,ry,rz], deg.
+  # test2 a utilisé [5.0, 5.0, 5.0].
+  mobile_rotation_deg: [0.0, 0.0, 0.0]
+
+  # Randomisation de translation appliquée à la pièce fixe / gabarit.
+  fixed_translation: [0.0, 0.0, 0.0]
+
+  # Randomisation de rotation appliquée à la pièce fixe / gabarit, en degrés.
+  fixed_rotation_deg: [0.0, 0.0, 0.0]
+
+  # Intervalle / facteur de mise à l'échelle des frottements.
+  # [1.0, 1.0] = aucune randomisation.
+  friction_scale: [1.0, 1.0]
+
+
+# ----------------------------------------------------------------------------
+# PERCEPTION / BRUIT DE MESURE
+# ----------------------------------------------------------------------------
+
+perception:
+  # Biais constant de translation ajouté à la pose perçue [x,y,z], m.
+  # test3 : [0.001, 0.0, 0.0].
+  translation_bias: [0.0, 0.0, 0.0]
+
+  # Biais constant de rotation [rx,ry,rz], degrés.
+  # test3 : [0.0, 1.0, 0.0].
+  rotation_bias_deg: [0.0, 0.0, 0.0]
+
+  # Écart-type du bruit aléatoire de translation, m.
+  # test3 : 0.0005.
+  translation_noise_std: 0.0
+
+  # Écart-type du bruit aléatoire de rotation, degrés.
+  # test3 : 0.5.
+  rotation_noise_std_deg: 0.0
+
+  # Bruit sur le wrench 6D :
+  # [Fx, Fy, Fz, Tx, Ty, Tz].
+  # test4 : [0.5, 0.5, 0.5, 0.03, 0.03, 0.03].
+  wrench_noise_std: [0, 0, 0, 0, 0, 0]
+
+
+# ----------------------------------------------------------------------------
+# ACTION / COMMANDE
+# ----------------------------------------------------------------------------
+
+action:
+  # Repère dans lequel les incréments 6D de la policy sont exprimés.
+  # "task"  = repère de tâche / CAD cible.
+  # "grasp" = comportement historique lié au repère de grasp.
+  action_frame: task
+
+  # Déplacement translationnel maximal correspondant à une action normalisée
+  # de module 1 sur un axe, par décision RL.
+  # Valeurs testées : 0.001 puis 0.0005 m.
+  max_translation_step: 0.0005
+
+  # Rotation maximale correspondant à une action normalisée de module 1
+  # sur un axe, par décision RL.
+  # Valeurs testées : 1.0 puis 0.25 deg.
+  max_rotation_step_deg: 0.25
+
+  # Mode de génération de la consigne.
+  # "reactive_actual_pose" recalcule la commande depuis la pose physique
+  # réellement atteinte plutôt que depuis une référence interne cachée.
+  control_mode: reactive_actual_pose
+
+
+# ----------------------------------------------------------------------------
+# ADMITTANCE / DYNAMIQUE DE COMMANDE 6D
+# ----------------------------------------------------------------------------
+#
+# Convention des vecteurs 6D :
+# [x, y, z, rx, ry, rz]
+#
+# Les trois premières composantes concernent la translation,
+# les trois dernières la rotation.
+
+admittance:
+  # Masse / inertie virtuelle 6D.
+  mass: [2.0, 2.0, 2.0, 0.08, 0.08, 0.08]
+
+  # Amortissement virtuel 6D.
+  damping: [80, 80, 80, 2.0, 2.0, 2.0]
+
+  # Raideur virtuelle 6D.
+  stiffness: [600, 600, 600, 15, 15, 15]
+
+  # Saturation de l'offset d'admittance.
+  # Translation en m ; rotation selon la convention interne du contrôleur.
+  max_offset: [0.008, 0.008, 0.008, 0.15, 0.15, 0.15]
+
+  # Saturation de vitesse de l'admittance.
+  # Translation en m/s ; rotation selon la convention interne du contrôleur.
+  max_velocity: [0.02, 0.02, 0.02, 0.25, 0.25, 0.25]
+
+
+# ----------------------------------------------------------------------------
+# SUCCÈS ET TERMINAISONS DE SÉCURITÉ
+# ----------------------------------------------------------------------------
+
+success:
+  # Erreur de position maximale pour déclarer l'insertion réussie.
+  # Ancienne valeur test0 : 0.003 m.
+  position_tolerance: 0.0005
+
+  # Erreur d'orientation maximale pour déclarer le succès.
+  # Ancienne valeur test0 : 4 deg.
+  rotation_tolerance_deg: 2.0
+
+  # Seuil de sécurité force.
+  # Dépassement => épisode unsafe.
+  # Ancienne valeur test0 : 100 N.
+  max_force: 80.0
+
+  # Seuil de sécurité couple.
+  max_torque: 10.0
+
+  # Rayon maximal autorisé autour de la zone de travail / référence.
+  # Ancienne valeur test0 : 0.20 m.
+  workspace_radius: 0.15
+
+
+# ----------------------------------------------------------------------------
+# REWARD
+# ----------------------------------------------------------------------------
+#
+# IMPORTANT :
+# Les configs historiques empilent plusieurs générations de reward.
+# Les clés ci-dessous sont toutes présentes dans l'héritage de V34.
+#
+# D'après l'évolution test1V18 -> V19 -> V20, la reward récente est centrée
+# sur une distance de pose 6D et des pénalités force/couple/action/temps.
+# Les paramètres marqués LEGACY proviennent d'anciennes expériences et peuvent
+# ne plus être consommés par l'implémentation courante de la reward.
+#
+reward:
+  # --------------------------------------------------------------------------
+  # Paramètres récents / V19-V20
+  # --------------------------------------------------------------------------
+
+  # Convertit l'erreur angulaire en une "longueur équivalente" lorsqu'une
+  # métrique pose 6D combine translation et rotation.
+  rotation_length_scale: 0.05
+
+  # Poids global de la pénalité de distance de pose dans la reward V20.
+  pose_weight: 50.0
+
+  # Coût appliqué à chaque step pour décourager la stagnation.
+  step_penalty: 0.05
+
+  # Pénalité continue proportionnelle aux efforts de force.
+  force_weight: 0.01
+
+  # Pénalité continue proportionnelle aux couples.
+  torque_weight: 0.08
+
+  # Pénalité sur la norme / énergie des actions.
+  action_weight: 0.01
+
+  # Bonus terminal de succès.
+  success_bonus: 300.0
+
+  # Pénalité terminale en cas de violation de sécurité.
+  unsafe_penalty: 300.0
+
+  # Pénalité terminale si max_episode_steps est atteint sans succès.
+  timeout_penalty: 150.0
+
+  # --------------------------------------------------------------------------
+  # LEGACY / anciennes expériences de reward
+  # Conservés ici pour documenter toutes les clés rencontrées.
+  # Vérifier leur consommation dans le code avant de les modifier.
+  # --------------------------------------------------------------------------
+
+  # LEGACY : poids direct de l'erreur de position dans les premières rewards.
+  position_weight: 20.0
+
+  # LEGACY : poids direct de l'erreur d'orientation.
+  orientation_weight: 2.0
+
+  # LEGACY : poids d'un terme récompensant le progrès entre deux steps.
+  # test0=10.0, test1V4=2.5.
+  progress_weight: 2.5
+
+  # LEGACY : bonus ponctuels lors du franchissement de seuils de proximité.
+  proximity_milestones:
+    - threshold: 0.010
+      bonus: 5.0
+    - threshold: 0.006
+      bonus: 10.0
+    - threshold: 0.004
+      bonus: 20.0
+    - threshold: 0.002
+      bonus: 40.0
+
+  # LEGACY V19 : gain global du shaping potentiel.
+  potential_scale: 10.0
+
+  # LEGACY V19 : échelle de distance utilisée par le shaping potentiel.
+  potential_distance_scale: 0.010
+
+
+# ----------------------------------------------------------------------------
+# NORMALISATION / OBSERVATION
+# ----------------------------------------------------------------------------
+
+observation:
+  # Inclut l'état/offset d'admittance dans l'observation.
+  include_admittance_position: true
+
+  # Échelles de normalisation des composantes d'observation.
+  position_scale: 0.05
+  rotation_scale: 0.5
+  force_scale: 50.0
+  torque_scale: 5.0
+
+
+# ----------------------------------------------------------------------------
+# CONTRÔLEUR SCRIPTÉ / ÉVALUATION MÉCANIQUE
+# ----------------------------------------------------------------------------
+
+scripted_controller:
+  # Gains du contrôleur P utilisé pour valider la mécanique / tâche
+  # indépendamment de la policy RL.
+  position_gain: 1.0
+  rotation_gain: 1.0
+
+scripted_evaluation:
+  # Nombre d'épisodes utilisés lors de l'évaluation du contrôleur scripté.
+  n_episodes: 20
+
+
+# ============================================================================
+# REVERSE CURRICULUM GENERATION
+# ============================================================================
+
+curriculum:
+  # Active le Reverse Curriculum Generation.
+  enabled: true
+
+  # LEGACY / compatibilité :
+  # Dans l'ancien sampler, probabilité globale de démarrer depuis le curriculum
+  # avant la répartition frontier/historical.
+  #
+  # V21 : 0.80 ; V21-curi_max/V29+ : 0.95.
+  #
+  # Avec start_sampling.strategy: adaptive_three_way, les probabilités
+  # frontier/historical/true_start sont calculées directement. Cette clé peut
+  # donc être sans effet selon la version du code, mais elle existe encore
+  # dans V34 et est conservée ici pour documentation/compatibilité.
+  curriculum_reset_probability: 0.95
+
+  # --------------------------------------------------------------------------
+  # QUALIFICATION DES ÉTATS
+  # --------------------------------------------------------------------------
+
+  # Seuil bas de taux de succès.
+  #
+  # Schéma historique :
+  # success_rate < success_rate_low      => too_hard
+  # success_rate_low..success_rate_high  => frontier
+  # success_rate > success_rate_high     => mastered
+  #
+  # Avec 5 rollouts et success_rate_low=0.00, un candidat à 0/5 n'est plus
+  # inférieur au seuil : les nouveaux candidats valides deviennent donc
+  # frontier ou mastered, et plus aucun nouveau too_hard n'est créé si le code
+  # utilise bien la comparaison stricte "< low".
+  success_rate_low: 0.00
+
+  # Seuil haut de qualification.
+  # Avec 5 rollouts : 4/5=0.8 reste frontier ; 5/5=1.0 devient mastered.
+  success_rate_high: 0.90
+
+  # Nombre de transitions d'entraînement entre deux mises à jour curriculum.
+  # V21 : 50_000 ; V29+ : 20_000.
+  update_interval_timesteps: 20000
+
+  # Nombre de candidats du générateur legacy / bootstrap.
+  # Pendant l'expansion multi-hop normale, le budget principal est
+  # expansion.max_candidates_per_update.
+  candidates_per_update: 32
+
+  # Nombre de rollouts forward utilisés pour estimer le taux de succès
+  # d'un candidat lors de sa qualification.
+  # 5 => taux observables 0/20/40/60/80/100 %.
+  evaluation_rollouts_per_candidate: 5
+
+  # Protection sur le nombre total d'états stockés dans les pools.
+  max_pool_size: 2000
+
+  # --------------------------------------------------------------------------
+  # SAMPLING DES STARTS D'ENTRAÎNEMENT
+  # --------------------------------------------------------------------------
+
+  start_sampling:
+    # Stratégie courante : probabilités directes entre frontier,
+    # historical et true_start.
+    strategy: adaptive_three_way
+
+    # Nombre de bins utilisé par le sampling historique stratifié.
+    # Paramètre hérité de l'ancien sampler ; la manière exacte de constituer
+    # les bins dépend de l'implémentation.
+    historical_bins: 4
+
+    frontier:
+      # Contribution de chaque state frontier à la probabilité de reset
+      # depuis le pool frontier.
+      #
+      # p_frontier = min(fraction_max,
+      #                  fraction_per_state * frontier_pool_size)
+      fraction_per_state: 0.10
+
+      # Plafond global de resets frontier.
+      fraction_max: 0.45
+
+    historical:
+      # Contribution de chaque state mastered/historical à la probabilité
+      # de reset historical.
+      #
+      # p_historical = min(fraction_max,
+      #                    fraction_per_state * historical_pool_size)
+      fraction_per_state: 0.01
+
+      # Plafond global de resets historical.
+      fraction_max: 0.25
+
+    true_start:
+      # Part minimale que l'on souhaite conserver pour le vrai départ.
+      # Avec les caps ci-dessus : 0.45 + 0.25 = 0.70 => true_start >= 0.30.
+      #
+      # Dans la stratégie adaptative :
+      # p_true_start = 1 - p_frontier - p_historical
+      fraction_min: 0.30
+
+    # ------------------------------------------------------------------------
+    # LEGACY : ancien sampler V21.
+    # À utiliser uniquement avec l'ancienne stratégie correspondante.
+    # Les fractions étaient conditionnelles à curriculum_reset_probability.
+    # ------------------------------------------------------------------------
+    # frontier_fraction: 0.625
+    # historical_fraction: 0.375
+
+  # --------------------------------------------------------------------------
+  # REVALIDATION DES POOLS
+  # --------------------------------------------------------------------------
+
+  revalidation:
+    # Nombre d'états actuellement mastered/historical retestés par update.
+    # Sert à détecter un éventuel forgetting et à les reclasser si nécessaire.
+    # V21 : 8 ; V29+ : 12.
+    mastered_samples_per_update: 12
+
+    # Nombre d'états actuellement too_hard retestés par update.
+    # Ce paramètre ne crée pas de too_hard : il décide combien d'anciens
+    # too_hard sont réévalués avec la policy actuelle à chaque update.
+    #
+    # Avec success_rate_low=0.00, un ancien too_hard revalidé peut migrer
+    # immédiatement vers frontier/mastered selon son nouveau score.
+    too_hard_samples_per_update: 12
+
+    # 1 = revalidation à chaque update curriculum.
+    # 2 = une update sur deux, etc.
+    every_n_curriculum_updates: 1
+
+  # --------------------------------------------------------------------------
+  # EXPANSION TOPOLOGIQUE MULTI-HOP
+  # --------------------------------------------------------------------------
+
+  expansion:
+    # Nombre maximal de générations successives parcourues sur une même
+    # branche pendant une seule update, tant que les candidats sont mastered.
+    max_hops_per_seed: 4
+
+    # Nombre maximal de reverse random walks tentés depuis exactement le même
+    # parent pour obtenir un candidat utilisable pour ce hop.
+    max_attempts_per_hop: 8
+
+    # Budget global de candidats réellement qualifiés pendant une update.
+    # Les attempts invalides / sans candidat ne doivent pas consommer ce budget.
+    max_candidates_per_update: 24
+
+    # Multiplicateur d'échelle initial au début d'une expansion.
+    initial_scale: 1.0
+
+    # Facteurs d'adaptation de l'amplitude d'exploration entre hops/branches.
+    # scale_up augmente l'échelle, scale_down la réduit ; les valeurs restent
+    # bornées par min_scale et max_scale.
+    scale_up_factor: 1.25
+    scale_down_factor: 0.7
+
+    min_scale: 0.5
+    max_scale: 3.0
+
+  # --------------------------------------------------------------------------
+  # REVERSE RANDOM WALK
+  # --------------------------------------------------------------------------
+
+  reverse_random_walk:
+    # LEGACY / bootstrap :
+    # nombre de walks générés par seed dans l'ancien générateur.
+    # Dans l'expansion multi-hop, un "attempt" correspond à un walk et
+    # max_attempts_per_hop contrôle les retries.
+    walks_per_seed: 8
+
+    # Nombre maximal d'actions dans un reverse random walk.
+    # À 50 Hz, 20 steps = 0.4 s de commandes au maximum.
+    # Le safe-prefix recovery peut retourner le dernier état valide avant ce max.
+    max_steps: 20
+
+    # Amplitude de base des actions de génération reverse, relativement aux
+    # limites définies sous action.max_translation_step / max_rotation_step_deg.
+    #
+    # Avec action_scale=0.75 et max_translation_step=0.5 mm :
+    # composante translationnelle uniforme typiquement bornée à ±0.375 mm
+    # par axe si l'action reverse normalisée est tirée dans [-1,+1].
+    #
+    # Ancienne valeur V21 : 0.5.
+    action_scale: 0.75
+
+    # independent reproduit le random walk historique : une nouvelle action
+    # uniforme est tirée à chaque reverse step.
+    # persistent initialise une direction principale par branche et la
+    # conserve, avec une courbure locale, pendant ses hops successifs.
+    proposal_mode: persistent
+
+    persistent_proposal:
+      # Variation tirée une fois par retry autour du heading du hop courant.
+      attempt_direction_noise_std: 0.20
+
+      # Variation du heading après un candidat mastered, avant le hop suivant.
+      hop_direction_noise_std: 0.15
+
+      # Bruit gaussien tiré à chaque step autour de la direction principale.
+      # Ce paramètre est sans effet avec proposal_mode=independent.
+      step_noise_std: 0.10
+
+    proposal:
+      # Fraction des nouvelles branches initialisées depuis un proposal guidé.
+      # 0.0 = uniquement uniforme.
+      # 0.7 = environ 70 % guided lorsque de la mémoire est disponible.
+      # Si aucune mémoire n'existe pour le parent, fallback uniforme attendu.
+      guided_fraction: 0.70
+
+      # En mode persistent, perturbe une fois la direction mémorisée au début
+      # de la branche. Les bruits attempt/hop/step restent distincts.
+      guided_noise_std: 0.20
+
+      # Nombre maximal de directions/proposals prometteurs mémorisés
+      # pour un même parent.
+      memory_size_per_parent: 16
+
+  # --------------------------------------------------------------------------
+  # DÉDUPLICATION DES ÉTATS CURRICULUM
+  # --------------------------------------------------------------------------
+
+  deduplication:
+    # Deux états suffisamment proches en translation ET rotation sont
+    # considérés comme redondants selon la logique d'implémentation.
+    position_tolerance: 0.0005
+    rotation_tolerance_deg: 0.5
+
+  # --------------------------------------------------------------------------
+  # DIAGNOSTICS DU LINEAGE — AUCUN EFFET SUR L'ALGORITHME
+  # --------------------------------------------------------------------------
+
+  diagnostics:
+    # Seuil diagnostic pour détecter qu'un nouvel état revient près d'un
+    # de ses ancêtres dans l'espace physique.
+    # Ne doit pas servir à rejeter le state.
+    near_ancestor_position_m: 0.001
+    near_ancestor_rotation_deg: 1.0
+
+
+# ----------------------------------------------------------------------------
+# DIAGNOSTICS GLOBAUX
+# ----------------------------------------------------------------------------
+
+diagnostics:
+  # Seuils utilisés uniquement pour mesurer jusqu'où les épisodes true_start
+  # réussissent à s'approcher de la cible.
+  # Aucun impact sur la reward ou sur le succès.
+  true_start_position_milestones_m: [0.020, 0.010, 0.005, 0.002]
+
+
+# ============================================================================
+# RÉCAPITULATIF DES PARAMÈTRES EXPÉRIMENTAUX RENCONTRÉS
+# ============================================================================
+#
+# training.algorithm:
+#   sac / td3
+#
+# training.buffer_size:
+#   50_000 / 250_000 / 500_000
+#
+# training.learning_rate:
+#   0.0001 / 0.0003
+#
+# training.target_entropy:
+#   auto / -3.0 / -9.0
+#
+# action.action_frame:
+#   grasp / task
+#
+# action.max_translation_step:
+#   0.001 / 0.0005
+#
+# action.max_rotation_step_deg:
+#   1.0 / 0.25
+#
+# success.position_tolerance:
+#   0.003 / 0.0005
+#
+# success.rotation_tolerance_deg:
+#   4.0 / 2.0
+#
+# success.max_force:
+#   100 / 80
+#
+# success.workspace_radius:
+#   0.20 / 0.15
+#
+# curriculum.success_rate_low:
+#   0.10 / 0.00
+#
+# curriculum.update_interval_timesteps:
+#   50_000 / 20_000
+#
+# curriculum.reverse_random_walk.action_scale:
+#   0.5 / 0.75
+#
+# curriculum.curriculum_reset_probability (legacy):
+#   0.80 / 0.95
+#
+# Ancien start_sampling :
+#   frontier_fraction=0.625
+#   historical_fraction=0.375
+#
+# Nouveau start_sampling :
+#   adaptive_three_way
+#   frontier  : fraction_per_state + fraction_max
+#   historical: fraction_per_state + fraction_max
+#   true_start: fraction_min
+#
+# ============================================================================

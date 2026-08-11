@@ -17,7 +17,8 @@ from src.admittance import AdmittanceController
 from src.config import load_config
 from src.curriculum import (
     CurriculumGenerationResult, CurriculumResetSelection, CurriculumState,
-    PhysicsStepResult, historical_quantile_bins, select_training_start,
+    PhysicsStepResult, configured_start_sampling_probabilities,
+    historical_quantile_bins, select_training_start,
 )
 from src.mujoco_plugins import load_sdf_plugin
 from src.task_logic import assess_status, pose_distance, reward_components
@@ -111,6 +112,9 @@ class TenonMortaiseEnv(gym.Env):
         self.reference_pose: tuple[np.ndarray, np.ndarray] | None = None
         self.episode_max_force = 0.0; self.episode_max_torque = 0.0
         self.best_position_error = np.inf; self.best_rotation_error = np.inf
+        self.best_pose_metric = np.inf
+        self.position_error_at_best_pose = np.inf
+        self.rotation_error_at_best_pose = np.inf
         self.episode_reward_components: dict[str, float] = {}
         self.friction_scale = 1.0
         # Set by the periodic evaluation callback; zero during training.
@@ -176,6 +180,28 @@ class TenonMortaiseEnv(gym.Env):
         return np.r_[err[0], quat_to_rotvec(err[1])]
     def _true_wrench(self):
         return contact_wrench_at_site(self.model, self.data, self.mobile_geom, self.grasp_site)
+
+    def _curriculum_contact_categories(self) -> tuple[str, ...]:
+        """Coarse, observation-only roles for reverse-walk contact diagnostics.
+
+        The model has no existing forbidden-contact policy. In particular,
+        mobile--fixed contact is normal assembly contact, never a new reject
+        condition introduced by this diagnostic.
+        """
+        categories: set[str] = set()
+        for index in range(self.data.ncon):
+            contact = self.data.contact[index]
+            pair = {int(contact.geom1), int(contact.geom2)}
+            if pair == {self.mobile_geom, self.fixed_geom}:
+                categories.add("piece_fixture")
+            elif self.mobile_geom in pair:
+                categories.add("piece_other")
+            elif self.fixed_geom in pair:
+                categories.add("fixture_other")
+            else:
+                categories.add("unknown")
+        return tuple(sorted(categories))
+
     def _observed_wrench(self):
         return self._true_wrench() + self.np_random.normal(
             0, np.asarray(self.cfg["perception"]["wrench_noise_std"], float)
@@ -199,6 +225,19 @@ class TenonMortaiseEnv(gym.Env):
         self.episode_max_force = 0.0; self.episode_max_torque = 0.0
         self.episode_reward_components = {}
         self.best_position_error = np.inf; self.best_rotation_error = np.inf
+        self.best_pose_metric = np.inf
+        self.position_error_at_best_pose = np.inf
+        self.rotation_error_at_best_pose = np.inf
+
+    def _update_best_pose(self, position_error: float, rotation_error: float) -> None:
+        metric = pose_distance(
+            position_error, rotation_error,
+            float(self.cfg["reward"]["rotation_length_scale"]),
+        )
+        if metric < self.best_pose_metric:
+            self.best_pose_metric = metric
+            self.position_error_at_best_pose = position_error
+            self.rotation_error_at_best_pose = rotation_error
 
     def _set_episode_start_metadata(
         self, reset_source: str, state: CurriculumState | None = None,
@@ -208,11 +247,15 @@ class TenonMortaiseEnv(gym.Env):
             "curriculum_frontier", "curriculum_historical",
         }
         if state is None:
+            self.curriculum_start_state_id = -1
+            self.curriculum_start_generation_depth = -1
             self.curriculum_start_position_error = np.nan
             self.curriculum_start_rotation_error = np.nan
             self.curriculum_start_pose_distance = np.nan
             self.curriculum_start_success_rate = np.nan
         else:
+            self.curriculum_start_state_id = int(state.state_id)
+            self.curriculum_start_generation_depth = int(state.generation_depth)
             self.curriculum_start_position_error = float(state.position_error)
             self.curriculum_start_rotation_error = float(state.rotation_error)
             self.curriculum_start_pose_distance = float(state.pose_distance)
@@ -228,6 +271,10 @@ class TenonMortaiseEnv(gym.Env):
             "curriculum_start_rotation_error": self.curriculum_start_rotation_error,
             "curriculum_start_pose_distance": self.curriculum_start_pose_distance,
             "curriculum_start_success_rate": self.curriculum_start_success_rate,
+            "curriculum_start_state_id": self.curriculum_start_state_id,
+            "curriculum_start_generation_depth": (
+                self.curriculum_start_generation_depth
+            ),
         }
 
     def _initialize_true_start(self) -> np.ndarray:
@@ -255,6 +302,9 @@ class TenonMortaiseEnv(gym.Env):
         true_error = self._error()
         self.best_position_error = float(np.linalg.norm(true_error[:3]))
         self.best_rotation_error = float(np.linalg.norm(true_error[3:]))
+        self._update_best_pose(
+            self.best_position_error, self.best_rotation_error,
+        )
         self._set_episode_start_metadata("true_start")
         return true_error
 
@@ -275,18 +325,31 @@ class TenonMortaiseEnv(gym.Env):
             return CurriculumResetSelection("true_start", None)
         curriculum = self.cfg["curriculum"]
         sampling = curriculum["start_sampling"]
+        probabilities = configured_start_sampling_probabilities(
+            frontier_pool_size=len(self.curriculum_frontier_pool),
+            historical_pool_size=len(self.curriculum_historical_pool),
+            curriculum_probability=float(
+                curriculum["curriculum_reset_probability"]
+            ),
+            config=sampling,
+        )
         return select_training_start(
             self.curriculum_rng,
             curriculum_probability=float(
                 curriculum["curriculum_reset_probability"]
             ),
-            frontier_fraction=float(sampling["frontier_fraction"]),
-            historical_fraction=float(sampling["historical_fraction"]),
+            frontier_fraction=float(sampling.get("frontier_fraction", .625)),
+            historical_fraction=float(sampling.get("historical_fraction", .375)),
             historical_bins=int(sampling["historical_bins"]),
             frontier=self.curriculum_frontier_pool,
             historical=self.curriculum_historical_pool,
             requested=requested,
             historical_bin_groups=self.curriculum_historical_bins,
+            probabilities=(
+                probabilities
+                if sampling.get("strategy", "legacy") == "adaptive_three_way"
+                else None
+            ),
         )
 
     def _choose_reset_source(self, requested: str) -> str:
@@ -451,6 +514,7 @@ class TenonMortaiseEnv(gym.Env):
             rotation_error = float(np.linalg.norm(true_error[3:]))
             self.best_position_error = position_error
             self.best_rotation_error = rotation_error
+            self._update_best_pose(position_error, rotation_error)
             self._set_episode_start_metadata(reset_source, state)
         return self._observation(), self._start_info(true_error)
 
@@ -511,6 +575,7 @@ class TenonMortaiseEnv(gym.Env):
             )
         self.best_position_error = position_error
         self.best_rotation_error = rotation_error
+        self._update_best_pose(position_error, rotation_error)
         self._set_episode_start_metadata("goal_seed")
         goal_seed = self.capture_curriculum_state(success_rate=1.0)
 
@@ -629,6 +694,8 @@ class TenonMortaiseEnv(gym.Env):
             float(self.cfg["reward"]["rotation_length_scale"]),
         )
         state = self.capture_curriculum_state()
+        final_force = float(np.linalg.norm(result.final_wrench[:3]))
+        final_torque = float(np.linalg.norm(result.final_wrench[3:]))
         return CurriculumGenerationResult(
             state=state,
             geometric_success=status.geometric_success,
@@ -640,6 +707,11 @@ class TenonMortaiseEnv(gym.Env):
             position_error=position_error,
             rotation_error=rotation_error,
             pose_distance=distance,
+            max_force=result.max_force,
+            max_torque=result.max_torque,
+            final_force=final_force,
+            final_torque=final_torque,
+            contact_categories=self._curriculum_contact_categories(),
         )
 
     def step(self, action):
@@ -655,6 +727,7 @@ class TenonMortaiseEnv(gym.Env):
         pos = float(np.linalg.norm(true_error[:3])); rot = float(np.linalg.norm(true_error[3:]))
         self.best_position_error = min(self.best_position_error, pos)
         self.best_rotation_error = min(self.best_rotation_error, rot)
+        self._update_best_pose(pos, rot)
         status = assess_status(
             position_error=pos, rotation_error=rot,
             max_force=step_max_force, max_torque=step_max_torque,
@@ -707,6 +780,9 @@ class TenonMortaiseEnv(gym.Env):
             "final_rotation_error": rot,
             "best_position_error": self.best_position_error,
             "best_rotation_error": self.best_rotation_error,
+            "best_pose_metric": self.best_pose_metric,
+            "position_error_at_best_pose": self.position_error_at_best_pose,
+            "rotation_error_at_best_pose": self.rotation_error_at_best_pose,
             "max_force": self.episode_max_force,
             "max_torque": self.episode_max_torque,
             "training_timesteps": self.training_timesteps,
@@ -717,7 +793,19 @@ class TenonMortaiseEnv(gym.Env):
             "curriculum_start_rotation_error": self.curriculum_start_rotation_error,
             "curriculum_start_pose_distance": self.curriculum_start_pose_distance,
             "curriculum_start_success_rate": self.curriculum_start_success_rate,
+            "curriculum_start_state_id": self.curriculum_start_state_id,
+            "curriculum_start_generation_depth": (
+                self.curriculum_start_generation_depth
+            ),
         }
+        milestones = self.cfg.get("diagnostics", {}).get(
+            "true_start_position_milestones_m", (.020, .010, .005, .002),
+        )
+        for threshold in milestones:
+            millimetres = int(round(float(threshold) * 1000.0))
+            info[f"reached_{millimetres}mm"] = float(
+                self.best_position_error <= float(threshold)
+            )
         info.update({f"episode_{key}": value for key, value in self.episode_reward_components.items()})
         if self.render_mode=="human": self.render()
         total_reward = sum(

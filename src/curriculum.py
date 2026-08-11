@@ -15,6 +15,7 @@ from collections import deque
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
+from enum import Enum
 import hashlib
 import json
 import math
@@ -41,6 +42,7 @@ RESET_SOURCES = (
 )
 EXPANSION_DEFAULTS: dict[str, int | float] = {
     "max_hops_per_seed": 4,
+    "max_attempts_per_hop": 8,
     "max_candidates_per_update": 24,
     "initial_scale": 1.0,
     "scale_up_factor": 1.25,
@@ -49,6 +51,25 @@ EXPANSION_DEFAULTS: dict[str, int | float] = {
     "max_scale": 3.0,
 }
 EXPANSION_STRATEGY_KEYS = frozenset(EXPANSION_DEFAULTS)
+
+
+class ExpansionStopReason(str, Enum):
+    """Exclusive final outcome for one expansion branch in one update."""
+
+    DUPLICATE = "duplicate"
+    FORCE = "force"
+    TORQUE = "torque"
+    FORCE_AND_TORQUE = "force_and_torque"
+    SNAPSHOT_INVALID = "snapshot_invalid"
+    FORBIDDEN_CONTACT = "forbidden_contact"
+    OTHER_INVALID = "other_invalid"
+    WORKSPACE = "workspace"
+    GENERATION_FAILED = "generation_failed"
+    FRONTIER = "frontier"
+    TOO_HARD = "too_hard"
+    MAX_HOPS = "max_hops"
+    CANDIDATE_BUDGET = "candidate_budget"
+    ATTEMPT_BUDGET = "attempt_budget"
 
 
 @dataclass
@@ -95,6 +116,112 @@ class CurriculumResetSelection:
     historical_bin: int | None = None
 
 
+@dataclass(frozen=True)
+class StartSamplingProbabilities:
+    true_start: float
+    frontier: float
+    historical: float
+    historical_fraction_effective: float
+
+    @property
+    def frontier_fraction_effective(self) -> float:
+        return self.frontier
+
+    @property
+    def true_start_fraction_effective(self) -> float:
+        return self.true_start
+
+
+def compute_adaptive_three_way_probabilities(
+    frontier_pool_size: int, historical_pool_size: int, *,
+    frontier_fraction_per_state: float, frontier_fraction_max: float,
+    historical_fraction_per_state: float, historical_fraction_max: float,
+) -> StartSamplingProbabilities:
+    """Direct reset/episode probabilities from available pool diversity."""
+    frontier = min(
+        frontier_fraction_max,
+        frontier_fraction_per_state * max(0, int(frontier_pool_size)),
+    )
+    historical = min(
+        historical_fraction_max,
+        historical_fraction_per_state * max(0, int(historical_pool_size)),
+    )
+    true_start = 1.0 - frontier - historical
+    return StartSamplingProbabilities(
+        float(true_start), float(frontier), float(historical), float(historical),
+    )
+
+
+def configured_start_sampling_probabilities(
+    *, frontier_pool_size: int, historical_pool_size: int,
+    curriculum_probability: float, config: dict[str, Any],
+) -> StartSamplingProbabilities:
+    """Dispatch one explicit strategy; legacy remains available for A/B runs."""
+    strategy = config.get("strategy", "legacy")
+    if strategy == "adaptive_three_way":
+        frontier = config["frontier"]
+        historical = config["historical"]
+        return compute_adaptive_three_way_probabilities(
+            frontier_pool_size, historical_pool_size,
+            frontier_fraction_per_state=float(frontier["fraction_per_state"]),
+            frontier_fraction_max=float(frontier["fraction_max"]),
+            historical_fraction_per_state=float(historical["fraction_per_state"]),
+            historical_fraction_max=float(historical["fraction_max"]),
+        )
+    historical_fraction = effective_historical_fraction(
+        historical_pool_size,
+        adaptive=bool(config.get("adaptive_historical", False)),
+        fixed_fraction=float(config.get("historical_fraction", 0.375)),
+        fraction_per_state=float(
+            config.get("historical_fraction_per_state", 0.01)
+        ),
+        fraction_max=float(config.get("historical_fraction_max", 0.375)),
+    )
+    return compute_start_sampling_probabilities(
+        curriculum_probability=curriculum_probability,
+        historical_fraction=historical_fraction,
+        frontier_available=frontier_pool_size > 0,
+        historical_available=historical_pool_size > 0,
+    )
+
+
+def effective_historical_fraction(
+    historical_pool_size: int, *, adaptive: bool,
+    fixed_fraction: float, fraction_per_state: float,
+    fraction_max: float,
+) -> float:
+    """Grow historical replay with absolute learned-memory capacity."""
+    if not adaptive:
+        return float(fixed_fraction)
+    return float(np.clip(
+        fraction_per_state * max(0, int(historical_pool_size)),
+        0.0, fraction_max,
+    ))
+
+
+def compute_start_sampling_probabilities(
+    *, curriculum_probability: float, historical_fraction: float,
+    frontier_available: bool, historical_available: bool,
+) -> StartSamplingProbabilities:
+    """Resolve the three probabilities without cascading empty-pool fallback."""
+    if not frontier_available and not historical_available:
+        return StartSamplingProbabilities(1.0, 0.0, 0.0, historical_fraction)
+    if not historical_available:
+        return StartSamplingProbabilities(
+            1.0 - curriculum_probability, curriculum_probability, 0.0,
+            historical_fraction,
+        )
+    historical = curriculum_probability * historical_fraction
+    frontier = (
+        curriculum_probability * (1.0 - historical_fraction)
+        if frontier_available else 0.0
+    )
+    return StartSamplingProbabilities(
+        1.0 - historical - frontier, frontier, historical,
+        historical_fraction,
+    )
+
+
 def historical_quantile_bins(
     states: list[CurriculumState], bin_count: int,
 ) -> list[list[CurriculumState]]:
@@ -129,11 +256,12 @@ def select_training_start(
     historical: list[CurriculumState],
     requested: str = "auto",
     historical_bin_groups: list[list[CurriculumState]] | None = None,
+    probabilities: StartSamplingProbabilities | None = None,
 ) -> CurriculumResetSelection:
-    """Tire un vrai start, un frontier ou un historique avec fallbacks sûrs.
+    """Tire la source d'un épisode puis un état dans le pool choisi.
 
-    Les probabilités globales ne sont jamais codées en dur : avec la config
-    V21, elles découlent de ``0.80 * (0.625, 0.375)``.
+    ``probabilities`` active le tirage direct à trois sources. Sans lui, le
+    chemin RNG et les fallbacks du sampler legacy restent inchangés.
     """
     allowed = {"auto", "curriculum", *RESET_SOURCES}
     if requested not in allowed:
@@ -152,28 +280,57 @@ def select_training_start(
         raise ValueError("les fractions frontier/historical doivent sommer à 1")
     if requested == "true_start":
         return CurriculumResetSelection("true_start", None)
-    if requested == "auto" and (
-        not frontier and not historical
-        or rng.random() >= curriculum_probability
-    ):
-        return CurriculumResetSelection("true_start", None)
-
-    if requested == "curriculum_frontier":
-        preferred = "frontier"
-    elif requested == "curriculum_historical":
-        preferred = "historical"
+    if requested in {"curriculum_frontier", "curriculum_historical"}:
+        preferred = requested.removeprefix("curriculum_")
+        if preferred == "frontier" and not frontier:
+            return CurriculumResetSelection("true_start", None)
+        if preferred == "historical" and not historical:
+            preferred = "frontier" if frontier else "true_start"
+    elif requested == "curriculum":
+        if frontier and historical:
+            preferred = (
+                "frontier"
+                if rng.random() * fraction_total < frontier_fraction
+                else "historical"
+            )
+        else:
+            preferred = "frontier" if frontier else (
+                "historical" if historical else "true_start"
+            )
+    elif probabilities is not None:
+        # The adaptive three-way strategy is a direct categorical reset draw.
+        draw = float(rng.random())
+        if draw < probabilities.frontier:
+            preferred = "frontier"
+        elif draw < probabilities.frontier + probabilities.historical:
+            preferred = "historical"
+        else:
+            preferred = "true_start"
     else:
-        preferred = (
-            "frontier"
-            if rng.random() * fraction_total < frontier_fraction
-            else "historical"
-        )
-
-    # Un pool souhaité vide bascule sur l'autre; aucun pool revient au vrai start.
-    if preferred == "frontier" and not frontier:
-        preferred = "historical"
-    elif preferred == "historical" and not historical:
-        preferred = "frontier"
+        # Preserve the historical two-draw RNG path when both pools exist.
+        if frontier and historical:
+            if rng.random() >= curriculum_probability:
+                return CurriculumResetSelection("true_start", None)
+            preferred = (
+                "frontier"
+                if rng.random() * fraction_total < frontier_fraction
+                else "historical"
+            )
+        elif frontier:
+            preferred = (
+                "frontier" if rng.random() < curriculum_probability
+                else "true_start"
+            )
+        elif historical:
+            preferred = (
+                "historical"
+                if rng.random() < curriculum_probability * historical_fraction
+                else "true_start"
+            )
+        else:
+            preferred = "true_start"
+    if preferred == "true_start":
+        return CurriculumResetSelection("true_start", None)
     if preferred == "frontier" and frontier:
         index = int(rng.integers(len(frontier)))
         return CurriculumResetSelection(
@@ -217,6 +374,11 @@ class CurriculumGenerationResult:
     position_error: float
     rotation_error: float
     pose_distance: float
+    max_force: float = 0.0
+    max_torque: float = 0.0
+    final_force: float = 0.0
+    final_torque: float = 0.0
+    contact_categories: tuple[str, ...] = ()
 
 
 @dataclass
@@ -231,8 +393,9 @@ class GenerationReport:
     restoration_failures: int = 0
     invalid_rejected: int = 0
     # Coût et résultat de la dernière expansion multi-hop. ``generated`` reste
-    # le nombre historique de pas physiques de reverse walk, tandis que
-    # ``expansion_hops`` compte les tentatives de produire au plus un état.
+    # le nombre historique de pas physiques de reverse walk. Pour compatibilité,
+    # ``expansion_hops`` est le nombre de tentatives de reverse walk et
+    # ``expansion_candidates`` le nombre de snapshots arrivés à qualification.
     expansion_candidates: int = 0
     expansion_hops: int = 0
     expansion_branches: int = 0
@@ -247,6 +410,59 @@ class GenerationReport:
     frontier_found_per_candidate: float = 0.0
     expansion_wall_time: float = 0.0
     stop_reasons: dict[str, int] = field(default_factory=dict)
+    # Expansion diagnostics expose the candidate-generation funnel. A hop can
+    # fail before policy qualification when reverse generation fails, its
+    # snapshot is invalid/outside the workspace, or it is a duplicate.
+    # Frontier/too-hard/max-hops/budget are normal branch terminations.
+    raw_candidates_generated: int = 0
+    valid_candidates: int = 0
+    nonduplicate_candidates: int = 0
+    qualified_candidates: int = 0
+    raw_parent_translation_mm: list[float] = field(default_factory=list)
+    raw_parent_rotation_deg: list[float] = field(default_factory=list)
+    duplicate_parent_translation_mm: list[float] = field(default_factory=list)
+    duplicate_parent_rotation_deg: list[float] = field(default_factory=list)
+    duplicate_nearest_position_mm: list[float] = field(default_factory=list)
+    duplicate_nearest_rotation_deg: list[float] = field(default_factory=list)
+    reverse_steps: list[int] = field(default_factory=list)
+    rejected_force_max: list[float] = field(default_factory=list)
+    rejected_torque_max: list[float] = field(default_factory=list)
+    rejected_force_step: list[int] = field(default_factory=list)
+    rejected_torque_step: list[int] = field(default_factory=list)
+    accepted_reverse_force_max: list[float] = field(default_factory=list)
+    accepted_reverse_torque_max: list[float] = field(default_factory=list)
+    candidate_final_force: list[float] = field(default_factory=list)
+    candidate_final_torque: list[float] = field(default_factory=list)
+    rejected_contact_counts: dict[str, int] = field(default_factory=dict)
+    accepted_contact_counts: dict[str, int] = field(default_factory=dict)
+    expansion_attempts: int = 0
+    attempts_per_hop: list[int] = field(default_factory=list)
+    attempt_no_candidate: int = 0
+    attempt_duplicate: int = 0
+    attempt_candidate_found: int = 0
+    safe_prefix_candidates: int = 0
+    full_walk_candidates: int = 0
+    safe_prefix_steps: list[int] = field(default_factory=list)
+    proposal_uniform_attempts: int = 0
+    proposal_guided_attempts: int = 0
+    proposal_uniform_candidates: int = 0
+    proposal_guided_candidates: int = 0
+    proposal_uniform_unique: int = 0
+    proposal_guided_unique: int = 0
+    proposal_uniform_safe_prefix: int = 0
+    proposal_guided_safe_prefix: int = 0
+    proposal_uniform_attempt_budget_failures: int = 0
+    proposal_guided_attempt_budget_failures: int = 0
+    persistent_attempts: int = 0
+    independent_attempts: int = 0
+    branch_heading_changes: list[float] = field(default_factory=list)
+    attempt_to_heading_deviations: list[float] = field(default_factory=list)
+    successive_hop_heading_opposition: int = 0
+    guided_memory_insertions: int = 0
+    guided_memory_rejected_duplicates: int = 0
+    new_states_near_ancestor: int = 0
+    nearest_ancestor_position_mm: list[float] = field(default_factory=list)
+    nearest_ancestor_rotation_deg: list[float] = field(default_factory=list)
 
     def as_dict(self, states: list[CurriculumState]) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -275,6 +491,10 @@ class GenerationReport:
             ),
             "expansion_wall_time": self.expansion_wall_time,
             "stop_reasons": dict(self.stop_reasons),
+            "raw_candidates_generated": self.raw_candidates_generated,
+            "valid_candidates": self.valid_candidates,
+            "nonduplicate_candidates": self.nonduplicate_candidates,
+            "qualified_candidates": self.qualified_candidates,
         }
         for name, values in (
             ("position_error", [state.position_error for state in states]),
@@ -293,6 +513,18 @@ class GenerationReport:
         return result
 
 
+@dataclass
+class StateLifecycleStats:
+    created_update: int
+    last_revalidated_update: int = -1
+    revalidation_count: int = 0
+    frontier_since_update: int | None = None
+    consecutive_frontier_updates: int = 0
+    nearest_ancestor_position_m: float | None = None
+    nearest_ancestor_rotation_deg: float | None = None
+    near_ancestor_return: bool = False
+
+
 @dataclass(frozen=True)
 class RevalidationReport:
     """Bilan d'une revalidation, sans effet sur le format des pools."""
@@ -303,6 +535,9 @@ class RevalidationReport:
     too_hard_to_frontier: int = 0
     too_hard_to_mastered: int = 0
     too_hard_remained_hard: int = 0
+    frontier_promoted_to_mastered: int = 0
+    frontier_remained_frontier: int = 0
+    frontier_demoted_to_too_hard: int = 0
     frontier_rollouts: int = 0
     mastered_rollouts: int = 0
     too_hard_rollouts: int = 0
@@ -324,6 +559,10 @@ class _ExpansionBranch:
     current: CurriculumState
     scale: float
     hops: int = 0
+    # Ces champs décrivent une hypothèse d'expansion temporaire. Ils ne font
+    # volontairement pas partie du CurriculumState ni du state_dict.
+    heading: np.ndarray | None = None
+    proposal_kind: str | None = None
 
 
 def mastered_boundary_states(
@@ -430,7 +669,7 @@ class ReverseCurriculumManager:
     diagnostic, jamais dans une décision de progression.
     """
 
-    STATE_VERSION = 2
+    STATE_VERSION = 3
 
     def __init__(
         self, env: TenonMortaiseEnv, config: dict[str, Any], *, seed: int,
@@ -457,6 +696,143 @@ class ReverseCurriculumManager:
         self.last_revalidation_report = RevalidationReport()
         self.last_expansion_seed_distances: list[float] = []
         self.last_expansion_seed_depths: list[int] = []
+        # Guidance is deliberately ephemeral: losing it on resume affects
+        # proposal efficiency, never pools, lineage, or physical snapshots.
+        self.proposal_memory: dict[int, list[np.ndarray]] = {}
+        self._active_proposal_direction: np.ndarray | None = None
+        self._active_proposal_kind = "uniform"
+        self.state_lifecycle: dict[int, StateLifecycleStats] = {}
+
+    def _proposal_settings(self) -> dict[str, Any]:
+        proposal = self.walk.get("proposal", {})
+        return {
+            "guided_fraction": float(proposal.get("guided_fraction", 0.0)),
+            "guided_noise_std": float(proposal.get("guided_noise_std", 0.20)),
+            "memory_size_per_parent": int(
+                proposal.get("memory_size_per_parent", 16)
+            ),
+        }
+
+    def _proposal_mode(self) -> str:
+        return str(self.walk.get("proposal_mode", "independent"))
+
+    def _persistent_proposal_settings(self) -> dict[str, float]:
+        persistent = self.walk.get("persistent_proposal", {})
+        return {
+            "attempt_direction_noise_std": float(
+                persistent.get("attempt_direction_noise_std", 0.20)
+            ),
+            "hop_direction_noise_std": float(
+                persistent.get("hop_direction_noise_std", 0.15)
+            ),
+            "step_noise_std": float(persistent.get("step_noise_std", 0.10)),
+        }
+
+    def _choose_reverse_proposal(
+        self, parent: CurriculumState,
+    ) -> tuple[str, np.ndarray | None]:
+        settings = self._proposal_settings()
+        memory = getattr(self, "proposal_memory", {}).get(int(parent.state_id), [])
+        fraction = settings["guided_fraction"]
+        # With fraction zero no extra RNG draw is made: A/B uniform runs stay
+        # bit-identical to the pre-guidance implementation.
+        if not memory or fraction <= 0.0 or self.rng.random() >= fraction:
+            return "uniform", None
+        index = int(self.rng.integers(len(memory)))
+        return "guided", memory[index].copy()
+
+    def _proposal_direction(
+        self, parent: CurriculumState, candidate: CurriculumState,
+    ) -> np.ndarray:
+        """Convert a useful SE(3) displacement into an action-space direction.
+
+        Dividing by one physical action step makes metres and radians
+        comparable. Normalizing the largest component then keeps only the
+        direction and relative axis mix: a guided attempt is free to extend
+        beyond the candidate that originally revealed that direction.
+        """
+        delta = relative(
+            (parent.task_position, parent.task_quaternion),
+            (candidate.task_position, candidate.task_quaternion),
+        )
+        env_config = getattr(getattr(self, "env", None), "cfg", {})
+        action = env_config.get("action", {})
+        scales = np.r_[
+            np.full(3, float(action.get("max_translation_step", 1.0))),
+            np.full(3, np.deg2rad(float(
+                action.get("max_rotation_step_deg", 57.2957795)
+            ))),
+        ]
+        normalized = np.r_[delta[0], quat_to_rotvec(delta[1])] / scales
+        largest_component = float(np.max(np.abs(normalized)))
+        if largest_component <= 0.0:
+            return np.zeros(6, dtype=float)
+        return np.clip(normalized / largest_component, -1.0, 1.0)
+
+    def _remember_proposal(
+        self, parent: CurriculumState, candidate: CurriculumState,
+    ) -> None:
+        """Keep only directions that produced a genuinely new physical state."""
+        key = int(parent.state_id)
+        if not hasattr(self, "proposal_memory"):
+            self.proposal_memory = {}
+        memory = self.proposal_memory.setdefault(key, [])
+        memory.append(self._proposal_direction(parent, candidate))
+        limit = self._proposal_settings()["memory_size_per_parent"]
+        while len(memory) > limit:
+            memory.pop(0)
+
+    def _initial_branch_heading(
+        self, proposal_kind: str, guided_direction: np.ndarray | None,
+    ) -> np.ndarray:
+        """Initialize one branch, consulting guided memory only at its root."""
+        if guided_direction is None:
+            return self.rng.uniform(-1.0, 1.0, size=6)
+        heading = np.asarray(guided_direction, dtype=float).copy()
+        guided_noise = self._proposal_settings()["guided_noise_std"]
+        if proposal_kind == "guided" and guided_noise > 0.0:
+            heading += self.rng.normal(0.0, guided_noise, size=6)
+        return np.clip(heading, -1.0, 1.0)
+
+    def _persistent_attempt_direction(
+        self, branch_heading: np.ndarray,
+    ) -> np.ndarray:
+        """Sample one retry-local variation around a branch heading."""
+        direction = np.asarray(branch_heading, dtype=float).copy()
+        noise = self._persistent_proposal_settings()[
+            "attempt_direction_noise_std"
+        ]
+        if noise > 0.0:
+            direction += self.rng.normal(0.0, noise, size=6)
+        return np.clip(direction, -1.0, 1.0)
+
+    def _next_branch_heading(
+        self, heading: np.ndarray,
+    ) -> np.ndarray:
+        """Let a persistent branch curve locally between two mastered hops."""
+        next_heading = np.asarray(heading, dtype=float).copy()
+        noise = self._persistent_proposal_settings()["hop_direction_noise_std"]
+        if noise > 0.0:
+            next_heading += self.rng.normal(0.0, noise, size=6)
+        return np.clip(next_heading, -1.0, 1.0)
+
+    def _reverse_step_action(
+        self, amplitude: float, attempt_direction: np.ndarray | None,
+    ) -> np.ndarray:
+        """Sample one step while preserving the exact independent RNG path."""
+        if self._proposal_mode() == "independent":
+            if attempt_direction is None:
+                return self.rng.uniform(-amplitude, amplitude, size=6)
+            noise = self.rng.normal(
+                0.0, self._proposal_settings()["guided_noise_std"], size=6,
+            )
+            return np.clip(attempt_direction + noise, -1.0, 1.0) * amplitude
+
+        direction = np.asarray(attempt_direction, dtype=float)
+        step_noise = self._persistent_proposal_settings()["step_noise_std"]
+        if step_noise > 0.0:
+            direction = direction + self.rng.normal(0.0, step_noise, size=6)
+        return np.clip(direction, -1.0, 1.0) * amplitude
 
     def _task_config_sha256(
         self, curriculum_config: dict[str, Any] | None = None, *,
@@ -643,10 +1019,23 @@ class ReverseCurriculumManager:
         L'état existant conserve volontairement son lineage d'origine; un
         duplicate ne reçoit donc ni nouvel identifiant ni nouveau parent.
         """
+        duplicate, nearest_position, nearest_rotation = self._duplicate_match(
+            candidate, additional,
+        )
+        self._last_duplicate_match = (nearest_position, nearest_rotation)
+        return duplicate
+
+    def _duplicate_match(
+        self, candidate: CurriculumState, additional: list[CurriculumState],
+    ) -> tuple[bool, float | None, float | None]:
+        """Return duplicate status and nearest-state deltas in native units."""
         position_tolerance = float(self.deduplication["position_tolerance"])
         rotation_tolerance = np.deg2rad(
             float(self.deduplication["rotation_tolerance_deg"])
         )
+        nearest_position: float | None = None
+        nearest_rotation: float | None = None
+        duplicate = False
         for existing in self.all_states() + additional:
             position_delta = float(np.linalg.norm(
                 candidate.task_position - existing.task_position
@@ -655,10 +1044,67 @@ class ReverseCurriculumManager:
                 (np.zeros(3), existing.task_quaternion),
                 (np.zeros(3), candidate.task_quaternion),
             )[1])))
-            if (position_delta < position_tolerance
-                    and rotation_delta < rotation_tolerance):
-                return True
-        return False
+            # A closest pair is useful only as a diagnostic: duplicate uses
+            # the conjunction below, exactly as before.
+            if nearest_position is None or position_delta < nearest_position:
+                nearest_position, nearest_rotation = position_delta, rotation_delta
+            duplicate |= (
+                position_delta < position_tolerance
+                and rotation_delta < rotation_tolerance
+            )
+        return duplicate, nearest_position, nearest_rotation
+
+    @staticmethod
+    def _parent_candidate_delta(
+        parent: CurriculumState, candidate: CurriculumState,
+    ) -> tuple[float, float]:
+        position = float(np.linalg.norm(
+            candidate.task_position - parent.task_position
+        ))
+        rotation = float(np.linalg.norm(quat_to_rotvec(relative(
+            (np.zeros(3), parent.task_quaternion),
+            (np.zeros(3), candidate.task_quaternion),
+        )[1])))
+        return position * 1000.0, float(np.rad2deg(rotation))
+
+    def _ancestor_diagnostics(
+        self, candidate: CurriculumState, known: list[CurriculumState],
+    ) -> tuple[float | None, float | None, bool]:
+        """Measure lineage geometry only; never feed it into acceptance."""
+        states = {
+            int(state.state_id): state for state in known
+            if int(state.state_id) >= 0
+        }
+        # The direct parent is necessarily local and would make this metric
+        # trivially high. Detect returns to earlier lineage states instead.
+        parent = states.get(int(candidate.parent_id)) if candidate.parent_id is not None else None
+        ancestor_id = None if parent is None else parent.parent_id
+        nearest_position: float | None = None
+        nearest_rotation: float | None = None
+        while ancestor_id is not None and int(ancestor_id) in states:
+            ancestor = states[int(ancestor_id)]
+            position = float(np.linalg.norm(
+                candidate.task_position - ancestor.task_position
+            ))
+            rotation = float(np.rad2deg(np.linalg.norm(quat_to_rotvec(relative(
+                (np.zeros(3), ancestor.task_quaternion),
+                (np.zeros(3), candidate.task_quaternion),
+            )[1]))))
+            if nearest_position is None or position < nearest_position:
+                nearest_position, nearest_rotation = position, rotation
+            ancestor_id = ancestor.parent_id
+        diagnostics = self.config.get("diagnostics", {})
+        near = (
+            nearest_position is not None
+            and nearest_position < float(
+                diagnostics.get("near_ancestor_position_m", 0.001)
+            )
+            and nearest_rotation is not None
+            and nearest_rotation < float(
+                diagnostics.get("near_ancestor_rotation_deg", 1.0)
+            )
+        )
+        return nearest_position, nearest_rotation, bool(near)
 
     def _assign_lineage_to_candidate(
         self, candidate: CurriculumState, seed: CurriculumState,
@@ -726,12 +1172,16 @@ class ReverseCurriculumManager:
         """Exécute un reverse walk et retourne au plus son dernier état valide.
 
         Le snapshot est capturé par l'environnement à l'instant physique exact.
-        Une violation unsafe/invalide annule tout le hop, même si un état
-        intermédiaire avait été sûr. Les sous-steps encore successful sont
-        traversés sans devenir des candidats. Un hop correspond à un seul walk;
-        ``walks_per_seed`` appartient uniquement au générateur legacy utilisé
-        par le bootstrap et les diagnostics.
+        Une violation unsafe arrête immédiatement la physique, mais le dernier
+        prefix safe non-success reste récupérable. Les sous-steps encore
+        successful sont traversés sans devenir des candidats. Un hop correspond
+        à un seul walk; ``walks_per_seed`` appartient uniquement au générateur
+        legacy utilisé par le bootstrap et les diagnostics.
         """
+        # Forward safety and reverse state-generation validity are distinct
+        # concepts. Reverse walks start from contact-rich assembly states, so
+        # transient contact/wrench is measured separately from the final
+        # CurriculumState. Existing rejection rules remain unchanged here.
         self.env.restore_curriculum_state(
             seed, reset_episode=False, restore_rng=True,
         )
@@ -741,23 +1191,100 @@ class ReverseCurriculumManager:
         amplitude = min(
             float(self.walk["action_scale"]) * float(expansion_scale), 1.0,
         )
+        proposal_kind = getattr(self, "_active_proposal_kind", "uniform")
+        configured_heading = getattr(
+            self, "_active_proposal_direction", None,
+        )
+        if self._proposal_mode() == "persistent":
+            report.persistent_attempts += 1
+            branch_heading = (
+                self._initial_branch_heading(proposal_kind, None)
+                if configured_heading is None
+                else np.asarray(configured_heading, dtype=float)
+            )
+            attempt_direction = self._persistent_attempt_direction(branch_heading)
+            report.attempt_to_heading_deviations.append(float(np.linalg.norm(
+                attempt_direction - branch_heading
+            )))
+        else:
+            report.independent_attempts += 1
+            attempt_direction = configured_heading
         last_candidate: CurriculumState | None = None
-        for _ in range(int(self.walk["max_steps"])):
-            action = self.rng.uniform(-amplitude, amplitude, size=6)
+        walk_max_force = 0.0
+        walk_max_torque = 0.0
+        final_force = 0.0
+        final_torque = 0.0
+        walk_contacts: set[str] = set()
+        for step_index in range(int(self.walk["max_steps"])):
+            action = self._reverse_step_action(
+                amplitude, attempt_direction,
+            )
             result = self.env.step_for_curriculum_generation(action)
             report.generated += 1
+            walk_max_force = max(
+                walk_max_force, float(getattr(result, "max_force", 0.0)),
+            )
+            walk_max_torque = max(
+                walk_max_torque, float(getattr(result, "max_torque", 0.0)),
+            )
+            walk_contacts.update(getattr(result, "contact_categories", ()))
             if result.unsafe:
                 report.unsafe_rejected += 1
-                return None, "unsafe"
+                if result.unsafe_force:
+                    report.rejected_force_max.append(walk_max_force)
+                    report.rejected_force_step.append(step_index + 1)
+                if result.unsafe_torque:
+                    report.rejected_torque_max.append(walk_max_torque)
+                    report.rejected_torque_step.append(step_index + 1)
+                if result.unsafe_workspace:
+                    reason = ExpansionStopReason.WORKSPACE.value
+                elif result.unsafe_force and result.unsafe_torque:
+                    reason = ExpansionStopReason.FORCE_AND_TORQUE.value
+                elif result.unsafe_force:
+                    reason = ExpansionStopReason.FORCE.value
+                elif result.unsafe_torque:
+                    reason = ExpansionStopReason.TORQUE.value
+                else:
+                    reason = ExpansionStopReason.OTHER_INVALID.value
+                for category in walk_contacts:
+                    report.rejected_contact_counts[category] = (
+                        report.rejected_contact_counts.get(category, 0) + 1
+                    )
+                # A valid non-success prefix is an admissible curriculum
+                # state; stop at the unsafe transition but do not traverse it.
+                if last_candidate is not None:
+                    report.raw_candidates_generated += 1
+                    report.reverse_steps.append(step_index)
+                    report.safe_prefix_candidates += 1
+                    report.safe_prefix_steps.append(step_index)
+                    report.candidate_final_force.append(final_force)
+                    report.candidate_final_torque.append(final_torque)
+                    return last_candidate, None
+                return None, reason
             if not self._candidate_snapshot_is_valid(result.state):
                 report.invalid_rejected += 1
-                return None, "invalid"
+                return None, ExpansionStopReason.SNAPSHOT_INVALID.value
             if result.success:
                 report.successful_excluded += 1
                 continue
             last_candidate = result.state
+            final_force = float(getattr(result, "final_force", 0.0))
+            final_torque = float(getattr(result, "final_torque", 0.0))
         if last_candidate is None:
-            return None, "no_candidate"
+            # This is deliberately narrow: the reverse generator completed a
+            # walk but never yielded a non-success state usable as a raw hop.
+            return None, "generation_failed"
+        report.raw_candidates_generated += 1
+        report.reverse_steps.append(int(self.walk["max_steps"]))
+        report.accepted_reverse_force_max.append(walk_max_force)
+        report.accepted_reverse_torque_max.append(walk_max_torque)
+        report.candidate_final_force.append(final_force)
+        report.candidate_final_torque.append(final_torque)
+        report.full_walk_candidates += 1
+        for category in walk_contacts:
+            report.accepted_contact_counts[category] = (
+                report.accepted_contact_counts.get(category, 0) + 1
+            )
         return last_candidate, None
 
     @staticmethod
@@ -787,6 +1314,7 @@ class ReverseCurriculumManager:
         """
         settings = self._expansion_settings()
         max_hops = int(settings["max_hops_per_seed"])
+        max_attempts = int(settings["max_attempts_per_hop"])
         candidate_budget = int(settings["max_candidates_per_update"])
         initial_scale = float(np.clip(
             float(settings["initial_scale"]),
@@ -802,9 +1330,18 @@ class ReverseCurriculumManager:
                 int(state.generation_depth) for state in selected
             ]
 
-        branches = [
-            _ExpansionBranch(seed, initial_scale) for seed in selected
-        ]
+        branches = []
+        for seed in selected:
+            branch = _ExpansionBranch(seed, initial_scale)
+            if self._proposal_mode() == "persistent":
+                proposal_kind, guided_direction = self._choose_reverse_proposal(
+                    seed,
+                )
+                branch.proposal_kind = proposal_kind
+                branch.heading = self._initial_branch_heading(
+                    proposal_kind, guided_direction,
+                )
+            branches.append(branch)
         queue = deque(branches)
         report = GenerationReport()
         used_scales: list[float] = []
@@ -832,37 +1369,147 @@ class ReverseCurriculumManager:
                 report.expansion_hops += 1
                 used_scales.append(float(branch.scale))
 
-                snapshot, stop_reason = self._generate_hop_snapshot(
-                    branch.current, branch.scale, report,
+                candidate: CurriculumState | None = None
+                last_proposal_kind = "uniform"
+                attempts_before_hop = report.expansion_attempts
+                for _ in range(max_attempts):
+                    # _generate_hop_snapshot restores branch.current on every
+                    # call; retries therefore never inherit a failed walk.
+                    report.expansion_attempts += 1
+                    if self._proposal_mode() == "persistent":
+                        if branch.heading is None or branch.proposal_kind is None:
+                            raise AssertionError(
+                                "Branche persistante sans heading initialisé"
+                            )
+                        proposal_kind = branch.proposal_kind
+                        direction = branch.heading
+                    else:
+                        proposal_kind, direction = self._choose_reverse_proposal(
+                            branch.current,
+                        )
+                    last_proposal_kind = proposal_kind
+                    setattr(
+                        report, f"proposal_{proposal_kind}_attempts",
+                        getattr(report, f"proposal_{proposal_kind}_attempts") + 1,
+                    )
+                    prefix_before = report.safe_prefix_candidates
+                    self._active_proposal_kind = proposal_kind
+                    self._active_proposal_direction = direction
+                    try:
+                        snapshot, _ = self._generate_hop_snapshot(
+                            branch.current, branch.scale, report,
+                        )
+                    finally:
+                        self._active_proposal_direction = None
+                        self._active_proposal_kind = "uniform"
+                    if snapshot is None:
+                        report.attempt_no_candidate += 1
+                        continue
+
+                    setattr(
+                        report, f"proposal_{proposal_kind}_candidates",
+                        getattr(report, f"proposal_{proposal_kind}_candidates") + 1,
+                    )
+                    if report.safe_prefix_candidates > prefix_before:
+                        setattr(
+                            report, f"proposal_{proposal_kind}_safe_prefix",
+                            getattr(report, f"proposal_{proposal_kind}_safe_prefix") + 1,
+                        )
+
+                    report.valid_candidates += 1
+                    translation_mm, rotation_deg = self._parent_candidate_delta(
+                        branch.current, snapshot,
+                    )
+                    report.raw_parent_translation_mm.append(translation_mm)
+                    report.raw_parent_rotation_deg.append(rotation_deg)
+                    proposal = self._assign_lineage_to_candidate(
+                        snapshot, branch.current,
+                    )
+                    self._last_duplicate_match = (None, None)
+                    if self._is_duplicate(proposal, known_during_update):
+                        report.deduplicated_rejected += 1
+                        report.attempt_duplicate += 1
+                        report.duplicate_parent_translation_mm.append(translation_mm)
+                        report.duplicate_parent_rotation_deg.append(rotation_deg)
+                        nearest_pos, nearest_rot = self._last_duplicate_match
+                        if nearest_pos is not None:
+                            report.duplicate_nearest_position_mm.append(nearest_pos * 1000.0)
+                        if nearest_rot is not None:
+                            report.duplicate_nearest_rotation_deg.append(float(np.rad2deg(nearest_rot)))
+                        # Duplicate prefixes used to reinforce the very
+                        # direction that rediscovered an existing state.
+                        report.guided_memory_rejected_duplicates += 1
+                        continue
+                    candidate = proposal
+                    self._remember_proposal(branch.current, proposal)
+                    report.guided_memory_insertions += 1
+                    setattr(
+                        report, f"proposal_{proposal_kind}_unique",
+                        getattr(report, f"proposal_{proposal_kind}_unique") + 1,
+                    )
+                    report.attempt_candidate_found += 1
+                    break
+                report.attempts_per_hop.append(
+                    report.expansion_attempts - attempts_before_hop
                 )
-                if snapshot is None:
+                if candidate is None:
+                    setattr(
+                        report,
+                        f"proposal_{last_proposal_kind}_attempt_budget_failures",
+                        getattr(
+                            report,
+                            f"proposal_{last_proposal_kind}_attempt_budget_failures",
+                        ) + 1,
+                    )
                     self._record_expansion_stop(
-                        report, stop_reason or "invalid",
+                        report, ExpansionStopReason.ATTEMPT_BUDGET.value,
                     )
                     continue
 
-                candidate = self._assign_lineage_to_candidate(
-                    snapshot, branch.current,
+                ancestor_position, ancestor_rotation, near_ancestor = (
+                    self._ancestor_diagnostics(candidate, known_during_update)
                 )
-                if self._is_duplicate(candidate, known_during_update):
-                    report.deduplicated_rejected += 1
-                    self._record_expansion_stop(report, "duplicate")
-                    continue
 
                 # L'identifiant n'est consommé que par un snapshot réellement
                 # nouveau. Le budget est encore disponible car il est testé en
                 # tête de boucle, avant cet unique appel de qualification.
                 self.next_state_id += 1
                 report.valid += 1
+                report.nonduplicate_candidates += 1
                 qualified = self.qualify_candidates(model, [candidate])
                 if len(qualified) != 1:
                     raise RuntimeError(
                         "La qualification d'un hop doit retourner exactement un état"
                     )
                 state = qualified[0]
+                report.qualified_candidates += 1
                 category = classify_success_rate(
                     state.success_rate, low, high,
                 )
+                if not hasattr(self, "state_lifecycle"):
+                    self.state_lifecycle = {}
+                self.state_lifecycle[int(state.state_id)] = StateLifecycleStats(
+                    created_update=int(getattr(self, "update_count", 0)) + 1,
+                    frontier_since_update=(
+                        int(getattr(self, "update_count", 0)) + 1
+                        if category == "frontier" else None
+                    ),
+                    consecutive_frontier_updates=(
+                        1 if category == "frontier" else 0
+                    ),
+                    nearest_ancestor_position_m=ancestor_position,
+                    nearest_ancestor_rotation_deg=ancestor_rotation,
+                    near_ancestor_return=near_ancestor,
+                )
+                if ancestor_position is not None:
+                    report.nearest_ancestor_position_mm.append(
+                        ancestor_position * 1000.0
+                    )
+                if ancestor_rotation is not None:
+                    report.nearest_ancestor_rotation_deg.append(
+                        ancestor_rotation
+                    )
+                report.new_states_near_ancestor += int(near_ancestor)
                 # Le pool peut être élagué ici. La continuation conserve
                 # néanmoins l'objet snapshot exact qualifié comme parent du
                 # prochain hop; elle ne reconstruit jamais sa pose.
@@ -881,16 +1528,39 @@ class ReverseCurriculumManager:
                     self._record_expansion_stop(report, category)
                     continue
                 if branch.hops >= max_hops:
-                    self._record_expansion_stop(report, "max_hops")
+                    self._record_expansion_stop(report, ExpansionStopReason.MAX_HOPS.value)
                     continue
                 branch.current = state
                 branch.scale = self._next_expansion_scale(
                     branch.scale, category,
                 )
+                if self._proposal_mode() == "persistent":
+                    if branch.heading is None:
+                        raise AssertionError(
+                            "Branche persistante sans heading à faire évoluer"
+                        )
+                    previous_heading = branch.heading
+                    next_heading = self._next_branch_heading(previous_heading)
+                    report.branch_heading_changes.append(float(np.linalg.norm(
+                        next_heading - previous_heading
+                    )))
+                    norm_product = float(
+                        np.linalg.norm(previous_heading)
+                        * np.linalg.norm(next_heading)
+                    )
+                    if (
+                        norm_product > 0.0
+                        and float(np.dot(previous_heading, next_heading))
+                        / norm_product < -0.5
+                    ):
+                        report.successive_hop_heading_opposition += 1
+                    branch.heading = next_heading
                 queue.append(branch)
 
             if queue and report.expansion_candidates >= candidate_budget:
-                self._record_expansion_stop(report, "global_budget", len(queue))
+                self._record_expansion_stop(
+                    report, ExpansionStopReason.CANDIDATE_BUDGET.value, len(queue),
+                )
         finally:
             report.expansion_wall_time = time.perf_counter() - started_at
 
@@ -905,6 +1575,9 @@ class ReverseCurriculumManager:
             report.frontier_found_per_candidate = (
                 report.new_frontier / report.expansion_candidates
             )
+        # Every selected branch has exactly one final, exclusive reason.
+        if sum(report.stop_reasons.values()) != len(branches):
+            raise AssertionError("Une branche d'expansion a disparu sans raison d'arrêt")
         self.last_expansion_seed_distances = [
             float(state.pose_distance) for state in attempted_seeds
         ]
@@ -945,8 +1618,24 @@ class ReverseCurriculumManager:
                 self.env.restore_curriculum_state(
                     seed_state, reset_episode=False, restore_rng=True,
                 )
+                if self._proposal_mode() == "persistent":
+                    report.persistent_attempts += 1
+                    branch_heading = self._initial_branch_heading(
+                        "uniform", None,
+                    )
+                    attempt_direction = self._persistent_attempt_direction(
+                        branch_heading,
+                    )
+                    report.attempt_to_heading_deviations.append(float(
+                        np.linalg.norm(attempt_direction - branch_heading)
+                    ))
+                else:
+                    report.independent_attempts += 1
+                    attempt_direction = None
                 for _ in range(max_steps):
-                    action = self.rng.uniform(-action_scale, action_scale, size=6)
+                    action = self._reverse_step_action(
+                        action_scale, attempt_direction,
+                    )
                     result = self.env.step_for_curriculum_generation(action)
                     report.generated += 1
                     if result.unsafe:
@@ -1146,7 +1835,19 @@ class ReverseCurriculumManager:
         if self.total_pool_size:
             return self.last_generation_report
         candidates, report = self.generate_candidates([self.goal_seed])
-        self._insert(self.qualify_candidates(model, candidates))
+        qualified = self.qualify_candidates(model, candidates)
+        low = float(self.config["success_rate_low"])
+        high = float(self.config["success_rate_high"])
+        for state in qualified:
+            category = classify_success_rate(state.success_rate, low, high)
+            self.state_lifecycle[int(state.state_id)] = StateLifecycleStats(
+                created_update=self.update_count,
+                frontier_since_update=(
+                    self.update_count if category == "frontier" else None
+                ),
+                consecutive_frontier_updates=(1 if category == "frontier" else 0),
+            )
+        self._insert(qualified)
         return report
 
     def select_too_hard_for_revalidation(
@@ -1257,6 +1958,21 @@ class ReverseCurriculumManager:
             # Qualifier avant toute mutation : une erreur de rollout laisse les
             # pools intacts, même si les flux RNG de qualification ont avancé.
             requalified = self.qualify_candidates(model, selected)
+            old_categories = {
+                int(state.state_id): pool
+                for pool in POOL_NAMES for state in self.pools[pool]
+            }
+            new_categories = {
+                int(state.state_id): classify_success_rate(
+                    state.success_rate,
+                    float(self.config["success_rate_low"]),
+                    float(self.config["success_rate_high"]),
+                )
+                for state in requalified
+            }
+            self._update_lifecycle_after_revalidation(
+                old_categories, new_categories,
+            )
             too_hard_keys = {
                 self._state_selection_key(state)
                 for state in too_hard_selected
@@ -1281,6 +1997,18 @@ class ReverseCurriculumManager:
                 too_hard_to_frontier=too_hard_categories.count("frontier"),
                 too_hard_to_mastered=too_hard_categories.count("mastered"),
                 too_hard_remained_hard=too_hard_categories.count("too_hard"),
+                frontier_promoted_to_mastered=sum(
+                    old_categories.get(state_id) == "frontier" and category == "mastered"
+                    for state_id, category in new_categories.items()
+                ),
+                frontier_remained_frontier=sum(
+                    old_categories.get(state_id) == "frontier" and category == "frontier"
+                    for state_id, category in new_categories.items()
+                ),
+                frontier_demoted_to_too_hard=sum(
+                    old_categories.get(state_id) == "frontier" and category == "too_hard"
+                    for state_id, category in new_categories.items()
+                ),
                 frontier_rollouts=len(frontier_selected) * rollouts,
                 mastered_rollouts=mastered_count * rollouts,
                 too_hard_rollouts=len(too_hard_keys) * rollouts,
@@ -1291,6 +2019,28 @@ class ReverseCurriculumManager:
                 wall_time=time.perf_counter() - started_at,
             )
         return len(selected)
+
+    def _update_lifecycle_after_revalidation(
+        self, old_categories: dict[int, str], new_categories: dict[int, str],
+    ) -> None:
+        if not hasattr(self, "state_lifecycle"):
+            self.state_lifecycle = {}
+        for state_id, category in new_categories.items():
+            stats = self.state_lifecycle.setdefault(
+                state_id, StateLifecycleStats(created_update=-1),
+            )
+            update_count = int(getattr(self, "update_count", 0)) + 1
+            stats.last_revalidated_update = update_count
+            stats.revalidation_count += 1
+            if category == "frontier":
+                if old_categories.get(state_id) == "frontier":
+                    stats.consecutive_frontier_updates += 1
+                else:
+                    stats.frontier_since_update = update_count
+                    stats.consecutive_frontier_updates = 1
+            else:
+                stats.frontier_since_update = None
+                stats.consecutive_frontier_updates = 0
 
     def update(self, model: BaseAlgorithm) -> GenerationReport:
         """Revalide à sa cadence puis étend les branches en multi-hop.
@@ -1387,11 +2137,15 @@ class ReverseCurriculumManager:
         for config in (saved_core, current_core):
             config.pop("evaluation_rollouts_per_candidate", None)
             config.pop("start_sampling", None)
+            config.pop("diagnostics", None)
             config.pop("revalidation", None)
             config.pop("curriculum_reset_probability", None)
             walk = config.get("reverse_random_walk")
             if isinstance(walk, dict):
                 walk.pop("min_pose_distance_increase", None)
+                walk.pop("proposal", None)
+                walk.pop("proposal_mode", None)
+                walk.pop("persistent_proposal", None)
                 if not walk:
                     config.pop("reverse_random_walk", None)
             # Toute la section expansion décrit une stratégie de découverte,
@@ -1441,18 +2195,19 @@ class ReverseCurriculumManager:
             "training_timesteps": (
                 None if training_timesteps is None else int(training_timesteps)
             ),
+            "state_lifecycle": deepcopy(self.state_lifecycle),
         }
 
     def load_state_dict(self, payload: dict[str, Any]) -> None:
         version = int(payload.get("version", 1))
-        if version not in {1, self.STATE_VERSION}:
+        if version not in {1, 2, self.STATE_VERSION}:
             raise ValueError(
                 "Version de curriculum_state.pkl incompatible: "
                 f"{payload.get('version')!r}"
             )
         saved_config = payload.get("curriculum_config")
         saved_hash = payload.get("task_config_sha256")
-        if version == self.STATE_VERSION:
+        if version in {2, self.STATE_VERSION}:
             compatible_task = saved_hash == self._task_config_sha256()
         elif saved_hash is not None and saved_config is not None:
             compatible_task = saved_hash == self._task_config_sha256(
@@ -1505,6 +2260,36 @@ class ReverseCurriculumManager:
         self.update_count = int(payload["update_count"])
         self.next_update_timesteps = int(payload["next_update_timesteps"])
         self.loaded_training_timesteps = payload.get("training_timesteps")
+        saved_lifecycle = payload.get("state_lifecycle", {})
+        self.state_lifecycle = {}
+        for state_id, stats in saved_lifecycle.items():
+            migrated = (
+                stats if isinstance(stats, StateLifecycleStats)
+                else StateLifecycleStats(**stats)
+            )
+            for name, default in (
+                ("nearest_ancestor_position_m", None),
+                ("nearest_ancestor_rotation_deg", None),
+                ("near_ancestor_return", False),
+            ):
+                if not hasattr(migrated, name):
+                    setattr(migrated, name, default)
+            self.state_lifecycle[int(state_id)] = migrated
+        # Legacy states have unknown creation history. ``-1`` explicitly means
+        # unknown; current frontier membership starts its observable age now.
+        for pool, states in self.pools.items():
+            for state in states:
+                state_id = int(state.state_id)
+                if state_id not in self.state_lifecycle:
+                    self.state_lifecycle[state_id] = StateLifecycleStats(
+                        created_update=-1,
+                        frontier_since_update=(
+                            self.update_count if pool == "frontier" else None
+                        ),
+                    )
+        self.proposal_memory = {}
+        self._active_proposal_direction = None
+        self._active_proposal_kind = "uniform"
         if "training_python_rng_state" in payload:
             random.setstate(payload["training_python_rng_state"])
         if "training_numpy_rng_state" in payload:

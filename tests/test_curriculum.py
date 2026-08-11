@@ -13,8 +13,11 @@ import numpy as np
 from src.assembly_env import TenonMortaiseEnv
 from src.config import load_config
 from src.curriculum import (
-    CurriculumState, GenerationReport, ReverseCurriculumManager,
+    CurriculumGenerationResult, CurriculumState, GenerationReport,
+    ReverseCurriculumManager, StateLifecycleStats,
     classify_success_rate,
+    compute_adaptive_three_way_probabilities,
+    compute_start_sampling_probabilities, effective_historical_fraction,
     historical_quantile_bins, mastered_boundary_states,
     mastered_edge_states, select_too_hard_by_lineage,
     select_training_start,
@@ -283,6 +286,10 @@ class ReverseCurriculumPhysicsTest(unittest.TestCase):
                 seed=99, options={"reset_source": "true_start"},
             )
             self.assertEqual(curriculum_info["reset_source"], "true_start")
+            self.assertEqual(curriculum_info["curriculum_start_state_id"], -1)
+            self.assertEqual(
+                curriculum_info["curriculum_start_generation_depth"], -1,
+            )
             np.testing.assert_allclose(
                 baseline_info["true_error"], curriculum_info["true_error"],
                 atol=1e-12,
@@ -302,6 +309,10 @@ class ReverseCurriculumPhysicsTest(unittest.TestCase):
         )
         self.assertEqual(info["reset_source"], "curriculum_frontier")
         self.assertTrue(info["is_curriculum_reset"])
+        self.assertEqual(info["curriculum_start_state_id"], state.state_id)
+        self.assertEqual(
+            info["curriculum_start_generation_depth"], state.generation_depth,
+        )
         np.testing.assert_allclose(
             self.env._integration_state(), state.mj_state, atol=1e-10,
         )
@@ -511,6 +522,13 @@ class ReverseCurriculumPhysicsTest(unittest.TestCase):
             "too_hard": [c], "frontier": [b], "mastered": [a],
         }
         source.next_state_id = 23_004
+        source.state_lifecycle = {
+            23_002: StateLifecycleStats(
+                created_update=2, last_revalidated_update=4,
+                revalidation_count=3, frontier_since_update=3,
+                consecutive_frontier_updates=2,
+            ),
+        }
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "curriculum_state.pkl"
@@ -533,6 +551,9 @@ class ReverseCurriculumPhysicsTest(unittest.TestCase):
         self.assertEqual(actual, expected)
         self.assertEqual(restored.next_state_id, 23_004)
         self.assertEqual(restored.loaded_training_timesteps, 1_600_000)
+        self.assertEqual(restored.state_lifecycle[23_002].revalidation_count, 3)
+        self.assertEqual(restored.state_lifecycle[23_002].frontier_since_update, 3)
+        self.assertEqual(restored.state_lifecycle[23_001].created_update, -1)
 
     def test_save_reload_preserves_a_graph_produced_by_multihop_expansion(self):
         curriculum_config = deepcopy(self.config["curriculum"])
@@ -815,6 +836,8 @@ class ReverseCurriculumPureLogicTest(unittest.TestCase):
             used_scales.append(scale)
             raw_index += 1
             report.generated += 1
+            report.raw_candidates_generated += 1
+            report.reverse_steps.append(1)
             return self._snapshot(-1, x=1.0 + raw_index), None
 
         manager._generate_hop_snapshot = generate
@@ -848,7 +871,122 @@ class ReverseCurriculumPureLogicTest(unittest.TestCase):
         selection = self._select(
             [], self._states([.001]), requested="curriculum_frontier",
         )
-        self.assertEqual(selection.source, "curriculum_historical")
+        self.assertEqual(selection.source, "true_start")
+
+    def test_adaptive_historical_ramp_and_empty_pool_probabilities(self):
+        expected = {0: 0.0, 3: .03, 20: .20, 38: .375, 100: .375}
+        for size, fraction in expected.items():
+            self.assertAlmostEqual(effective_historical_fraction(
+                size, adaptive=True, fixed_fraction=.375,
+                fraction_per_state=.01, fraction_max=.375,
+            ), fraction)
+        empty_frontier = compute_start_sampling_probabilities(
+            curriculum_probability=.95, historical_fraction=.10,
+            frontier_available=False, historical_available=True,
+        )
+        self.assertAlmostEqual(empty_frontier.historical, .095)
+        self.assertAlmostEqual(empty_frontier.true_start, .905)
+        empty_historical = compute_start_sampling_probabilities(
+            curriculum_probability=.95, historical_fraction=.10,
+            frontier_available=True, historical_available=False,
+        )
+        self.assertEqual(empty_historical.frontier, .95)
+        both_empty = compute_start_sampling_probabilities(
+            curriculum_probability=.95, historical_fraction=.10,
+            frontier_available=False, historical_available=False,
+        )
+        self.assertEqual(both_empty.true_start, 1.0)
+
+    def test_adaptive_historical_disabled_keeps_fixed_fraction(self):
+        self.assertEqual(effective_historical_fraction(
+            3, adaptive=False, fixed_fraction=.375,
+            fraction_per_state=.01, fraction_max=.375,
+        ), .375)
+
+    def test_auto_sampling_does_not_reassign_empty_frontier_budget(self):
+        rng = np.random.default_rng(41)
+        historical = self._states([.001, .002, .003])
+        historical_count = sum(
+            select_training_start(
+                rng, curriculum_probability=.95,
+                frontier_fraction=.90, historical_fraction=.10,
+                historical_bins=4, frontier=[], historical=historical,
+            ).source == "curriculum_historical"
+            for _ in range(20_000)
+        )
+        self.assertAlmostEqual(historical_count / 20_000, .095, delta=.01)
+
+        rng = np.random.default_rng(42)
+        frontier = self._states([.005])
+        frontier_count = sum(
+            select_training_start(
+                rng, curriculum_probability=.95,
+                frontier_fraction=.90, historical_fraction=.10,
+                historical_bins=4, frontier=frontier, historical=[],
+            ).source == "curriculum_frontier"
+            for _ in range(20_000)
+        )
+        self.assertAlmostEqual(frontier_count / 20_000, .95, delta=.01)
+
+    def test_adaptive_three_way_probabilities_scale_and_cap_independently(self):
+        def probabilities(frontier, historical):
+            return compute_adaptive_three_way_probabilities(
+                frontier, historical,
+                frontier_fraction_per_state=.10, frontier_fraction_max=.45,
+                historical_fraction_per_state=.01,
+                historical_fraction_max=.25,
+            )
+
+        for size, expected in {0: 0, 1: .1, 2: .2, 3: .3, 5: .45, 100: .45}.items():
+            self.assertAlmostEqual(probabilities(size, 0).frontier, expected)
+        for size, expected in {0: 0, 3: .03, 10: .1, 20: .2, 25: .25, 100: .25}.items():
+            self.assertAlmostEqual(probabilities(0, size).historical, expected)
+        early = probabilities(2, 3)
+        self.assertAlmostEqual(early.frontier, .20)
+        self.assertAlmostEqual(early.historical, .03)
+        self.assertAlmostEqual(early.true_start, .77)
+        mature = probabilities(100, 100)
+        self.assertAlmostEqual(mature.frontier, .45)
+        self.assertAlmostEqual(mature.historical, .25)
+        self.assertAlmostEqual(mature.true_start, .30)
+        empty = probabilities(0, 0)
+        self.assertAlmostEqual(empty.frontier, 0.0)
+        self.assertAlmostEqual(empty.historical, 0.0)
+        self.assertAlmostEqual(empty.true_start, 1.0)
+        no_frontier = probabilities(0, 10)
+        self.assertAlmostEqual(no_frontier.frontier, 0.0)
+        self.assertAlmostEqual(no_frontier.historical, .10)
+        self.assertAlmostEqual(no_frontier.true_start, .90)
+        no_historical = probabilities(3, 0)
+        self.assertAlmostEqual(no_historical.frontier, .30)
+        self.assertAlmostEqual(no_historical.historical, 0.0)
+        self.assertAlmostEqual(no_historical.true_start, .70)
+        self.assertAlmostEqual(
+            early.frontier + early.historical + early.true_start, 1.0,
+        )
+
+    def test_adaptive_three_way_sampling_matches_target_with_one_draw(self):
+        probabilities = compute_adaptive_three_way_probabilities(
+            2, 3, frontier_fraction_per_state=.10,
+            frontier_fraction_max=.45, historical_fraction_per_state=.01,
+            historical_fraction_max=.25,
+        )
+        rng = np.random.default_rng(43)
+        counts = {source: 0 for source in (
+            "curriculum_frontier", "curriculum_historical", "true_start",
+        )}
+        for _ in range(20_000):
+            selection = select_training_start(
+                rng, curriculum_probability=.95,
+                frontier_fraction=.625, historical_fraction=.375,
+                historical_bins=4, frontier=self._states([.005, .006]),
+                historical=self._states([.001, .002, .003]),
+                probabilities=probabilities,
+            )
+            counts[selection.source] += 1
+        self.assertAlmostEqual(counts["curriculum_frontier"] / 20_000, .20, delta=.015)
+        self.assertAlmostEqual(counts["curriculum_historical"] / 20_000, .03, delta=.01)
+        self.assertAlmostEqual(counts["true_start"] / 20_000, .77, delta=.015)
 
     def test_c_empty_historical_falls_back_to_frontier(self):
         selection = self._select(
@@ -973,7 +1111,7 @@ class ReverseCurriculumPureLogicTest(unittest.TestCase):
         self.assertEqual(report.expansion_rollouts, 25)
         self.assertEqual(qualification_calls, 5)
         self.assertEqual(report.expansion_hops, 5)
-        self.assertIn("global_budget", report.stop_reasons)
+        self.assertIn("candidate_budget", report.stop_reasons)
 
     def test_round_robin_attempts_every_branch_before_any_second_hop(self):
         manager, seeds, generated_from, _ = self._multihop_manager(
@@ -1011,9 +1149,10 @@ class ReverseCurriculumPureLogicTest(unittest.TestCase):
         )
 
     def test_invalid_and_duplicate_each_stop_the_branch_without_descendant(self):
-        for stop_kind in ("invalid", "duplicate"):
+        for stop_kind in ("snapshot_invalid", "duplicate"):
             with self.subTest(stop_kind=stop_kind):
                 manager, seeds, _, _ = self._multihop_manager([1.0])
+                manager.config["expansion"]["max_attempts_per_hop"] = 1
                 qualification_calls = 0
 
                 def qualify(model, states):
@@ -1022,9 +1161,9 @@ class ReverseCurriculumPureLogicTest(unittest.TestCase):
                     return [replace(states[0], success_rate=1.0)]
 
                 manager.qualify_candidates = qualify
-                if stop_kind == "invalid":
+                if stop_kind == "snapshot_invalid":
                     manager._generate_hop_snapshot = (
-                        lambda seed, scale, report: (None, "invalid")
+                        lambda seed, scale, report: (None, "snapshot_invalid")
                     )
                 else:
                     manager._is_duplicate = lambda candidate, additional: True
@@ -1034,15 +1173,629 @@ class ReverseCurriculumPureLogicTest(unittest.TestCase):
                 self.assertEqual(report.expansion_candidates, 0)
                 self.assertEqual(report.expansion_hops, 1)
                 self.assertEqual(qualification_calls, 0)
-                self.assertEqual(report.stop_reasons, {stop_kind: 1})
+                self.assertEqual(report.stop_reasons, {"attempt_budget": 1})
                 self.assertEqual(manager.pools["mastered"], seeds)
                 self.assertEqual(manager.next_state_id, 100)
+
+    def test_reverse_unsafe_reasons_preserve_force_torque_priority(self):
+        seed = self._snapshot(1, x=.01)
+        for flags, expected in (
+            ((True, False, False), "force"),
+            ((False, True, False), "torque"),
+            ((True, True, False), "force_and_torque"),
+            ((False, False, True), "workspace"),
+        ):
+            with self.subTest(flags=flags):
+                manager = self._manager()
+                manager.walk["max_steps"] = 1
+                result = CurriculumGenerationResult(
+                    state=seed, geometric_success=False, success=False,
+                    unsafe=True, unsafe_force=flags[0], unsafe_torque=flags[1],
+                    unsafe_workspace=flags[2], position_error=.01,
+                    rotation_error=0.0, pose_distance=.01,
+                    max_force=91.0, max_torque=9.0,
+                )
+                manager.env = SimpleNamespace(
+                    restore_curriculum_state=lambda *args, **kwargs: None,
+                    step_for_curriculum_generation=lambda action: result,
+                )
+                report = GenerationReport()
+                snapshot, reason = manager._generate_hop_snapshot(seed, 1.0, report)
+                self.assertIsNone(snapshot)
+                self.assertEqual(reason, expected)
+                self.assertEqual(len(report.rejected_force_max), int(flags[0]))
+                self.assertEqual(len(report.rejected_torque_max), int(flags[1]))
+
+    def test_unsafe_walk_returns_last_valid_non_success_prefix(self):
+        manager = self._manager()
+        manager.walk.update({
+            "proposal_mode": "persistent", "max_steps": 5,
+            "persistent_proposal": {
+                "attempt_direction_noise_std": 0.0,
+                "hop_direction_noise_std": 0.0,
+                "step_noise_std": 0.0,
+            },
+        })
+        manager._active_proposal_direction = np.array([1, 0, 0, 0, 0, 0.])
+        parent = self._snapshot(1, x=.01)
+        snapshots = [self._snapshot(-1, x=value) for value in (.02, .03, .04)]
+        outcomes = [
+            CurriculumGenerationResult(
+                state=state, geometric_success=False, success=False,
+                unsafe=False, unsafe_force=False, unsafe_torque=False,
+                unsafe_workspace=False, position_error=state.position_error,
+                rotation_error=0.0, pose_distance=state.pose_distance,
+            ) for state in snapshots
+        ]
+        outcomes.append(CurriculumGenerationResult(
+            state=self._snapshot(-1, x=.05), geometric_success=False,
+            success=False, unsafe=True, unsafe_force=False, unsafe_torque=True,
+            unsafe_workspace=False, position_error=.05, rotation_error=0.0,
+            pose_distance=.05, max_torque=9.0,
+        ))
+        calls = 0
+        def step(action):
+            nonlocal calls
+            value = outcomes[calls]
+            calls += 1
+            return value
+        manager.env = SimpleNamespace(
+            restore_curriculum_state=lambda *args, **kwargs: None,
+            step_for_curriculum_generation=step,
+        )
+        report = GenerationReport()
+        candidate, reason = manager._generate_hop_snapshot(parent, 1.0, report)
+        self.assertIs(candidate, snapshots[-1])
+        self.assertIsNone(reason)
+        self.assertEqual(calls, 4)
+        self.assertEqual(report.safe_prefix_candidates, 1)
+        self.assertEqual(report.safe_prefix_steps, [3])
+        self.assertEqual(report.persistent_attempts, 1)
+
+    def test_expansion_funnel_and_parent_displacement_are_diagnostic_only(self):
+        manager, _, _, _ = self._multihop_manager([.6])
+        report = manager._expand_branches(object())
+
+        self.assertEqual(report.expansion_hops, 1)
+        self.assertEqual(report.raw_candidates_generated, 1)
+        self.assertEqual(report.valid_candidates, 1)
+        self.assertEqual(report.nonduplicate_candidates, 1)
+        self.assertEqual(report.qualified_candidates, 1)
+        # Parent x=10 mm and synthetic raw candidate x=2 m: delta is 1990 mm.
+        self.assertAlmostEqual(report.raw_parent_translation_mm[0], 1990.0)
+        self.assertAlmostEqual(report.raw_parent_rotation_deg[0], 0.0)
+
+    def test_workspace_and_generation_failure_are_exclusive_stops(self):
+        for reason in ("workspace", "generation_failed"):
+            with self.subTest(reason=reason):
+                manager, _, _, _ = self._multihop_manager([1.0])
+                manager.config["expansion"]["max_attempts_per_hop"] = 1
+                manager._generate_hop_snapshot = (
+                    lambda seed, scale, report: (None, reason)
+                )
+                report = manager._expand_branches(object())
+                self.assertEqual(report.stop_reasons, {"attempt_budget": 1})
+                self.assertEqual(report.attempt_no_candidate, 1)
+                self.assertEqual(report.qualified_candidates, 0)
+
+    def test_attempts_retry_from_same_parent_without_consuming_candidate_budget(self):
+        manager, seeds, generated_from, _ = self._multihop_manager([.6])
+        manager.config["expansion"]["max_attempts_per_hop"] = 4
+        attempts = iter((None, self._snapshot(-1, x=.01), self._snapshot(-1, x=2.0)))
+
+        def generate(seed, scale, report):
+            generated_from.append(seed.state_id)
+            report.raw_candidates_generated += 1
+            snapshot = next(attempts)
+            return snapshot, "generation_failed" if snapshot is None else None
+
+        manager._generate_hop_snapshot = generate
+        duplicate_calls = 0
+        def duplicate(candidate, additional):
+            nonlocal duplicate_calls
+            duplicate_calls += 1
+            return duplicate_calls == 1
+        manager._is_duplicate = duplicate
+        report = manager._expand_branches(object())
+
+        self.assertEqual(report.expansion_attempts, 3)
+        self.assertEqual(report.attempt_no_candidate, 1)
+        self.assertEqual(report.attempt_duplicate, 1)
+        self.assertEqual(report.attempt_candidate_found, 1)
+        self.assertEqual(report.expansion_candidates, 1)
+        self.assertEqual(generated_from, [seeds[0].state_id] * 3)
+        self.assertEqual(report.guided_memory_rejected_duplicates, 1)
+        self.assertEqual(report.guided_memory_insertions, 1)
+        self.assertEqual(len(manager.proposal_memory[seeds[0].state_id]), 1)
+
+    def test_attempt_budget_stops_branch_after_exact_limit(self):
+        manager, _, _, _ = self._multihop_manager([1.0])
+        manager.config["expansion"]["max_attempts_per_hop"] = 3
+        manager._generate_hop_snapshot = lambda seed, scale, report: (
+            None, "generation_failed",
+        )
+        report = manager._expand_branches(object())
+        self.assertEqual(report.expansion_attempts, 3)
+        self.assertEqual(report.stop_reasons, {"attempt_budget": 1})
+
+    def test_guided_fraction_zero_preserves_rng_and_uniform_fallback(self):
+        manager = self._manager(seed=19)
+        manager.walk["proposal"] = {
+            "guided_fraction": 0.0, "guided_noise_std": .2,
+            "memory_size_per_parent": 4,
+        }
+        parent = self._snapshot(1, x=.01)
+        manager.proposal_memory = {1: [np.ones(6)]}
+        before = deepcopy(manager.rng.bit_generator.state)
+        kind, direction = manager._choose_reverse_proposal(parent)
+        self.assertEqual(kind, "uniform")
+        self.assertIsNone(direction)
+        self.assertEqual(manager.rng.bit_generator.state, before)
+
+        manager.walk["proposal"]["guided_fraction"] = 1.0
+        manager.proposal_memory = {}
+        kind, direction = manager._choose_reverse_proposal(parent)
+        self.assertEqual(kind, "uniform")
+        self.assertIsNone(direction)
+
+    def test_proposal_memory_is_bounded_per_parent(self):
+        manager = self._manager()
+        manager.walk["proposal"] = {
+            "guided_fraction": 1.0, "guided_noise_std": .2,
+            "memory_size_per_parent": 4,
+        }
+        manager.proposal_memory = {}
+        parent = self._snapshot(1, x=.01)
+        for index in range(10):
+            manager._remember_proposal(
+                parent, self._snapshot(-1, x=.02 + index * .01),
+            )
+        self.assertEqual(len(manager.proposal_memory[1]), 4)
+
+    def test_guided_direction_keeps_direction_not_candidate_magnitude(self):
+        manager = self._manager()
+        manager.env = SimpleNamespace(cfg={"action": {
+            "max_translation_step": .001,
+            "max_rotation_step_deg": 10.0,
+        }})
+        parent = self._snapshot(1)
+        translated = self._snapshot(-1, x=.002)
+        direction_x = manager._proposal_direction(parent, translated)
+        np.testing.assert_allclose(direction_x, [1, 0, 0, 0, 0, 0])
+
+        angle = np.deg2rad(5.0)
+        rotated = replace(
+            self._snapshot(-1),
+            task_quaternion=np.array([
+                np.cos(angle / 2), 0.0, 0.0, np.sin(angle / 2),
+            ]),
+        )
+        direction_rz = manager._proposal_direction(parent, rotated)
+        np.testing.assert_allclose(
+            direction_rz, [0, 0, 0, 0, 0, 1], atol=1e-12,
+        )
+
+        farther = self._snapshot(-1, x=.020)
+        np.testing.assert_allclose(
+            manager._proposal_direction(parent, farther), direction_x,
+        )
+
+    def test_independent_mode_preserves_the_historical_uniform_rng_path(self):
+        manager = self._manager(seed=23)
+        manager.walk.update({
+            "proposal_mode": "independent", "max_steps": 3,
+            "action_scale": .5,
+        })
+        parent = self._snapshot(1)
+        actions = []
+        expected_rng = np.random.default_rng()
+        expected_rng.bit_generator.state = deepcopy(manager.rng.bit_generator.state)
+
+        class Env:
+            def restore_curriculum_state(self, *args, **kwargs):
+                return None
+
+            def step_for_curriculum_generation(inner_self, action):
+                actions.append(np.asarray(action).copy())
+                return CurriculumGenerationResult(
+                    state=self._snapshot(-1, x=.01),
+                    geometric_success=False, success=False, unsafe=False,
+                    unsafe_force=False, unsafe_torque=False,
+                    unsafe_workspace=False, position_error=.01,
+                    rotation_error=0.0, pose_distance=.01,
+                )
+
+        manager.env = Env()
+        report = GenerationReport()
+        manager._generate_hop_snapshot(parent, 1.0, report)
+        expected = np.asarray([
+            expected_rng.uniform(-.5, .5, size=6) for _ in range(3)
+        ])
+        np.testing.assert_array_equal(np.asarray(actions), expected)
+        self.assertEqual(report.independent_attempts, 1)
+        self.assertEqual(report.persistent_attempts, 0)
+
+    def test_persistent_guided_attempt_reuses_one_direction(self):
+        manager = self._manager(seed=24)
+        manager.walk.update({
+            "proposal_mode": "persistent", "max_steps": 4,
+            "action_scale": .5,
+            "persistent_proposal": {
+                "attempt_direction_noise_std": 0.0,
+                "hop_direction_noise_std": 0.0,
+                "step_noise_std": 0.0,
+            },
+            "proposal": {
+                "guided_fraction": 1.0, "guided_noise_std": 0.0,
+                "memory_size_per_parent": 4,
+            },
+        })
+        manager._active_proposal_kind = "guided"
+        manager._active_proposal_direction = np.array([1, 0, 0, 0, 0, 0.])
+        parent = self._snapshot(1)
+        actions = []
+
+        class Env:
+            def restore_curriculum_state(self, *args, **kwargs):
+                return None
+
+            def step_for_curriculum_generation(inner_self, action):
+                actions.append(np.asarray(action).copy())
+                return CurriculumGenerationResult(
+                    state=self._snapshot(-1, x=.01),
+                    geometric_success=False, success=False, unsafe=False,
+                    unsafe_force=False, unsafe_torque=False,
+                    unsafe_workspace=False, position_error=.01,
+                    rotation_error=0.0, pose_distance=.01,
+                )
+
+        manager.env = Env()
+        report = GenerationReport()
+        manager._generate_hop_snapshot(parent, 1.0, report)
+        np.testing.assert_array_equal(
+            np.asarray(actions), np.tile([.5, 0, 0, 0, 0, 0], (4, 1)),
+        )
+        self.assertEqual(report.persistent_attempts, 1)
+        self.assertEqual(report.independent_attempts, 0)
+
+    def test_persistent_step_noise_stays_centered_and_clipped(self):
+        manager = self._manager(seed=25)
+        manager.walk.update({
+            "proposal_mode": "persistent", "max_steps": 500,
+            "action_scale": .5,
+            "persistent_proposal": {
+                "attempt_direction_noise_std": 0.0,
+                "hop_direction_noise_std": 0.0,
+                "step_noise_std": .05,
+            },
+        })
+        direction = np.array([.25, -.20, .10, 0.0, .15, -.10])
+        manager._active_proposal_direction = direction
+        parent = self._snapshot(1)
+        actions = []
+
+        class Env:
+            def restore_curriculum_state(self, *args, **kwargs):
+                return None
+
+            def step_for_curriculum_generation(inner_self, action):
+                actions.append(np.asarray(action).copy())
+                return CurriculumGenerationResult(
+                    state=self._snapshot(-1, x=.01),
+                    geometric_success=False, success=False, unsafe=False,
+                    unsafe_force=False, unsafe_torque=False,
+                    unsafe_workspace=False, position_error=.01,
+                    rotation_error=0.0, pose_distance=.01,
+                )
+
+        manager.env = Env()
+        manager._generate_hop_snapshot(parent, 1.0, GenerationReport())
+        samples = np.asarray(actions)
+        self.assertGreater(float(np.std(samples[:, 0])), 0.0)
+        self.assertLessEqual(float(np.max(np.abs(samples))), .5)
+        np.testing.assert_allclose(
+            np.mean(samples, axis=0) / .5, direction, atol=.015,
+        )
+
+    def test_persistent_branch_keeps_one_guided_heading_across_mastered_hops(self):
+        manager, seeds, _, _ = self._multihop_manager([1.0, 1.0, .6])
+        manager.walk.update({
+            "proposal_mode": "persistent",
+            "persistent_proposal": {
+                "attempt_direction_noise_std": 0.0,
+                "hop_direction_noise_std": 0.0,
+                "step_noise_std": 0.0,
+            },
+            "proposal": {
+                "guided_fraction": 1.0, "guided_noise_std": 0.0,
+                "memory_size_per_parent": 4,
+            },
+        })
+        expected = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        manager.proposal_memory = {int(seeds[0].state_id): [expected.copy()]}
+        choose = manager._choose_reverse_proposal
+        queried_parents = []
+
+        def choose_once(parent):
+            queried_parents.append(int(parent.state_id))
+            return choose(parent)
+
+        manager._choose_reverse_proposal = choose_once
+        generated = manager._generate_hop_snapshot
+        headings = []
+
+        def capture_heading(seed, scale, report):
+            headings.append(manager._active_proposal_direction.copy())
+            return generated(seed, scale, report)
+
+        manager._generate_hop_snapshot = capture_heading
+        report = manager._expand_branches(object())
+
+        np.testing.assert_array_equal(headings, np.tile(expected, (3, 1)))
+        np.testing.assert_array_equal(report.branch_heading_changes, [0.0, 0.0])
+        self.assertEqual(report.proposal_guided_attempts, 3)
+        self.assertEqual(report.successive_hop_heading_opposition, 0)
+        self.assertEqual(queried_parents, [int(seeds[0].state_id)])
+
+    def test_hop_heading_noise_is_local_and_clipped(self):
+        manager = self._manager(seed=27)
+        manager.walk["persistent_proposal"] = {
+            "attempt_direction_noise_std": 0.0,
+            "hop_direction_noise_std": 0.15,
+            "step_noise_std": 0.0,
+        }
+        heading = np.array([.95, -.90, .2, 0.0, .1, -.1])
+        expected_rng = np.random.default_rng()
+        expected_rng.bit_generator.state = deepcopy(manager.rng.bit_generator.state)
+        expected = np.clip(
+            heading + expected_rng.normal(0.0, .15, size=6), -1.0, 1.0,
+        )
+
+        actual = manager._next_branch_heading(heading)
+
+        np.testing.assert_array_equal(actual, expected)
+        self.assertFalse(np.array_equal(actual, heading))
+        self.assertLessEqual(float(np.max(np.abs(actual))), 1.0)
+
+    def test_retries_vary_around_the_same_heading_and_restore_the_parent(self):
+        manager = self._manager(seed=28)
+        manager.walk.update({
+            "proposal_mode": "persistent", "max_steps": 1,
+            "action_scale": .5,
+            "persistent_proposal": {
+                "attempt_direction_noise_std": .20,
+                "hop_direction_noise_std": 0.0,
+                "step_noise_std": 0.0,
+            },
+        })
+        heading = np.array([.5, -.25, .1, 0.0, .2, -.1])
+        manager._active_proposal_direction = heading
+        parent = self._snapshot(1)
+        actions = []
+        restored = []
+        expected_rng = np.random.default_rng()
+        expected_rng.bit_generator.state = deepcopy(manager.rng.bit_generator.state)
+
+        class Env:
+            def restore_curriculum_state(inner_self, state, **kwargs):
+                restored.append(state)
+
+            def step_for_curriculum_generation(inner_self, action):
+                actions.append(np.asarray(action).copy())
+                return CurriculumGenerationResult(
+                    state=self._snapshot(-1, x=.01),
+                    geometric_success=False, success=False, unsafe=False,
+                    unsafe_force=False, unsafe_torque=False,
+                    unsafe_workspace=False, position_error=.01,
+                    rotation_error=0.0, pose_distance=.01,
+                )
+
+        manager.env = Env()
+        report = GenerationReport()
+        for _ in range(3):
+            manager._generate_hop_snapshot(parent, 1.0, report)
+
+        expected = np.asarray([
+            np.clip(
+                heading + expected_rng.normal(0.0, .20, size=6), -1.0, 1.0,
+            ) * .5
+            for _ in range(3)
+        ])
+        np.testing.assert_array_equal(actions, expected)
+        self.assertTrue(all(state is parent for state in restored))
+        self.assertEqual(len({tuple(action) for action in actions}), 3)
+        self.assertTrue(all(value > 0.0 for value in report.attempt_to_heading_deviations))
+
+    def test_two_branches_from_the_same_parent_get_independent_headings(self):
+        manager = self._manager(seed=29)
+        manager.walk.update({
+            "proposal_mode": "persistent",
+            "persistent_proposal": {
+                "attempt_direction_noise_std": 0.0,
+                "hop_direction_noise_std": 0.0,
+                "step_noise_std": 0.0,
+            },
+            "proposal": {
+                "guided_fraction": 0.0, "guided_noise_std": 0.0,
+                "memory_size_per_parent": 4,
+            },
+        })
+        parent = self._snapshot(1, depth=1, x=.01, success_rate=1.0)
+        manager.pools["mastered"] = [parent]
+        manager.next_state_id = 100
+        headings = []
+
+        def generate(seed, scale, report):
+            headings.append(manager._active_proposal_direction.copy())
+            return self._snapshot(-1, x=1.0 + len(headings)), None
+
+        manager._generate_hop_snapshot = generate
+        manager._is_duplicate = lambda candidate, additional: False
+        manager.qualify_candidates = lambda model, states: [
+            replace(states[0], success_rate=.6)
+        ]
+
+        report = manager._expand_branches(object(), seeds=[parent, parent])
+
+        self.assertEqual(report.expansion_branches, 2)
+        self.assertEqual(len(headings), 2)
+        self.assertFalse(np.array_equal(headings[0], headings[1]))
+
+    def test_branch_can_curve_across_hops_without_a_direction_constraint(self):
+        manager, seeds, _, _ = self._multihop_manager([1.0, 1.0, .6])
+        manager.walk.update({
+            "proposal_mode": "persistent",
+            "persistent_proposal": {
+                "attempt_direction_noise_std": 0.0,
+                "hop_direction_noise_std": 0.15,
+                "step_noise_std": 0.0,
+            },
+            "proposal": {
+                "guided_fraction": 1.0, "guided_noise_std": 0.0,
+                "memory_size_per_parent": 4,
+            },
+        })
+        x = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        xy = np.array([1.0, 1.0, 0.0, 0.0, 0.0, 0.0])
+        y = np.array([0.0, 1.0, 0.0, 0.0, 0.0, 0.0])
+        manager.proposal_memory = {int(seeds[0].state_id): [x.copy()]}
+        turns = iter((xy.copy(), y.copy()))
+        manager._next_branch_heading = lambda heading: next(turns)
+        generated = manager._generate_hop_snapshot
+        headings = []
+
+        def capture_heading(seed, scale, report):
+            headings.append(manager._active_proposal_direction.copy())
+            return generated(seed, scale, report)
+
+        manager._generate_hop_snapshot = capture_heading
+        report = manager._expand_branches(object())
+
+        np.testing.assert_array_equal(headings, np.asarray([x, xy, y]))
+        self.assertEqual(report.expansion_candidates, 3)
+        self.assertEqual(report.successive_hop_heading_opposition, 0)
+
+    def test_legacy_bootstrap_honours_persistent_proposal_mode(self):
+        manager = self._manager(seed=26)
+        manager.config["candidates_per_update"] = 3
+        manager.walk.update({
+            "proposal_mode": "persistent", "walks_per_seed": 1,
+            "max_steps": 3, "action_scale": .5,
+            "persistent_proposal": {
+                "attempt_direction_noise_std": 0.0,
+                "hop_direction_noise_std": 0.0,
+                "step_noise_std": 0.0,
+            },
+        })
+        manager.next_state_id = 10
+        manager._is_duplicate = lambda candidate, additional: False
+        parent = self._snapshot(1)
+        actions = []
+        step = 0
+
+        class Env:
+            def restore_curriculum_state(self, *args, **kwargs):
+                return None
+
+            def step_for_curriculum_generation(inner_self, action):
+                nonlocal step
+                step += 1
+                actions.append(np.asarray(action).copy())
+                return CurriculumGenerationResult(
+                    state=self._snapshot(-1, x=.01 * step),
+                    geometric_success=False, success=False, unsafe=False,
+                    unsafe_force=False, unsafe_torque=False,
+                    unsafe_workspace=False, position_error=.01 * step,
+                    rotation_error=0.0, pose_distance=.01 * step,
+                )
+
+        manager.env = Env()
+        candidates, report = manager.generate_candidates([parent])
+        self.assertEqual(len(candidates), 3)
+        np.testing.assert_array_equal(
+            np.asarray(actions), np.tile(actions[0], (3, 1)),
+        )
+        self.assertEqual(report.persistent_attempts, 1)
+        self.assertEqual(report.independent_attempts, 0)
+
+    def test_proposal_metrics_distinguish_uniform_and_guided_attempts(self):
+        uniform, _, _, _ = self._multihop_manager([.6])
+        uniform.walk["proposal"] = {
+            "guided_fraction": 0.0, "guided_noise_std": .2,
+            "memory_size_per_parent": 4,
+        }
+        uniform_report = uniform._expand_branches(object())
+        self.assertEqual(uniform_report.proposal_uniform_attempts, 1)
+        self.assertEqual(uniform_report.proposal_uniform_unique, 1)
+
+        guided, seeds, _, _ = self._multihop_manager([.6])
+        guided.walk["proposal"] = {
+            "guided_fraction": 1.0, "guided_noise_std": .2,
+            "memory_size_per_parent": 4,
+        }
+        guided.proposal_memory = {
+            int(seeds[0].state_id): [np.zeros(6)],
+        }
+        guided_report = guided._expand_branches(object())
+        self.assertEqual(guided_report.proposal_guided_attempts, 1)
+        self.assertEqual(guided_report.proposal_guided_unique, 1)
+
+    def test_frontier_lifecycle_tracks_remain_promote_and_demote(self):
+        manager = self._manager()
+        manager.update_count = 4
+        manager.state_lifecycle = {
+            1: StateLifecycleStats(
+                created_update=1, frontier_since_update=2,
+                consecutive_frontier_updates=2,
+            ),
+        }
+        manager._update_lifecycle_after_revalidation(
+            {1: "frontier"}, {1: "frontier"},
+        )
+        stats = manager.state_lifecycle[1]
+        self.assertEqual(stats.revalidation_count, 1)
+        self.assertEqual(stats.last_revalidated_update, 5)
+        self.assertEqual(stats.frontier_since_update, 2)
+        self.assertEqual(stats.consecutive_frontier_updates, 3)
+
+        manager.update_count = 5
+        manager._update_lifecycle_after_revalidation(
+            {1: "frontier"}, {1: "mastered"},
+        )
+        self.assertIsNone(stats.frontier_since_update)
+        self.assertEqual(stats.consecutive_frontier_updates, 0)
+
+        manager.update_count = 6
+        manager._update_lifecycle_after_revalidation(
+            {1: "mastered"}, {1: "frontier"},
+        )
+        self.assertEqual(stats.frontier_since_update, 7)
+        self.assertEqual(stats.consecutive_frontier_updates, 1)
+
+    def test_nearest_ancestor_diagnostic_is_observational(self):
+        manager = self._manager()
+        manager.config["diagnostics"] = {
+            "near_ancestor_position_m": .001,
+            "near_ancestor_rotation_deg": 1.0,
+        }
+        ancestor = self._snapshot(1, x=.010)
+        parent = self._snapshot(2, parent_id=1, depth=2, x=.020)
+        candidate = self._snapshot(-1, parent_id=2, depth=3, x=.0105)
+        before = (candidate.parent_id, candidate.generation_depth)
+        position, rotation, near = manager._ancestor_diagnostics(
+            candidate, [ancestor, parent],
+        )
+        self.assertAlmostEqual(position, .0005)
+        self.assertEqual(rotation, 0.0)
+        self.assertTrue(near)
+        self.assertEqual((candidate.parent_id, candidate.generation_depth), before)
 
     def test_deduplication_remembers_an_accepted_state_pruned_during_update(self):
         manager, seeds, _, _ = self._multihop_manager(
             [1.0], max_hops=4,
         )
         manager.config["max_pool_size"] = 1
+        manager.config["expansion"]["max_attempts_per_hop"] = 1
         manager.deduplication = {
             "position_tolerance": 1e-6,
             "rotation_tolerance_deg": 1e-6,
@@ -1072,7 +1825,7 @@ class ReverseCurriculumPureLogicTest(unittest.TestCase):
         self.assertEqual(report.expansion_candidates, 1)
         self.assertEqual(report.expansion_hops, 2)
         self.assertEqual(report.deduplicated_rejected, 1)
-        self.assertEqual(report.stop_reasons, {"duplicate": 1})
+        self.assertEqual(report.stop_reasons, {"attempt_budget": 1})
         self.assertEqual(qualification_calls, 1)
         self.assertEqual(manager.next_state_id, 101)
         self.assertEqual(manager.pools["mastered"], seeds)
@@ -1409,6 +2162,19 @@ class ReverseCurriculumPureLogicTest(unittest.TestCase):
             "min_scale": .3,
             "max_scale": 2.0,
         })
+        self.assertTrue(
+            ReverseCurriculumManager._curriculum_configs_compatible(
+                saved_with_strategy, changed_strategy,
+            )
+        )
+        saved_with_strategy["reverse_random_walk"] = {
+            "proposal_mode": "independent",
+            "persistent_proposal": {"step_noise_std": .10},
+        }
+        changed_strategy["reverse_random_walk"] = {
+            "proposal_mode": "persistent",
+            "persistent_proposal": {"step_noise_std": .20},
+        }
         self.assertTrue(
             ReverseCurriculumManager._curriculum_configs_compatible(
                 saved_with_strategy, changed_strategy,

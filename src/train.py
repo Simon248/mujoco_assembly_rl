@@ -27,7 +27,12 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecEnv,
 
 from src.assembly_env import TenonMortaiseEnv
 from src.config import load_config, save_resolved_config
-from src.curriculum import ReverseCurriculumManager
+from src.curriculum import (
+    ReverseCurriculumManager, configured_start_sampling_probabilities,
+)
+from src.curriculum_diagnostics import (
+    ExpansionDiagnostics, curriculum_state_rows, write_curriculum_diagnostics,
+)
 
 
 MONITOR_FIELDS = (
@@ -47,7 +52,11 @@ MONITOR_FIELDS = (
     "episode_reward_success", "episode_reward_unsafe", "episode_reward_timeout",
     "reset_source", "curriculum_start_position_error",
     "curriculum_start_rotation_error", "curriculum_start_pose_distance",
-    "curriculum_start_success_rate", "is_curriculum_reset",
+    "curriculum_start_success_rate", "curriculum_start_state_id",
+    "curriculum_start_generation_depth", "is_curriculum_reset",
+    "best_pose_metric", "position_error_at_best_pose",
+    "rotation_error_at_best_pose", "reached_20mm", "reached_10mm",
+    "reached_5mm", "reached_2mm",
 )
 
 EVAL_MONITOR_FIELDS = MONITOR_FIELDS + (
@@ -137,6 +146,18 @@ class ReverseCurriculumCallback(BaseCallback):
         self.used_start_distances: dict[str, list[float]] = {
             source: [] for source in self.CURRICULUM_SOURCES
         }
+        self.true_start_diagnostics: dict[str, list[float]] = {
+            name: [] for name in (
+                "best_position_error", "best_pose_metric",
+                "position_error_at_best_pose", "rotation_error_at_best_pose",
+                "reached_20mm", "reached_10mm", "reached_5mm", "reached_2mm",
+            )
+        }
+        # Window: episodes completed since the preceding curriculum update.
+        self.frontier_reset_counts: dict[int, int] = {}
+        # Pools are broadcast only at update boundaries, so this snapshot is
+        # exactly the reset distribution used throughout the current window.
+        self.sampling_targets_used = self._sampling_targets()
 
     def _broadcast_pool(self) -> None:
         pools = self.manager.training_reset_pools()
@@ -194,6 +215,8 @@ class ReverseCurriculumCallback(BaseCallback):
             for name in (
                 "too_hard_revalidated", "too_hard_to_frontier",
                 "too_hard_to_mastered", "too_hard_remained_hard",
+                "frontier_promoted_to_mastered", "frontier_remained_frontier",
+                "frontier_demoted_to_too_hard",
             ):
                 value = getattr(revalidation_report, name, None)
                 if value is None:
@@ -246,6 +269,210 @@ class ReverseCurriculumCallback(BaseCallback):
                 self.logger.record(
                     f"curriculum/{name}", float(value), exclude="stdout",
                 )
+            # Per-update expansion funnel and exclusive branch stop causes.
+            # Missing fields deliberately default to zero for backward-
+            # compatible report objects used by older checkpoints/tests.
+            for reason in (
+                "duplicate", "force", "torque", "force_and_torque",
+                "snapshot_invalid", "forbidden_contact", "other_invalid",
+                "workspace", "generation_failed",
+                "frontier", "too_hard", "max_hops", "attempt_budget",
+                "candidate_budget",
+            ):
+                self.logger.record(
+                    f"curriculum/stop_{reason}",
+                    float(getattr(expansion_report, "stop_reasons", {}).get(reason, 0)),
+                    exclude="stdout",
+                )
+            funnel_names = (
+                "raw_candidates_generated", "valid_candidates",
+                "nonduplicate_candidates", "qualified_candidates",
+                "expansion_attempts", "attempt_no_candidate", "attempt_duplicate",
+                "attempt_candidate_found", "safe_prefix_candidates",
+                "full_walk_candidates",
+                "proposal_uniform_attempts", "proposal_guided_attempts",
+                "proposal_uniform_candidates", "proposal_guided_candidates",
+                "proposal_uniform_unique", "proposal_guided_unique",
+                "proposal_uniform_safe_prefix", "proposal_guided_safe_prefix",
+                "proposal_uniform_attempt_budget_failures",
+                "proposal_guided_attempt_budget_failures",
+                "persistent_attempts", "independent_attempts",
+                "successive_hop_heading_opposition",
+                "guided_memory_insertions",
+                "guided_memory_rejected_duplicates",
+                "new_states_near_ancestor",
+            )
+            # expansion_hops / expansion_candidates are retained legacy names:
+            # hops is every reverse-walk attempt, candidates is every state
+            # reaching policy qualification.
+            for name in funnel_names:
+                self.logger.record(
+                    f"curriculum/{name}",
+                    float(getattr(expansion_report, name, 0)), exclude="stdout",
+                )
+            hops = float(getattr(expansion_report, "expansion_hops", 0))
+            raw = float(getattr(expansion_report, "raw_candidates_generated", 0))
+            qualified = float(getattr(expansion_report, "qualified_candidates", 0))
+            self.logger.record(
+                "curriculum/raw_candidate_rate", raw / hops if hops else 0.0,
+                exclude="stdout",
+            )
+            self.logger.record(
+                "curriculum/qualification_rate", qualified / hops if hops else 0.0,
+                exclude="stdout",
+            )
+            # These are attempt-level observations, not branch stop reasons:
+            # a later retry may still make the branch progress.
+            self.logger.record(
+                "curriculum/reverse_force_limit_exceeded",
+                float(len(getattr(expansion_report, "rejected_force_max", []))),
+                exclude="stdout",
+            )
+            self.logger.record(
+                "curriculum/reverse_torque_limit_exceeded",
+                float(len(getattr(expansion_report, "rejected_torque_max", []))),
+                exclude="stdout",
+            )
+            near_ancestor = float(getattr(
+                expansion_report, "new_states_near_ancestor", 0,
+            ))
+            self.logger.record(
+                "curriculum/new_states_near_ancestor_fraction",
+                near_ancestor / qualified if qualified else 0.0,
+                exclude="stdout",
+            )
+            for kind in ("uniform", "guided"):
+                attempts = float(getattr(
+                    expansion_report, f"proposal_{kind}_attempts", 0,
+                ))
+                candidates = float(getattr(
+                    expansion_report, f"proposal_{kind}_candidates", 0,
+                ))
+                unique = float(getattr(
+                    expansion_report, f"proposal_{kind}_unique", 0,
+                ))
+                self.logger.record(
+                    f"curriculum/{kind}_unique_per_attempt",
+                    unique / attempts if attempts else 0.0, exclude="stdout",
+                )
+                self.logger.record(
+                    f"curriculum/{kind}_candidate_per_attempt",
+                    candidates / attempts if attempts else 0.0, exclude="stdout",
+                )
+            for prefix, attribute, statistics in (
+                ("raw_parent_translation_mm", "raw_parent_translation_mm", ("mean", "min", "max")),
+                ("raw_parent_rotation_deg", "raw_parent_rotation_deg", ("mean", "min", "max")),
+                ("duplicate_parent_translation_mm", "duplicate_parent_translation_mm", ("mean", "max")),
+                ("duplicate_parent_rotation_deg", "duplicate_parent_rotation_deg", ("mean", "max")),
+                ("duplicate_nearest_position_mm", "duplicate_nearest_position_mm", ("mean",)),
+                ("duplicate_nearest_rotation_deg", "duplicate_nearest_rotation_deg", ("mean",)),
+                ("reverse_steps", "reverse_steps", ("mean", "min", "max")),
+                ("attempts_per_hop", "attempts_per_hop", ("mean", "max")),
+                ("safe_prefix_steps", "safe_prefix_steps", ("mean", "min", "max")),
+                ("nearest_ancestor_position_mm", "nearest_ancestor_position_mm", ("mean",)),
+                ("nearest_ancestor_rotation_deg", "nearest_ancestor_rotation_deg", ("mean",)),
+                ("rejected_force_max", "rejected_force_max", ("mean", "min", "max")),
+                ("rejected_torque_max", "rejected_torque_max", ("mean", "min", "max")),
+                ("rejected_force_step", "rejected_force_step", ("mean",)),
+                ("rejected_torque_step", "rejected_torque_step", ("mean",)),
+                ("accepted_reverse_force_max", "accepted_reverse_force_max", ("mean", "max")),
+                ("accepted_reverse_torque_max", "accepted_reverse_torque_max", ("mean", "max")),
+                ("candidate_final_force", "candidate_final_force", ("mean", "max")),
+                ("candidate_final_torque", "candidate_final_torque", ("mean", "max")),
+                ("branch_heading_changes", "branch_heading_changes", ("mean", "max")),
+                (
+                    "attempt_to_heading_deviation",
+                    "attempt_to_heading_deviations", ("mean", "max"),
+                ),
+            ):
+                values = np.asarray(getattr(expansion_report, attribute, []), dtype=float)
+                values = values[np.isfinite(values)]
+                for statistic in statistics:
+                    value = 0.0 if not values.size else float(getattr(np, statistic)(values))
+                    self.logger.record(
+                        f"curriculum/{prefix}_{statistic}", value,
+                        exclude="stdout",
+                    )
+            for prefix, attribute in (
+                (
+                    "reverse_candidate_parent_delta_position_mm",
+                    "raw_parent_translation_mm",
+                ),
+                (
+                    "reverse_candidate_parent_delta_rotation_deg",
+                    "raw_parent_rotation_deg",
+                ),
+            ):
+                values = np.asarray(
+                    getattr(expansion_report, attribute, []), dtype=float,
+                )
+                values = values[np.isfinite(values)]
+                self.logger.record(
+                    f"curriculum/{prefix}_mean",
+                    float(np.mean(values)) if values.size else 0.0,
+                    exclude="stdout",
+                )
+                self.logger.record(
+                    f"curriculum/{prefix}_max",
+                    float(np.max(values)) if values.size else 0.0,
+                    exclude="stdout",
+                )
+            for outcome, attribute in (
+                ("rejected", "rejected_contact_counts"),
+                ("accepted", "accepted_contact_counts"),
+            ):
+                counts = getattr(expansion_report, attribute, {})
+                for category in (
+                    "piece_fixture", "piece_other", "fixture_other", "unknown",
+                ):
+                    self.logger.record(
+                        f"curriculum/{outcome}_reverse_contact_{category}",
+                        float(counts.get(category, 0)), exclude="stdout",
+                    )
+            # One compact update-level summary: reverse trajectory diagnostics
+            # never emit one line per MuJoCo substep or candidate.
+            stops = getattr(expansion_report, "stop_reasons", {})
+            def wrench_summary(attribute: str) -> str:
+                samples = np.asarray(
+                    getattr(expansion_report, attribute, []), dtype=float,
+                )
+                samples = samples[np.isfinite(samples)]
+                if not samples.size:
+                    return "n/a"
+                return f"mean={np.mean(samples):.3g} max={np.max(samples):.3g}"
+
+            print(
+                "[Curriculum expansion]\n"
+                f"hops={int(hops)} raw={int(raw)} "
+                f"valid={int(getattr(expansion_report, 'valid_candidates', 0))} "
+                f"unique={int(getattr(expansion_report, 'nonduplicate_candidates', 0))} "
+                f"qualified={int(qualified)} "
+                f"attempts={int(getattr(expansion_report, 'expansion_attempts', 0))}\n"
+                "attempts/hop: "
+                f"{wrench_summary('attempts_per_hop')}\n"
+                "candidates: "
+                f"safe_prefix={int(getattr(expansion_report, 'safe_prefix_candidates', 0))} "
+                f"full_walk={int(getattr(expansion_report, 'full_walk_candidates', 0))} "
+                f"duplicates={int(getattr(expansion_report, 'attempt_duplicate', 0))} "
+                f"no_candidate={int(getattr(expansion_report, 'attempt_no_candidate', 0))}\n"
+                "stops: " + " ".join(
+                    f"{name}={int(stops.get(name, 0))}" for name in (
+                        "force", "torque", "force_and_torque", "snapshot_invalid",
+                        "workspace", "duplicate", "generation_failed", "frontier",
+                        "too_hard", "max_hops", "candidate_budget",
+                        "attempt_budget",
+                    )
+                ) + "\n"
+                "reverse rejected: "
+                f"Fmax {wrench_summary('rejected_force_max')} "
+                f"Tmax {wrench_summary('rejected_torque_max')}\n"
+                "reverse accepted: "
+                f"Fmax {wrench_summary('accepted_reverse_force_max')} "
+                f"Tmax {wrench_summary('accepted_reverse_torque_max')}\n"
+                "candidate final: "
+                f"F {wrench_summary('candidate_final_force')} "
+                f"T {wrench_summary('candidate_final_torque')}",
+            )
 
         distances = np.asarray(
             getattr(self.manager, "last_expansion_seed_distances", []),
@@ -283,6 +510,7 @@ class ReverseCurriculumCallback(BaseCallback):
     def _record_metrics(
         self, *, include_pool_metrics: bool = False,
         include_update_metrics: bool = False,
+        sampling_targets_used=None, sampling_targets_next=None,
     ) -> None:
         # Les listes d'épisodes peuvent contenir des dizaines de milliers de
         # valeurs : ces agrégats sont volontairement calculés à la cadence des
@@ -294,6 +522,10 @@ class ReverseCurriculumCallback(BaseCallback):
                 label = "historical" if name == "mastered" else name
                 distances = [
                     state.pose_distance for state in self.manager.pools[name]
+                ]
+                positions = [
+                    float(getattr(state, "position_error", state.pose_distance))
+                    for state in self.manager.pools[name]
                 ]
                 depths = [
                     int(state.generation_depth)
@@ -307,6 +539,11 @@ class ReverseCurriculumCallback(BaseCallback):
                 )
                 self._record_distance_distribution(
                     f"{label}_pose_distance", distances, quartiles=True,
+                )
+                self.logger.record(
+                    f"curriculum/{name}_position_max",
+                    float(np.max(positions)) if positions else 0.0,
+                    exclude="stdout",
                 )
                 if name == "mastered" and distances:
                     maximum = float(np.max(distances))
@@ -329,11 +566,73 @@ class ReverseCurriculumCallback(BaseCallback):
                 "curriculum/mastered_boundary_count",
                 float(len(self.manager.mastered_boundary_states())),
             )
+            lifecycle = getattr(self.manager, "state_lifecycle", {})
+            frontier_stats = [
+                lifecycle.get(int(getattr(state, "state_id", -1)))
+                for state in self.manager.pools["frontier"]
+            ]
+            frontier_stats = [stats for stats in frontier_stats if stats is not None]
+            ages = [
+                max(0, int(getattr(self.manager, "update_count", 0))
+                    - int(stats.frontier_since_update))
+                for stats in frontier_stats
+                if stats.frontier_since_update is not None
+            ]
+            for prefix, values in (
+                ("frontier_age_updates", ages),
+                ("frontier_revalidation_count", [
+                    stats.revalidation_count for stats in frontier_stats
+                ]),
+                ("frontier_consecutive_updates", [
+                    stats.consecutive_frontier_updates for stats in frontier_stats
+                ]),
+            ):
+                self.logger.record(
+                    f"curriculum/{prefix}_mean",
+                    float(np.mean(values)) if values else 0.0,
+                    exclude="stdout",
+                )
+                self.logger.record(
+                    f"curriculum/{prefix}_max",
+                    float(np.max(values)) if values else 0.0,
+                    exclude="stdout",
+                )
 
         if include_update_metrics:
             self._record_update_metrics()
 
+        targets_used = (
+            self.sampling_targets_used
+            if sampling_targets_used is None else sampling_targets_used
+        )
+        targets_next = (
+            self._sampling_targets()
+            if sampling_targets_next is None else sampling_targets_next
+        )
+        for name in ("true_start", "frontier", "historical"):
+            self.logger.record(
+                f"curriculum/sampling/target_used/{name}",
+                float(getattr(targets_used, name)), exclude="stdout",
+            )
+            self.logger.record(
+                f"curriculum/sampling/target_next/{name}",
+                float(getattr(targets_next, name)), exclude="stdout",
+            )
+
         total_resets = sum(self.source_episode_counts.values())
+        observed_resets = {
+            source: (
+                self.source_episode_counts[source] / total_resets
+                if total_resets else 0.0
+            )
+            for source in self.RESET_SOURCES
+        }
+        for source, observed in observed_resets.items():
+            self.logger.record(
+                "curriculum/sampling/observed/"
+                f"{self.SOURCE_LABELS[source]}", observed,
+                exclude="stdout",
+            )
         if total_resets:
             curriculum_resets = sum(
                 self.source_episode_counts[source]
@@ -344,9 +643,10 @@ class ReverseCurriculumCallback(BaseCallback):
                 curriculum_resets / total_resets,
             )
             for source in self.RESET_SOURCES:
+                observed = observed_resets[source]
                 self.logger.record(
                     f"curriculum/reset_fraction_{self.SOURCE_LABELS[source]}",
-                    self.source_episode_counts[source] / total_resets,
+                    observed,
                 )
 
         total_transitions = sum(self.source_transition_counts.values())
@@ -394,6 +694,30 @@ class ReverseCurriculumCallback(BaseCallback):
                     exclude="stdout",
                 )
 
+        for name, samples in self.true_start_diagnostics.items():
+            values = np.asarray(samples, dtype=float)
+            values = values[np.isfinite(values)]
+            if values.size:
+                self.logger.record(
+                    f"true_start/{name}", float(np.mean(values)),
+                    exclude="stdout",
+                )
+        frontier_counts = list(self.frontier_reset_counts.values())
+        self.logger.record(
+            "curriculum/frontier_resets_per_state_mean",
+            float(np.mean(frontier_counts)) if frontier_counts else 0.0,
+            exclude="stdout",
+        )
+        self.logger.record(
+            "curriculum/frontier_resets_per_state_max",
+            float(np.max(frontier_counts)) if frontier_counts else 0.0,
+            exclude="stdout",
+        )
+        self.logger.record(
+            "curriculum/frontier_unique_states_sampled",
+            float(len(frontier_counts)), exclude="stdout",
+        )
+
         if include_pool_metrics:
             frontier_mean = self.manager.frontier_success_rate_mean()
             if np.isfinite(frontier_mean):
@@ -409,11 +733,52 @@ class ReverseCurriculumCallback(BaseCallback):
             self.source_episode_lengths[source].clear()
         for source in self.CURRICULUM_SOURCES:
             self.used_start_distances[source].clear()
+        for values in self.true_start_diagnostics.values():
+            values.clear()
+        self.frontier_reset_counts.clear()
 
     def _save_curriculum(self, path: Path) -> None:
         self.manager.save(
             path, self._worker_rng_states(),
             training_timesteps=int(self.model.num_timesteps),
+        )
+
+    def _sampling_targets(self):
+        manager_config = getattr(self.manager, "config", {})
+        pools = getattr(self.manager, "pools", {})
+        return configured_start_sampling_probabilities(
+            frontier_pool_size=len(pools.get("frontier", [])),
+            historical_pool_size=len(pools.get("mastered", [])),
+            curriculum_probability=float(
+                manager_config.get("curriculum_reset_probability", 0.8)
+            ),
+            config=manager_config.get("start_sampling", {}),
+        )
+
+    def _write_curriculum_diagnostics(
+        self, targets_used=None, targets_next=None,
+    ) -> None:
+        targets_used = (
+            self.sampling_targets_used if targets_used is None else targets_used
+        )
+        targets_next = (
+            self._sampling_targets() if targets_next is None else targets_next
+        )
+        total = sum(self.source_episode_counts.values())
+        observed = {
+            self.SOURCE_LABELS[source]: (
+                self.source_episode_counts[source] / total if total else 0.0
+            )
+            for source in self.RESET_SOURCES
+        }
+        timesteps = int(self.model.num_timesteps)
+        diagnostics = ExpansionDiagnostics.build(
+            self.manager, timesteps, targets_used, observed, targets_next,
+            self.frontier_reset_counts,
+        )
+        write_curriculum_diagnostics(
+            self.output, diagnostics,
+            curriculum_state_rows(self.manager, timesteps),
         )
 
     def _save_checkpoint(self) -> None:
@@ -432,11 +797,17 @@ class ReverseCurriculumCallback(BaseCallback):
 
     def _process_due_work(self) -> None:
         while self.model.num_timesteps >= self.manager.next_update_timesteps:
+            targets_used = self.sampling_targets_used
             self.manager.update(self.model)
             self._broadcast_pool()
+            targets_next = self._sampling_targets()
             self._record_metrics(
                 include_pool_metrics=True, include_update_metrics=True,
+                sampling_targets_used=targets_used,
+                sampling_targets_next=targets_next,
             )
+            self._write_curriculum_diagnostics(targets_used, targets_next)
+            self.sampling_targets_used = targets_next
             self._reset_cycle_metrics()
         if self.next_checkpoint_timesteps is None:
             self.next_checkpoint_timesteps = (
@@ -473,6 +844,19 @@ class ReverseCurriculumCallback(BaseCallback):
                 continue
             self.source_episode_counts[source] += 1
             self.source_success_counts[source] += int(bool(info.get("safe_success")))
+            if source == "curriculum_frontier":
+                state_id = info.get("curriculum_start_state_id")
+                if isinstance(state_id, (int, np.integer)) and int(state_id) >= 0:
+                    key = int(state_id)
+                    self.frontier_reset_counts[key] = (
+                        self.frontier_reset_counts.get(key, 0) + 1
+                    )
+            if source == "true_start":
+                for name, values in self.true_start_diagnostics.items():
+                    value = info.get(name)
+                    if (isinstance(value, (bool, int, float, np.number))
+                            and np.isfinite(float(value))):
+                        values.append(float(value))
             episode = info.get("episode")
             episode_length = (
                 episode.get("l") if isinstance(episode, dict) else None

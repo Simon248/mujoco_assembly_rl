@@ -199,6 +199,10 @@ class ConfigTest(unittest.TestCase):
                 "frontier_fraction": 0.625,
                 "historical_fraction": 0.375,
                 "historical_bins": 4,
+                "strategy": "legacy",
+                "adaptive_historical": False,
+                "historical_fraction_per_state": 0.01,
+                "historical_fraction_max": 0.375,
             },
             "revalidation": {
                 "mastered_samples_per_update": 8,
@@ -207,6 +211,7 @@ class ConfigTest(unittest.TestCase):
             },
             "expansion": {
                 "max_hops_per_seed": 4,
+                "max_attempts_per_hop": 8,
                 "max_candidates_per_update": 24,
                 "initial_scale": 1.0,
                 "scale_up_factor": 1.25,
@@ -217,6 +222,17 @@ class ConfigTest(unittest.TestCase):
             "reverse_random_walk": {
                 "walks_per_seed": 8, "max_steps": 20,
                 "action_scale": 0.5,
+                "proposal_mode": "independent",
+                "persistent_proposal": {
+                    "attempt_direction_noise_std": 0.20,
+                    "hop_direction_noise_std": 0.15,
+                    "step_noise_std": 0.10,
+                },
+                "proposal": {
+                    "guided_fraction": 0.0,
+                    "guided_noise_std": 0.20,
+                    "memory_size_per_parent": 16,
+                },
             },
             "deduplication": {
                 "position_tolerance": 0.0005,
@@ -233,6 +249,7 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(curi_max["curriculum"]["curriculum_reset_probability"], .95)
         self.assertEqual(curi_max["curriculum"]["expansion"], {
             "max_hops_per_seed": 4,
+            "max_attempts_per_hop": 8,
             "max_candidates_per_update": 24,
             "initial_scale": 1.0,
             "scale_up_factor": 1.25,
@@ -270,9 +287,14 @@ class ConfigTest(unittest.TestCase):
             "frontier_fraction": .625,
             "historical_fraction": .375,
             "historical_bins": 4,
+            "strategy": "legacy",
+            "adaptive_historical": False,
+            "historical_fraction_per_state": .01,
+            "historical_fraction_max": .375,
         })
         self.assertEqual(resolved["curriculum"]["expansion"], {
             "max_hops_per_seed": 4,
+            "max_attempts_per_hop": 8,
             "max_candidates_per_update": 24,
             "initial_scale": 1.0,
             "scale_up_factor": 1.25,
@@ -299,6 +321,76 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(
             resolved["curriculum"]["start_sampling"]["historical_bins"], 4,
         )
+
+    def test_adaptive_three_way_caps_preserve_true_start_minimum(self):
+        config = load_config("configs/test1V29.yaml")
+        config["curriculum"]["start_sampling"]["frontier"][
+            "fraction_max"
+        ] = .60
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "invalid_sampling.yaml"
+            save_resolved_config(config, path)
+            with self.assertRaisesRegex(ValueError, "fraction_max"):
+                load_config(path)
+
+    def test_persistent_proposal_mode_and_noise_are_explicitly_validated(self):
+        base = load_config("configs/test1V34.yaml")
+        self.assertEqual(
+            base["curriculum"]["reverse_random_walk"]["proposal_mode"],
+            "persistent",
+        )
+        for value, message in (("unknown", "proposal_mode"),):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                invalid = deepcopy(base)
+                invalid["curriculum"]["reverse_random_walk"][
+                    "proposal_mode"
+                ] = value
+                path = Path(directory) / "config.yaml"
+                save_resolved_config(invalid, path)
+                with self.assertRaisesRegex(ValueError, message):
+                    load_config(path)
+
+        persistent = base["curriculum"]["reverse_random_walk"][
+            "persistent_proposal"
+        ]
+        self.assertEqual(persistent, {
+            "attempt_direction_noise_std": 0.20,
+            "hop_direction_noise_std": 0.15,
+            "step_noise_std": 0.10,
+        })
+        for key in persistent:
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as directory:
+                invalid = deepcopy(base)
+                invalid["curriculum"]["reverse_random_walk"][
+                    "persistent_proposal"
+                ][key] = -0.1
+                path = Path(directory) / "config.yaml"
+                save_resolved_config(invalid, path)
+                with self.assertRaisesRegex(ValueError, key):
+                    load_config(path)
+
+    def test_v33_v34_are_an_independent_persistent_ab_pair(self):
+        v33 = load_config("configs/test1V33.yaml")
+        v34 = load_config("configs/test1V34.yaml")
+        walk33 = deepcopy(v33["curriculum"]["reverse_random_walk"])
+        walk34 = deepcopy(v34["curriculum"]["reverse_random_walk"])
+        self.assertEqual(walk33.pop("proposal_mode"), "independent")
+        self.assertEqual(walk34.pop("proposal_mode"), "persistent")
+        self.assertEqual(walk33, walk34)
+        v33["curriculum"]["reverse_random_walk"] = walk33
+        v34["curriculum"]["reverse_random_walk"] = walk34
+        self.assertEqual(v33, v34)
+
+    def test_v35_enables_branch_persistent_proposal_explicitly(self):
+        walk = load_config("configs/test1V35.yaml")["curriculum"][
+            "reverse_random_walk"
+        ]
+        self.assertEqual(walk["proposal_mode"], "persistent")
+        self.assertEqual(walk["persistent_proposal"], {
+            "attempt_direction_noise_std": 0.20,
+            "hop_direction_noise_std": 0.15,
+            "step_noise_std": 0.10,
+        })
 
     def test_enabled_curriculum_is_strictly_validated(self):
         base = load_config("configs/test1V21.yaml")
@@ -368,6 +460,9 @@ class ConfigTest(unittest.TestCase):
         )
         self.assertEqual(
             resolved["curriculum"]["expansion"]["max_hops_per_seed"], 4,
+        )
+        self.assertEqual(
+            resolved["curriculum"]["expansion"]["max_attempts_per_hop"], 8,
         )
         self.assertEqual(
             resolved["curriculum"]["reverse_random_walk"][

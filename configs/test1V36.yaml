@@ -1,19 +1,22 @@
 # Reverse Curriculum Generation autour du goal; tâche et reward héritées de V20.
 extends: test1V20.yaml
 
+training:
+  learning_rate: 0.0003
+
 curriculum:
   enabled: true
 
-  curriculum_reset_probability: 0.80 #probability to begin with the curiculum (otherwise start from true start state)
+  curriculum_reset_probability: 0.95 #probability to begin with the curiculum (otherwise start from true start state)
 
   #servent à classer les états candidats selon la politique actuelle :
   # <10 % de succès → trop difficile ;
   # 10–90 % → intéressant pour apprendre ;
   # >90 % → maîtrisé, donc utile pour continuer les branches reverse.
-  success_rate_low: 0.10
+  success_rate_low: 0.00
   success_rate_high: 0.90
 
-  update_interval_timesteps: 50000 #tous les 50k steps d'entraînement, on met à jour le curriculum : génération de nouveaux états, qualification, mise à jour des pools.
+  update_interval_timesteps: 20000 #tous les 50k steps d'entraînement, on met à jour le curriculum : génération de nouveaux états, qualification, mise à jour des pools.
 
   # Plafond du générateur legacy utilisé au bootstrap/diagnostic. Pendant
   # l'entraînement, le plafond effectif est expansion.max_candidates_per_update.
@@ -22,17 +25,24 @@ curriculum:
 
   max_pool_size: 2000 #au maximum 2000 états de départ stockés. C'est juste une protection mémoire et contre un curriculum énorme/redondant.
 
-  # Fractions conditionnelles aux 80 % de resets curriculum : elles donnent
-  # globalement 50 % frontier, 30 % historique et 20 % true-start.
+  # Probabilités directes par épisode; le budget non alloué aux pools revient
+  # au true start, sans redistribution cachée entre frontier et historical.
   start_sampling:
-    frontier_fraction: 0.625
-    historical_fraction: 0.375
+    strategy: adaptive_three_way
     historical_bins: 4
+    frontier:
+      fraction_per_state: 0.10
+      fraction_max: 0.45
+    historical:
+      fraction_per_state: 0.01
+      fraction_max: 0.25
+    true_start:
+      fraction_min: 0.30
 
   # À chaque update du curriculum, on reprend 8 états actuellement classés mastered , 12 too_hard et on reteste la policy dessus.
   # Le but est de les reclasser.
   revalidation:
-    mastered_samples_per_update: 8
+    mastered_samples_per_update: 12
     too_hard_samples_per_update: 12
     every_n_curriculum_updates: 1 # 1 conserve la revalidation à chaque update; 2 ou 3 permettraient de réduire sa fréquence.
 
@@ -56,8 +66,30 @@ curriculum:
     # multi-hop exécute un seul walk, borné par max_steps.
     walks_per_seed: 8
     max_steps: 20 #signifie que chaque exploration inverse fait au maximum 20 actions. Avec 50 Hz, ça correspond au maximum à environ 0,4 s de simulation.
-    action_scale: 0.5 #signifie que les actions aléatoires utilisées pour générer les resets sont limitées à [-0.5,0.5], avec max_translation_step: 0.0005 ona  au max 0.25mm par step pdt la génération du curiculum
+    action_scale: 0.75 #signifie que les actions aléatoires utilisées pour générer les resets sont limitées à [-0.5,0.5], avec max_translation_step: 0.0005 ona  au max 0.25mm par step pdt la génération du curiculum
+    # Une direction principale est initialisée une fois, puis portée par toute
+    # la branche multi-hop tant que ses candidats restent mastered.
+    proposal_mode: persistent
+    persistent_proposal:
+      # Variation indépendante entre les retries d'un même hop.
+      attempt_direction_noise_std: 0.20
+      # Courbure progressive du heading lors du passage au hop suivant.
+      hop_direction_noise_std: 0.15
+      # Bruit très local autour de l'attempt_direction, à chaque reverse step.
+      step_noise_std: 0.10
+    proposal:
+      # Choix et perturbation du heading uniquement au démarrage de la branche.
+      guided_fraction: 0.7
+      guided_noise_std: 0.20
+      memory_size_per_parent: 16
 
   deduplication: #sert à éviter les doublons.
     position_tolerance: 0.0005
     rotation_tolerance_deg: 0.5
+
+  diagnostics:
+    near_ancestor_position_m: 0.001
+    near_ancestor_rotation_deg: 1.0
+
+diagnostics:
+  true_start_position_milestones_m: [0.020, 0.010, 0.005, 0.002]

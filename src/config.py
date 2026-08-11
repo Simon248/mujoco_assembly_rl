@@ -219,10 +219,41 @@ def load_config(path: str | Path) -> dict[str, Any]:
         start_sampling.setdefault("frontier_fraction", 0.625)
         start_sampling.setdefault("historical_fraction", 0.375)
         start_sampling.setdefault("historical_bins", 4)
+        start_sampling.setdefault("strategy", "legacy")
+        start_sampling.setdefault("adaptive_historical", False)
+        start_sampling.setdefault("historical_fraction_per_state", 0.01)
+        start_sampling.setdefault(
+            "historical_fraction_max", start_sampling["historical_fraction"],
+        )
+        frontier_sampling = start_sampling.get("frontier")
+        historical_sampling = start_sampling.get("historical")
+        true_start_sampling = start_sampling.get("true_start")
+        curriculum_diagnostics = curriculum.get("diagnostics", {})
+        if not isinstance(curriculum_diagnostics, dict):
+            raise ValueError("curriculum.diagnostics doit être un mapping")
+        proposal = walk.setdefault("proposal", {})
+        if not isinstance(proposal, dict):
+            raise ValueError(
+                "curriculum.reverse_random_walk.proposal doit être un mapping"
+            )
+        proposal_mode = walk.setdefault("proposal_mode", "independent")
+        persistent_proposal = walk.setdefault("persistent_proposal", {})
+        if not isinstance(persistent_proposal, dict):
+            raise ValueError(
+                "curriculum.reverse_random_walk.persistent_proposal doit être "
+                "un mapping"
+            )
+        persistent_proposal.setdefault("attempt_direction_noise_std", 0.20)
+        persistent_proposal.setdefault("hop_direction_noise_std", 0.15)
+        persistent_proposal.setdefault("step_noise_std", 0.10)
+        proposal.setdefault("guided_fraction", 0.0)
+        proposal.setdefault("guided_noise_std", 0.20)
+        proposal.setdefault("memory_size_per_parent", 16)
         revalidation.setdefault("mastered_samples_per_update", 8)
         revalidation.setdefault("too_hard_samples_per_update", 12)
         revalidation.setdefault("every_n_curriculum_updates", 1)
         expansion.setdefault("max_hops_per_seed", 4)
+        expansion.setdefault("max_attempts_per_hop", 8)
         expansion.setdefault("max_candidates_per_update", 24)
         expansion.setdefault("initial_scale", 1.0)
         expansion.setdefault("scale_up_factor", 1.25)
@@ -298,6 +329,64 @@ def load_config(path: str | Path) -> dict[str, Any]:
                 "curriculum.start_sampling.historical_bins doit être un entier "
                 "strictement positif"
             )
+        strategy = start_sampling["strategy"]
+        if strategy not in {"legacy", "adaptive_three_way"}:
+            raise ValueError(
+                "curriculum.start_sampling.strategy doit être 'legacy' ou "
+                "'adaptive_three_way'"
+            )
+        if strategy == "adaptive_three_way":
+            for name, section in (
+                ("frontier", frontier_sampling),
+                ("historical", historical_sampling),
+                ("true_start", true_start_sampling),
+            ):
+                if not isinstance(section, dict):
+                    raise ValueError(
+                        f"curriculum.start_sampling.{name} doit être un mapping"
+                    )
+            frontier_per_state = finite_number(
+                frontier_sampling.get("fraction_per_state"),
+                "curriculum.start_sampling.frontier.fraction_per_state",
+            )
+            frontier_max = finite_number(
+                frontier_sampling.get("fraction_max"),
+                "curriculum.start_sampling.frontier.fraction_max",
+            )
+            adaptive_historical_per_state = finite_number(
+                historical_sampling.get("fraction_per_state"),
+                "curriculum.start_sampling.historical.fraction_per_state",
+            )
+            adaptive_historical_max = finite_number(
+                historical_sampling.get("fraction_max"),
+                "curriculum.start_sampling.historical.fraction_max",
+            )
+            true_start_min = finite_number(
+                true_start_sampling.get("fraction_min"),
+                "curriculum.start_sampling.true_start.fraction_min",
+            )
+            if (frontier_per_state < 0.0 or frontier_max < 0.0
+                    or adaptive_historical_per_state < 0.0
+                    or adaptive_historical_max < 0.0
+                    or not 0.0 <= true_start_min <= 1.0):
+                raise ValueError(
+                    "Les fractions adaptatives doivent être positives et "
+                    "true_start.fraction_min dans [0, 1]"
+                )
+            if frontier_max + adaptive_historical_max > 1.0 - true_start_min + 1e-12:
+                raise ValueError(
+                    "frontier.fraction_max + historical.fraction_max doit être <= "
+                    "1 - true_start.fraction_min"
+                )
+        for name, default in (
+            ("near_ancestor_position_m", 0.001),
+            ("near_ancestor_rotation_deg", 1.0),
+        ):
+            if finite_number(
+                curriculum_diagnostics.get(name, default),
+                f"curriculum.diagnostics.{name}",
+            ) < 0.0:
+                raise ValueError(f"curriculum.diagnostics.{name} doit être positif")
         for key in (
             "mastered_samples_per_update", "too_hard_samples_per_update",
         ):
@@ -308,6 +397,56 @@ def load_config(path: str | Path) -> dict[str, Any]:
                     f"curriculum.revalidation.{key} doit être un entier "
                     "positif ou nul"
                 )
+        if not isinstance(start_sampling["adaptive_historical"], bool):
+            raise ValueError(
+                "curriculum.start_sampling.adaptive_historical doit être un booléen"
+            )
+        historical_per_state = finite_number(
+            start_sampling["historical_fraction_per_state"],
+            "curriculum.start_sampling.historical_fraction_per_state",
+        )
+        historical_max = finite_number(
+            start_sampling["historical_fraction_max"],
+            "curriculum.start_sampling.historical_fraction_max",
+        )
+        if historical_per_state < 0.0 or not 0.0 <= historical_max <= 1.0:
+            raise ValueError(
+                "historical_fraction_per_state doit être positif et "
+                "historical_fraction_max dans [0, 1]"
+            )
+        guided_fraction = finite_number(
+            proposal["guided_fraction"],
+            "curriculum.reverse_random_walk.proposal.guided_fraction",
+        )
+        guided_noise = finite_number(
+            proposal["guided_noise_std"],
+            "curriculum.reverse_random_walk.proposal.guided_noise_std",
+        )
+        if not 0.0 <= guided_fraction <= 1.0 or guided_noise < 0.0:
+            raise ValueError(
+                "guided_fraction doit être dans [0, 1] et guided_noise_std positif"
+            )
+        memory_size = proposal["memory_size_per_parent"]
+        if (isinstance(memory_size, bool) or not isinstance(memory_size, int)
+                or memory_size <= 0):
+            raise ValueError("memory_size_per_parent doit être strictement positif")
+        if proposal_mode not in {"independent", "persistent"}:
+            raise ValueError(
+                "curriculum.reverse_random_walk.proposal_mode doit être "
+                "'independent' ou 'persistent'"
+            )
+        for key in (
+            "attempt_direction_noise_std", "hop_direction_noise_std",
+            "step_noise_std",
+        ):
+            if finite_number(
+                persistent_proposal[key],
+                f"curriculum.reverse_random_walk.persistent_proposal.{key}",
+            ) < 0.0:
+                raise ValueError(
+                    "curriculum.reverse_random_walk.persistent_proposal."
+                    f"{key} doit être positif ou nul"
+                )
         revalidation_frequency = revalidation["every_n_curriculum_updates"]
         if (isinstance(revalidation_frequency, bool)
                 or not isinstance(revalidation_frequency, int)
@@ -316,7 +455,10 @@ def load_config(path: str | Path) -> dict[str, Any]:
                 "curriculum.revalidation.every_n_curriculum_updates doit être "
                 "un entier strictement positif"
             )
-        for key in ("max_hops_per_seed", "max_candidates_per_update"):
+        for key in (
+            "max_hops_per_seed", "max_attempts_per_hop",
+            "max_candidates_per_update",
+        ):
             value = expansion[key]
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(
