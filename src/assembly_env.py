@@ -17,7 +17,8 @@ from src.admittance import AdmittanceController
 from src.config import load_config
 from src.curriculum import (
     CurriculumGenerationResult, CurriculumResetSelection, CurriculumState,
-    PhysicsStepResult, configured_start_sampling_probabilities,
+    PhysicsStepResult, RESET_SOURCES, SAMPLING_SOURCE_NAMES,
+    StartSamplingProbabilities, configured_start_sampling_probabilities,
     historical_quantile_bins, select_training_start,
 )
 from src.mujoco_plugins import load_sdf_plugin
@@ -124,7 +125,12 @@ class TenonMortaiseEnv(gym.Env):
         self.allow_curriculum_resets = bool(allow_curriculum_resets)
         self.curriculum_frontier_pool: list[CurriculumState] = []
         self.curriculum_historical_pool: list[CurriculumState] = []
+        self.curriculum_mastered_boundary_pool: list[CurriculumState] = []
+        self.curriculum_too_hard_near_pool: list[CurriculumState] = []
         self.curriculum_historical_bins: list[list[CurriculumState]] = []
+        self.curriculum_sampling_probabilities: (
+            StartSamplingProbabilities | None
+        ) = None
         self.curriculum_rng = np.random.default_rng(0)
         self.reset_source = "true_start"
         self.curriculum_start_position_error = np.nan
@@ -243,9 +249,7 @@ class TenonMortaiseEnv(gym.Env):
         self, reset_source: str, state: CurriculumState | None = None,
     ) -> None:
         self.reset_source = reset_source
-        self.is_curriculum_reset = reset_source in {
-            "curriculum_frontier", "curriculum_historical",
-        }
+        self.is_curriculum_reset = reset_source in RESET_SOURCES[1:]
         if state is None:
             self.curriculum_start_state_id = -1
             self.curriculum_start_generation_depth = -1
@@ -309,14 +313,10 @@ class TenonMortaiseEnv(gym.Env):
         return true_error
 
     def _select_reset(self, requested: str) -> CurriculumResetSelection:
-        if requested not in {
-            "auto", "curriculum", "true_start",
-            "curriculum_frontier", "curriculum_historical",
-        }:
+        if requested not in {"auto", "curriculum", *RESET_SOURCES}:
             raise ValueError(
                 "options.reset_source doit être 'auto', 'curriculum', "
-                "'true_start', 'curriculum_frontier' ou "
-                "'curriculum_historical'"
+                "'true_start' ou une source curriculum connue"
             )
         if (not self.allow_curriculum_resets
                 or not bool(self.cfg["curriculum"]["enabled"])):
@@ -325,14 +325,25 @@ class TenonMortaiseEnv(gym.Env):
             return CurriculumResetSelection("true_start", None)
         curriculum = self.cfg["curriculum"]
         sampling = curriculum["start_sampling"]
-        probabilities = configured_start_sampling_probabilities(
+        configured_probabilities = configured_start_sampling_probabilities(
             frontier_pool_size=len(self.curriculum_frontier_pool),
             historical_pool_size=len(self.curriculum_historical_pool),
+            mastered_boundary_pool_size=len(
+                self.curriculum_mastered_boundary_pool
+            ),
+            too_hard_near_pool_size=len(self.curriculum_too_hard_near_pool),
             curriculum_probability=float(
                 curriculum["curriculum_reset_probability"]
             ),
             config=sampling,
         )
+        probabilities = configured_probabilities
+        if sampling.get("balance_unit", "episodes") == "transitions":
+            broadcast_probabilities = getattr(
+                self, "curriculum_sampling_probabilities", None,
+            )
+            if broadcast_probabilities is not None:
+                probabilities = broadcast_probabilities
         return select_training_start(
             self.curriculum_rng,
             curriculum_probability=float(
@@ -343,11 +354,16 @@ class TenonMortaiseEnv(gym.Env):
             historical_bins=int(sampling["historical_bins"]),
             frontier=self.curriculum_frontier_pool,
             historical=self.curriculum_historical_pool,
+            mastered_boundary=self.curriculum_mastered_boundary_pool,
+            too_hard_near=self.curriculum_too_hard_near_pool,
             requested=requested,
             historical_bin_groups=self.curriculum_historical_bins,
             probabilities=(
                 probabilities
-                if sampling.get("strategy", "legacy") == "adaptive_three_way"
+                if (sampling.get("balance_unit", "episodes") == "transitions"
+                    or sampling.get("strategy", "legacy") in {
+                    "adaptive_three_way", "adaptive_diverse_fallback",
+                })
                 else None
             ),
         )
@@ -374,10 +390,18 @@ class TenonMortaiseEnv(gym.Env):
 
     def set_curriculum_reset_pools(
         self, frontier: list[CurriculumState], historical: list[CurriculumState],
+        mastered_boundary: list[CurriculumState] | None = None,
+        too_hard_near: list[CurriculumState] | None = None,
     ) -> None:
-        """Remplace les deux mémoires de reset; too-hard n'est jamais diffusé."""
+        """Replace reset views; optional arguments preserve the historical API."""
         self.curriculum_frontier_pool = list(frontier)
         self.curriculum_historical_pool = list(historical)
+        self.curriculum_mastered_boundary_pool = list(mastered_boundary or [])
+        self.curriculum_too_hard_near_pool = list(too_hard_near or [])
+        # A distribution computed for previous pools must never survive a
+        # standalone pool replacement. The callback installs the new shared
+        # distribution immediately after broadcasting the new pools.
+        self.curriculum_sampling_probabilities = None
         self.curriculum_historical_bins = historical_quantile_bins(
             self.curriculum_historical_pool,
             int(self.cfg["curriculum"]["start_sampling"]["historical_bins"]),
@@ -386,6 +410,26 @@ class TenonMortaiseEnv(gym.Env):
     def set_curriculum_reset_pool(self, states: list[CurriculumState]) -> None:
         """Compatibilité avec l'ancienne API : le pool fourni devient frontier."""
         self.set_curriculum_reset_pools(states, [])
+
+    def set_curriculum_sampling_probabilities(
+        self, probabilities: StartSamplingProbabilities | None,
+    ) -> None:
+        """Install one callback-computed reset distribution for this window."""
+        if probabilities is None:
+            self.curriculum_sampling_probabilities = None
+            return
+        if not isinstance(probabilities, StartSamplingProbabilities):
+            raise TypeError(
+                "probabilities doit être un StartSamplingProbabilities"
+            )
+        values = [
+            float(getattr(probabilities, name))
+            for name in SAMPLING_SOURCE_NAMES
+        ]
+        if (any(not np.isfinite(value) or value < 0.0 for value in values)
+                or not np.isclose(sum(values), 1.0, rtol=0.0, atol=1e-12)):
+            raise ValueError("Les probabilités de sampling doivent sommer à 1")
+        self.curriculum_sampling_probabilities = probabilities
 
     def get_curriculum_rng_state(self) -> dict:
         return deepcopy(self.curriculum_rng.bit_generator.state)

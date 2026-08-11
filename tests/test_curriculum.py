@@ -16,11 +16,14 @@ from src.curriculum import (
     CurriculumGenerationResult, CurriculumState, GenerationReport,
     ReverseCurriculumManager, StateLifecycleStats,
     classify_success_rate,
+    compute_adaptive_diverse_fallback_probabilities,
     compute_adaptive_three_way_probabilities,
     compute_start_sampling_probabilities, effective_historical_fraction,
     historical_quantile_bins, mastered_boundary_states,
+    reset_probabilities_for_transition_targets,
     mastered_edge_states, select_too_hard_by_lineage,
-    select_training_start,
+    select_training_start, too_hard_near_states,
+    StartSamplingProbabilities, update_sampling_episode_length_ema,
 )
 from src.task_logic import assess_status, reward_components
 from src.train import make_env
@@ -320,6 +323,28 @@ class ReverseCurriculumPhysicsTest(unittest.TestCase):
             self.env.admittance.offset, state.admittance_offset, atol=1e-12,
         )
 
+    def test_new_forced_reset_sources_preserve_episode_metadata(self):
+        boundary, too_hard = self.candidates[:2]
+        self.env.set_curriculum_reset_pools(
+            [], [], [boundary], [too_hard],
+        )
+        for source, state in (
+            ("curriculum_mastered_boundary", boundary),
+            ("curriculum_too_hard_near", too_hard),
+        ):
+            with self.subTest(source=source):
+                _, info = self.env.reset(
+                    seed=102, options={"reset_source": source},
+                )
+                self.assertEqual(info["reset_source"], source)
+                self.assertTrue(info["is_curriculum_reset"])
+                self.assertEqual(
+                    info["curriculum_start_state_id"], state.state_id,
+                )
+                self.assertEqual(
+                    info["curriculum_start_pose_distance"], state.pose_distance,
+                )
+
     def test_g_reset_source_mixture_is_consistent_with_50_30_20(self):
         self.env.set_curriculum_reset_pools(
             [self.candidates[0]], [self.candidates[1]],
@@ -334,6 +359,45 @@ class ReverseCurriculumPhysicsTest(unittest.TestCase):
         for source, probability in expected.items():
             self.assertAlmostEqual(
                 draws.count(source) / len(draws), probability, delta=.02,
+            )
+
+    def test_transition_mode_uses_callback_probabilities_in_environment(self):
+        self.env.set_curriculum_reset_pools(
+            [self.candidates[0]], [self.candidates[1]],
+        )
+        effective = StartSamplingProbabilities(
+            true_start=.80, frontier=.05, historical=.15,
+            historical_fraction_effective=.15,
+        )
+        sampling = self.env.cfg["curriculum"]["start_sampling"]
+        original_unit = sampling["balance_unit"]
+        try:
+            self.env.set_curriculum_sampling_probabilities(effective)
+            self.env.curriculum_rng = np.random.default_rng(216)
+            historical_path = [
+                self.env._choose_reset_source("auto") for _ in range(100)
+            ]
+            self.env.set_curriculum_sampling_probabilities(None)
+            self.env.curriculum_rng = np.random.default_rng(216)
+            self.assertEqual(historical_path, [
+                self.env._choose_reset_source("auto") for _ in range(100)
+            ])
+            sampling["balance_unit"] = "transitions"
+            self.env.set_curriculum_sampling_probabilities(effective)
+            self.env.curriculum_rng = np.random.default_rng(216)
+            draws = [
+                self.env._choose_reset_source("auto") for _ in range(30_000)
+            ]
+        finally:
+            sampling["balance_unit"] = original_unit
+            self.env.set_curriculum_sampling_probabilities(None)
+        for source, probability in {
+            "true_start": .80,
+            "curriculum_frontier": .05,
+            "curriculum_historical": .15,
+        }.items():
+            self.assertAlmostEqual(
+                draws.count(source) / len(draws), probability, delta=.015,
             )
 
     def test_i_evaluation_role_persistently_forces_true_start(self):
@@ -501,6 +565,47 @@ class ReverseCurriculumPhysicsTest(unittest.TestCase):
         self.assertEqual(restored.next_state_id, 21_002)
         self.assertEqual(restored.update_count, 3)
         self.assertEqual(restored.next_update_timesteps, 200_000)
+
+    def test_v4_pickle_preserves_sampling_episode_length_ema(self):
+        source = ReverseCurriculumManager(
+            self.env, self.config["curriculum"], seed=211,
+        )
+        source.sampling_episode_length_ema = {
+            "true_start": 283.0,
+            "frontier": 1.0,
+            "historical": 2.0,
+            "mastered_boundary": 3.0,
+            "too_hard_near": 4.4,
+        }
+        payload = source.state_dict()
+        self.assertEqual(payload["version"], 4)
+        restored = ReverseCurriculumManager(
+            self.env, self.config["curriculum"], seed=212,
+        )
+        restored.load_state_dict(payload)
+        self.assertEqual(
+            restored.sampling_episode_length_ema,
+            source.sampling_episode_length_ema,
+        )
+
+    def test_v3_pickle_without_sampling_ema_loads_unit_bootstrap(self):
+        source = ReverseCurriculumManager(
+            self.env, self.config["curriculum"], seed=213,
+        )
+        payload = source.state_dict()
+        payload["version"] = 3
+        payload.pop("sampling_episode_length_ema")
+        restored = ReverseCurriculumManager(
+            self.env, self.config["curriculum"], seed=214,
+        )
+        restored.load_state_dict(payload)
+        self.assertEqual(
+            restored.sampling_episode_length_ema,
+            {name: 1.0 for name in (
+                "true_start", "frontier", "historical",
+                "mastered_boundary", "too_hard_near",
+            )},
+        )
 
     def test_save_reload_preserves_lineage_and_classification(self):
         source = ReverseCurriculumManager(
@@ -987,6 +1092,297 @@ class ReverseCurriculumPureLogicTest(unittest.TestCase):
         self.assertAlmostEqual(counts["curriculum_frontier"] / 20_000, .20, delta=.015)
         self.assertAlmostEqual(counts["curriculum_historical"] / 20_000, .03, delta=.01)
         self.assertAlmostEqual(counts["true_start"] / 20_000, .77, delta=.015)
+
+    @staticmethod
+    def _sampling_probabilities(**overrides):
+        values = {
+            "true_start": .20,
+            "frontier": .30,
+            "historical": .10,
+            "historical_fraction_effective": .10,
+            "mastered_boundary": .25,
+            "too_hard_near": .15,
+        }
+        values.update(overrides)
+        return StartSamplingProbabilities(**values)
+
+    def test_transition_targets_are_identity_with_equal_lengths(self):
+        targets = self._sampling_probabilities()
+        effective = reset_probabilities_for_transition_targets(
+            targets, {name: 7.0 for name in (
+                "true_start", "frontier", "historical",
+                "mastered_boundary", "too_hard_near",
+            )},
+        )
+        self.assertEqual(effective, targets)
+
+    def test_transition_balancing_reconstructs_v39_example(self):
+        targets = self._sampling_probabilities(
+            true_start=.71, frontier=.10, historical=.04,
+            historical_fraction_effective=.04,
+            mastered_boundary=.10, too_hard_near=.05,
+        )
+        lengths = {
+            "true_start": 283.0,
+            "frontier": 1.0,
+            "historical": 1.0,
+            "mastered_boundary": 1.0,
+            "too_hard_near": 4.4,
+        }
+        effective = reset_probabilities_for_transition_targets(
+            targets, lengths,
+        )
+        expected = {
+            "true_start": .0099,
+            "frontier": .3939,
+            "historical": .1576,
+            "mastered_boundary": .3939,
+            "too_hard_near": .0448,
+        }
+        for name, probability in expected.items():
+            self.assertAlmostEqual(
+                getattr(effective, name), probability, delta=5e-5,
+            )
+        denominator = sum(
+            getattr(effective, name) * lengths[name]
+            for name in expected
+        )
+        for name in expected:
+            reconstructed = (
+                getattr(effective, name) * lengths[name] / denominator
+            )
+            self.assertAlmostEqual(
+                reconstructed, getattr(targets, name), places=12,
+            )
+        self.assertAlmostEqual(
+            sum(getattr(effective, name) for name in expected),
+            1.0, places=12,
+        )
+
+    def test_transition_balancing_handles_long_short_and_inactive_sources(self):
+        targets = self._sampling_probabilities(
+            true_start=.50, frontier=.50, historical=0.0,
+            historical_fraction_effective=0.0,
+            mastered_boundary=0.0, too_hard_near=0.0,
+        )
+        lengths = {
+            "true_start": 100.0,
+            "frontier": 1.0,
+            "historical": 3.0,
+            "mastered_boundary": 4.0,
+            "too_hard_near": 5.0,
+        }
+        effective = reset_probabilities_for_transition_targets(
+            targets, lengths,
+        )
+        self.assertAlmostEqual(effective.true_start, 1 / 101, places=12)
+        self.assertAlmostEqual(effective.frontier, 100 / 101, places=12)
+        self.assertEqual(effective.historical, 0.0)
+        self.assertEqual(effective.mastered_boundary, 0.0)
+        self.assertEqual(effective.too_hard_near, 0.0)
+        transition_mass = (
+            effective.true_start * lengths["true_start"]
+            + effective.frontier * lengths["frontier"]
+        )
+        self.assertAlmostEqual(
+            effective.true_start * lengths["true_start"] / transition_mass,
+            .5, places=12,
+        )
+
+    def test_transition_balanced_probabilities_drive_empirical_reset_sampling(self):
+        targets = self._sampling_probabilities(
+            true_start=.71, frontier=.10, historical=.04,
+            historical_fraction_effective=.04,
+            mastered_boundary=.10, too_hard_near=.05,
+        )
+        effective = reset_probabilities_for_transition_targets(targets, {
+            "true_start": 283.0, "frontier": 1.0, "historical": 1.0,
+            "mastered_boundary": 1.0, "too_hard_near": 4.4,
+        })
+        pools = {
+            "frontier": self._states([.01]),
+            "historical": self._states([.005]),
+            "mastered_boundary": self._states([.02]),
+            "too_hard_near": self._states([.03]),
+        }
+        reset_to_label = {
+            "true_start": "true_start",
+            "curriculum_frontier": "frontier",
+            "curriculum_historical": "historical",
+            "curriculum_mastered_boundary": "mastered_boundary",
+            "curriculum_too_hard_near": "too_hard_near",
+        }
+        counts = {name: 0 for name in reset_to_label.values()}
+        rng = np.random.default_rng(215)
+        for _ in range(50_000):
+            selection = select_training_start(
+                rng, curriculum_probability=.95,
+                frontier_fraction=.625, historical_fraction=.375,
+                historical_bins=4, probabilities=effective, **pools,
+            )
+            counts[reset_to_label[selection.source]] += 1
+        for name, count in counts.items():
+            self.assertAlmostEqual(
+                count / 50_000, getattr(effective, name), delta=.01,
+            )
+
+    def test_transition_balancing_rejects_invalid_episode_lengths(self):
+        targets = self._sampling_probabilities()
+        valid = {name: 1.0 for name in (
+            "true_start", "frontier", "historical",
+            "mastered_boundary", "too_hard_near",
+        )}
+        for invalid in (0.0, -1.0, np.nan, np.inf):
+            with self.subTest(invalid=invalid):
+                lengths = dict(valid)
+                lengths["frontier"] = invalid
+                with self.assertRaisesRegex(ValueError, "frontier"):
+                    reset_probabilities_for_transition_targets(
+                        targets, lengths,
+                    )
+
+    def test_episode_length_ema_updates_exactly_and_keeps_missing_source(self):
+        previous = {
+            name: value for name, value in zip(
+                ("true_start", "frontier", "historical",
+                 "mastered_boundary", "too_hard_near"),
+                (100.0, 4.0, 3.0, 2.0, 1.0),
+            )
+        }
+        completed = {
+            "true_start": [200.0, 300.0],
+            "frontier": [2.0],
+            "historical": [],
+            "mastered_boundary": [8.0, 12.0],
+            "too_hard_near": [],
+        }
+        updated = update_sampling_episode_length_ema(
+            previous, completed, ema_alpha=.25,
+            min_completed_episodes=2,
+        )
+        self.assertEqual(updated["true_start"], .25 * 250.0 + .75 * 100.0)
+        self.assertEqual(updated["mastered_boundary"], .25 * 10.0 + .75 * 2.0)
+        self.assertEqual(updated["frontier"], previous["frontier"])
+        self.assertEqual(updated["historical"], previous["historical"])
+        self.assertEqual(updated["too_hard_near"], previous["too_hard_near"])
+
+    @staticmethod
+    def _diverse_probabilities(frontier, historical, boundary, too_hard):
+        return compute_adaptive_diverse_fallback_probabilities(
+            frontier, historical, boundary, too_hard,
+            frontier_fraction_per_state=.10, frontier_fraction_max=.45,
+            historical_fraction_per_state=.01,
+            historical_fraction_max=.25,
+            mastered_boundary_fraction_per_state=.05,
+            mastered_boundary_fraction_max=.20,
+            too_hard_near_fraction_per_state=.05,
+            too_hard_near_fraction_max=.20,
+            historical_boost_fraction_per_state=.01,
+            historical_boost_fraction_max=.05,
+            true_start_fraction_min=.30,
+        )
+
+    def test_diverse_fallback_keeps_frontier_cap_and_vanishes_when_saturated(self):
+        for frontier_count, expected in ((0, 0.0), (1, .10), (2, .20),
+                                         (4, .40), (5, .45), (20, .45)):
+            probabilities = self._diverse_probabilities(
+                frontier_count, 25, 4, 4,
+            )
+            self.assertAlmostEqual(probabilities.frontier, expected)
+            self.assertAlmostEqual(
+                probabilities.missing_frontier_budget, .45 - expected,
+            )
+        saturated = self._diverse_probabilities(5, 25, 4, 4)
+        legacy = compute_adaptive_three_way_probabilities(
+            5, 25, frontier_fraction_per_state=.10,
+            frontier_fraction_max=.45, historical_fraction_per_state=.01,
+            historical_fraction_max=.25,
+        )
+        self.assertEqual(saturated.mastered_boundary, 0.0)
+        self.assertEqual(saturated.too_hard_near, 0.0)
+        self.assertEqual(saturated.fallback_budget_used, 0.0)
+        self.assertEqual(
+            (saturated.true_start, saturated.frontier, saturated.historical),
+            (legacy.true_start, legacy.frontier, legacy.historical),
+        )
+
+    def test_diverse_fallback_uses_missing_budget_without_inflating_frontier(self):
+        one_frontier = self._diverse_probabilities(1, 10, 4, 4)
+        self.assertAlmostEqual(one_frontier.frontier, .10)
+        self.assertGreater(one_frontier.mastered_boundary, 0.0)
+        self.assertGreater(one_frontier.too_hard_near, 0.0)
+        self.assertGreater(one_frontier.historical, .10)
+        scale = .35 / .45
+        self.assertAlmostEqual(one_frontier.mastered_boundary, .20 * scale)
+        self.assertAlmostEqual(one_frontier.too_hard_near, .20 * scale)
+        self.assertAlmostEqual(one_frontier.historical - .10, .05 * scale)
+        self.assertAlmostEqual(one_frontier.fallback_budget_used, .35)
+
+        no_frontier = self._diverse_probabilities(0, 25, 4, 4)
+        self.assertEqual(no_frontier.frontier, 0.0)
+        self.assertAlmostEqual(no_frontier.mastered_boundary, .20)
+        self.assertAlmostEqual(no_frontier.too_hard_near, .20)
+        self.assertAlmostEqual(no_frontier.historical, .30)
+        self.assertAlmostEqual(no_frontier.true_start, .30)
+
+    def test_diverse_fallback_low_diversity_leaves_unused_budget_at_true_start(self):
+        probabilities = self._diverse_probabilities(0, 0, 1, 1)
+        self.assertAlmostEqual(probabilities.mastered_boundary, .05)
+        self.assertAlmostEqual(probabilities.too_hard_near, .05)
+        self.assertAlmostEqual(probabilities.fallback_budget_used, .10)
+        self.assertAlmostEqual(probabilities.true_start, .90)
+
+    def test_diverse_fallback_always_preserves_minimum_and_unit_sum(self):
+        for frontier in (0, 1, 2, 4, 5, 20):
+            for historical in (0, 1, 10, 25, 100):
+                for boundary in (0, 1, 4, 20):
+                    for too_hard in (0, 1, 4, 20):
+                        probabilities = self._diverse_probabilities(
+                            frontier, historical, boundary, too_hard,
+                        )
+                        values = (
+                            probabilities.true_start,
+                            probabilities.frontier,
+                            probabilities.historical,
+                            probabilities.mastered_boundary,
+                            probabilities.too_hard_near,
+                        )
+                        self.assertGreaterEqual(
+                            probabilities.true_start, .30 - 1e-12,
+                        )
+                        self.assertAlmostEqual(sum(values), 1.0, places=12)
+
+    def test_diverse_fallback_sampling_matches_five_source_targets(self):
+        probabilities = self._diverse_probabilities(1, 10, 2, 1)
+        pools = {
+            "frontier": self._states([.01]),
+            "historical": self._states(np.linspace(.001, .01, 10)),
+            "mastered_boundary": self._states([.02, .021]),
+            "too_hard_near": self._states([.03]),
+        }
+        counts = {source: 0 for source in (
+            "true_start", "curriculum_frontier", "curriculum_historical",
+            "curriculum_mastered_boundary", "curriculum_too_hard_near",
+        )}
+        rng = np.random.default_rng(44)
+        for _ in range(40_000):
+            selection = select_training_start(
+                rng, curriculum_probability=.95,
+                frontier_fraction=.625, historical_fraction=.375,
+                historical_bins=4, probabilities=probabilities, **pools,
+            )
+            counts[selection.source] += 1
+        expected = {
+            "true_start": probabilities.true_start,
+            "curriculum_frontier": probabilities.frontier,
+            "curriculum_historical": probabilities.historical,
+            "curriculum_mastered_boundary": probabilities.mastered_boundary,
+            "curriculum_too_hard_near": probabilities.too_hard_near,
+        }
+        for source, target in expected.items():
+            self.assertAlmostEqual(
+                counts[source] / 40_000, target, delta=.012,
+            )
 
     def test_c_empty_historical_falls_back_to_frontier(self):
         selection = self._select(
@@ -2034,6 +2430,27 @@ class ReverseCurriculumPureLogicTest(unittest.TestCase):
         self.assertEqual(
             [state.state_id for state in completed], [200, 201],
         )
+
+    def test_too_hard_near_pool_contains_only_direct_mastered_children(self):
+        mastered = self._states([4.0], depths=[1], start_id=100)
+        direct, unrelated, grandchild = self._states(
+            [4.1, 4.2, 4.3], depths=[2, 2, 3],
+            parents=[100, 999, 200], start_id=200,
+        )
+        eligible = too_hard_near_states(
+            [unrelated, grandchild, direct], mastered,
+        )
+        self.assertEqual(eligible, [direct])
+
+        manager = self._manager()
+        manager.pools = {
+            "mastered": mastered,
+            "frontier": [],
+            "too_hard": [unrelated, grandchild, direct],
+        }
+        reset_pools = manager.training_reset_pools()
+        self.assertEqual(reset_pools["mastered_boundary"], mastered)
+        self.assertEqual(reset_pools["too_hard_near"], [direct])
 
     def test_too_hard_selection_falls_back_uniformly_without_mastered(self):
         too_hard = self._states([50.0, .001], start_id=300)

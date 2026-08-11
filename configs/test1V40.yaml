@@ -1,0 +1,5 @@
+# V39 conserve intégralement V38 et teste uniquement le fallback diversifié
+# du sampling lorsque la frontier n'atteint pas son plafond de 45 %.
+extends: test1V38.yaml
+training:
+  learning_rate: 0.0001

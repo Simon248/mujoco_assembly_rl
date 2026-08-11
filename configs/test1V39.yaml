@@ -1,0 +1,30 @@
+# V39 conserve intégralement V38 et teste uniquement le fallback diversifié
+# du sampling lorsque la frontier n'atteint pas son plafond de 45 %.
+extends: test1V38.yaml
+
+curriculum:
+  start_sampling:
+    strategy: adaptive_diverse_fallback
+    historical_bins: 4
+
+    frontier:
+      fraction_per_state: 0.10
+      fraction_max: 0.45
+
+    historical:
+      fraction_per_state: 0.01
+      fraction_max: 0.25
+
+    fallback:
+      mastered_boundary:
+        fraction_per_state: 0.05
+        fraction_max: 0.20
+      too_hard_near:
+        fraction_per_state: 0.05
+        fraction_max: 0.20
+      historical_boost:
+        fraction_per_state: 0.01
+        fraction_max: 0.05
+
+    true_start:
+      fraction_min: 0.30

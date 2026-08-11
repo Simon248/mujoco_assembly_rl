@@ -11,8 +11,8 @@ curriculum:
 
   #servent à classer les états candidats selon la politique actuelle :
   # <10 % de succès → trop difficile ;
-  # 10–90 % → intéressant pour apprendre ;
-  # >90 % → maîtrisé, donc utile pour continuer les branches reverse.
+  # 10–80 % → intéressant pour apprendre ;
+  # >80 % → maîtrisé, donc utile pour continuer les branches reverse.
   success_rate_low: 0.10
   success_rate_high: 0.80
 
@@ -21,7 +21,7 @@ curriculum:
   # Plafond du générateur legacy utilisé au bootstrap/diagnostic. Pendant
   # l'entraînement, le plafond effectif est expansion.max_candidates_per_update.
   candidates_per_update: 32
-  evaluation_rollouts_per_candidate: 15 #cinq rollouts donnent les niveaux 0/20/40/60/80/100 %, plus stables que trois.
+  evaluation_rollouts_per_candidate: 15 #quinze rollouts donnent une résolution de 1/15, plus stable pour les seuils 10/80 %.
 
   max_pool_size: 2000 #au maximum 2000 états de départ stockés. C'est juste une protection mémoire et contre un curriculum énorme/redondant.
 

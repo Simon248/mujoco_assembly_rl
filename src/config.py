@@ -220,6 +220,15 @@ def load_config(path: str | Path) -> dict[str, Any]:
         start_sampling.setdefault("historical_fraction", 0.375)
         start_sampling.setdefault("historical_bins", 4)
         start_sampling.setdefault("strategy", "legacy")
+        start_sampling.setdefault("balance_unit", "episodes")
+        transition_balance = start_sampling.setdefault("transition_balance", {})
+        if not isinstance(transition_balance, dict):
+            raise ValueError(
+                "curriculum.start_sampling.transition_balance doit être un mapping"
+            )
+        transition_balance.setdefault("ema_alpha", 0.25)
+        transition_balance.setdefault("min_episode_length", 1.0)
+        transition_balance.setdefault("min_completed_episodes", 1)
         start_sampling.setdefault("adaptive_historical", False)
         start_sampling.setdefault("historical_fraction_per_state", 0.01)
         start_sampling.setdefault(
@@ -228,6 +237,7 @@ def load_config(path: str | Path) -> dict[str, Any]:
         frontier_sampling = start_sampling.get("frontier")
         historical_sampling = start_sampling.get("historical")
         true_start_sampling = start_sampling.get("true_start")
+        fallback_sampling = start_sampling.get("fallback")
         curriculum_diagnostics = curriculum.get("diagnostics", {})
         if not isinstance(curriculum_diagnostics, dict):
             raise ValueError("curriculum.diagnostics doit être un mapping")
@@ -330,12 +340,46 @@ def load_config(path: str | Path) -> dict[str, Any]:
                 "strictement positif"
             )
         strategy = start_sampling["strategy"]
-        if strategy not in {"legacy", "adaptive_three_way"}:
+        if strategy not in {
+            "legacy", "adaptive_three_way", "adaptive_diverse_fallback",
+        }:
             raise ValueError(
-                "curriculum.start_sampling.strategy doit être 'legacy' ou "
-                "'adaptive_three_way'"
+                "curriculum.start_sampling.strategy doit être 'legacy', "
+                "'adaptive_three_way' ou 'adaptive_diverse_fallback'"
             )
-        if strategy == "adaptive_three_way":
+        balance_unit = start_sampling["balance_unit"]
+        if balance_unit not in {"episodes", "transitions"}:
+            raise ValueError(
+                "curriculum.start_sampling.balance_unit doit être 'episodes' "
+                "ou 'transitions'"
+            )
+        ema_alpha = finite_number(
+            transition_balance["ema_alpha"],
+            "curriculum.start_sampling.transition_balance.ema_alpha",
+        )
+        min_episode_length = finite_number(
+            transition_balance["min_episode_length"],
+            "curriculum.start_sampling.transition_balance.min_episode_length",
+        )
+        min_completed_episodes = transition_balance["min_completed_episodes"]
+        if not 0.0 < ema_alpha <= 1.0:
+            raise ValueError(
+                "curriculum.start_sampling.transition_balance.ema_alpha "
+                "doit être dans ]0, 1]"
+            )
+        if min_episode_length <= 0.0:
+            raise ValueError(
+                "curriculum.start_sampling.transition_balance."
+                "min_episode_length doit être strictement positif"
+            )
+        if (isinstance(min_completed_episodes, bool)
+                or not isinstance(min_completed_episodes, int)
+                or min_completed_episodes < 1):
+            raise ValueError(
+                "curriculum.start_sampling.transition_balance."
+                "min_completed_episodes doit être un entier >= 1"
+            )
+        if strategy in {"adaptive_three_way", "adaptive_diverse_fallback"}:
             for name, section in (
                 ("frontier", frontier_sampling),
                 ("historical", historical_sampling),
@@ -378,6 +422,35 @@ def load_config(path: str | Path) -> dict[str, Any]:
                     "frontier.fraction_max + historical.fraction_max doit être <= "
                     "1 - true_start.fraction_min"
                 )
+            if strategy == "adaptive_diverse_fallback":
+                if not isinstance(fallback_sampling, dict):
+                    raise ValueError(
+                        "curriculum.start_sampling.fallback doit être un mapping"
+                    )
+                for name in (
+                    "mastered_boundary", "too_hard_near", "historical_boost",
+                ):
+                    section = fallback_sampling.get(name)
+                    if not isinstance(section, dict):
+                        raise ValueError(
+                            f"curriculum.start_sampling.fallback.{name} "
+                            "doit être un mapping"
+                        )
+                    per_state = finite_number(
+                        section.get("fraction_per_state"),
+                        "curriculum.start_sampling.fallback."
+                        f"{name}.fraction_per_state",
+                    )
+                    maximum = finite_number(
+                        section.get("fraction_max"),
+                        "curriculum.start_sampling.fallback."
+                        f"{name}.fraction_max",
+                    )
+                    if per_state < 0.0 or not 0.0 <= maximum <= 1.0:
+                        raise ValueError(
+                            "Les fractions fallback doivent avoir "
+                            "fraction_per_state >= 0 et fraction_max dans [0, 1]"
+                        )
         for name, default in (
             ("near_ancestor_position_m", 0.001),
             ("near_ancestor_rotation_deg", 1.0),

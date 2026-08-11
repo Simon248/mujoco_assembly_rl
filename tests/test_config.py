@@ -200,6 +200,12 @@ class ConfigTest(unittest.TestCase):
                 "historical_fraction": 0.375,
                 "historical_bins": 4,
                 "strategy": "legacy",
+                "balance_unit": "episodes",
+                "transition_balance": {
+                    "ema_alpha": .25,
+                    "min_episode_length": 1.0,
+                    "min_completed_episodes": 1,
+                },
                 "adaptive_historical": False,
                 "historical_fraction_per_state": 0.01,
                 "historical_fraction_max": 0.375,
@@ -288,6 +294,12 @@ class ConfigTest(unittest.TestCase):
             "historical_fraction": .375,
             "historical_bins": 4,
             "strategy": "legacy",
+            "balance_unit": "episodes",
+            "transition_balance": {
+                "ema_alpha": .25,
+                "min_episode_length": 1.0,
+                "min_completed_episodes": 1,
+            },
             "adaptive_historical": False,
             "historical_fraction_per_state": .01,
             "historical_fraction_max": .375,
@@ -391,6 +403,95 @@ class ConfigTest(unittest.TestCase):
             "hop_direction_noise_std": 0.15,
             "step_noise_std": 0.10,
         })
+
+    def test_v39_changes_only_sampling_from_v38(self):
+        v38 = load_config("configs/test1V38.yaml")
+        v39 = load_config("configs/test1V39.yaml")
+        sampling = v39["curriculum"].pop("start_sampling")
+        v38["curriculum"].pop("start_sampling")
+        self.assertEqual(v39, v38)
+        self.assertEqual(sampling["strategy"], "adaptive_diverse_fallback")
+        self.assertEqual(sampling["balance_unit"], "episodes")
+        self.assertEqual(sampling["fallback"], {
+            "mastered_boundary": {
+                "fraction_per_state": .05, "fraction_max": .20,
+            },
+            "too_hard_near": {
+                "fraction_per_state": .05, "fraction_max": .20,
+            },
+            "historical_boost": {
+                "fraction_per_state": .01, "fraction_max": .05,
+            },
+        })
+
+    def test_v41_only_switches_v39_sampling_balance_to_transitions(self):
+        v39 = load_config("configs/test1V39.yaml")
+        v41 = load_config("configs/test1V41.yaml")
+        self.assertEqual(
+            v41["curriculum"]["start_sampling"]["balance_unit"],
+            "transitions",
+        )
+        self.assertEqual(
+            v41["curriculum"]["start_sampling"]["transition_balance"],
+            {
+                "ema_alpha": .25,
+                "min_episode_length": 1.0,
+                "min_completed_episodes": 1,
+            },
+        )
+        v39["curriculum"]["start_sampling"]["balance_unit"] = "transitions"
+        self.assertEqual(v41, v39)
+
+    def test_transition_balance_configuration_is_strictly_validated(self):
+        base = load_config("configs/test1V41.yaml")
+        mutations = (
+            (lambda sampling: sampling.__setitem__("balance_unit", "steps"),
+             "balance_unit"),
+            (lambda sampling: sampling["transition_balance"].__setitem__(
+                "ema_alpha", 0.0), "ema_alpha"),
+            (lambda sampling: sampling["transition_balance"].__setitem__(
+                "ema_alpha", 1.1), "ema_alpha"),
+            (lambda sampling: sampling["transition_balance"].__setitem__(
+                "min_episode_length", 0.0), "min_episode_length"),
+            (lambda sampling: sampling["transition_balance"].__setitem__(
+                "min_completed_episodes", 0), "min_completed_episodes"),
+            (lambda sampling: sampling.__setitem__(
+                "transition_balance", None), "transition_balance"),
+        )
+        for mutate, message in mutations:
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as directory:
+                invalid = deepcopy(base)
+                mutate(invalid["curriculum"]["start_sampling"])
+                path = Path(directory) / "invalid.yaml"
+                save_resolved_config(invalid, path)
+                with self.assertRaisesRegex(ValueError, message):
+                    load_config(path)
+
+    def test_diverse_fallback_configuration_is_strictly_validated(self):
+        base = load_config("configs/test1V39.yaml")
+        mutations = (
+            (lambda sampling: sampling.__setitem__("fallback", None), "fallback"),
+            (
+                lambda sampling: sampling["fallback"]["too_hard_near"].__setitem__(
+                    "fraction_per_state", -0.1,
+                ),
+                "fraction",
+            ),
+            (
+                lambda sampling: sampling["fallback"]["historical_boost"].__setitem__(
+                    "fraction_max", 1.1,
+                ),
+                "fraction",
+            ),
+        )
+        for mutate, message in mutations:
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as directory:
+                invalid = deepcopy(base)
+                mutate(invalid["curriculum"]["start_sampling"])
+                path = Path(directory) / "invalid.yaml"
+                save_resolved_config(invalid, path)
+                with self.assertRaisesRegex(ValueError, message):
+                    load_config(path)
 
     def test_enabled_curriculum_is_strictly_validated(self):
         base = load_config("configs/test1V21.yaml")

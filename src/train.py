@@ -28,7 +28,10 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecEnv,
 from src.assembly_env import TenonMortaiseEnv
 from src.config import load_config, save_resolved_config
 from src.curriculum import (
+    RESET_SOURCES as CURRICULUM_RESET_SOURCES, SAMPLING_SOURCE_NAMES,
     ReverseCurriculumManager, configured_start_sampling_probabilities,
+    reset_probabilities_for_transition_targets,
+    update_sampling_episode_length_ema,
 )
 from src.curriculum_diagnostics import (
     ExpansionDiagnostics, curriculum_state_rows, write_curriculum_diagnostics,
@@ -108,17 +111,15 @@ class TrainingTimestepEvalCallback(EvalCallback):
 class ReverseCurriculumCallback(BaseCallback):
     """Met à jour le RCG hors workers et coordonne ses checkpoints avec SAC."""
 
-    RESET_SOURCES = (
-        "true_start", "curriculum_frontier", "curriculum_historical",
-    )
+    RESET_SOURCES = CURRICULUM_RESET_SOURCES
     SOURCE_LABELS = {
         "true_start": "true_start",
         "curriculum_frontier": "frontier",
         "curriculum_historical": "historical",
+        "curriculum_mastered_boundary": "mastered_boundary",
+        "curriculum_too_hard_near": "too_hard_near",
     }
-    CURRICULUM_SOURCES = (
-        "curriculum_frontier", "curriculum_historical",
-    )
+    CURRICULUM_SOURCES = CURRICULUM_RESET_SOURCES[1:]
 
     def __init__(
         self, manager: ReverseCurriculumManager, training_env: VecEnv,
@@ -157,13 +158,31 @@ class ReverseCurriculumCallback(BaseCallback):
         self.frontier_reset_counts: dict[int, int] = {}
         # Pools are broadcast only at update boundaries, so this snapshot is
         # exactly the reset distribution used throughout the current window.
+        if not hasattr(self.manager, "sampling_episode_length_ema"):
+            self.manager.sampling_episode_length_ema = {
+                name: 1.0 for name in SAMPLING_SOURCE_NAMES
+            }
         self.sampling_targets_used = self._sampling_targets()
+        self.sampling_effective_resets_used = (
+            self._effective_reset_probabilities(self.sampling_targets_used)
+        )
+        self.sampling_episode_length_ema_used = dict(
+            self.manager.sampling_episode_length_ema
+        )
 
-    def _broadcast_pool(self) -> None:
+    def _broadcast_pool(self, probabilities=None) -> None:
         pools = self.manager.training_reset_pools()
         self.curriculum_workers.env_method(
             "set_curriculum_reset_pools",
             pools["frontier"], pools["historical"],
+            pools.get("mastered_boundary", []), pools.get("too_hard_near", []),
+        )
+        self.curriculum_workers.env_method(
+            "set_curriculum_sampling_probabilities",
+            (
+                self.sampling_effective_resets_used
+                if probabilities is None else probabilities
+            ),
         )
 
     def _restore_worker_rngs(self) -> None:
@@ -511,12 +530,23 @@ class ReverseCurriculumCallback(BaseCallback):
         self, *, include_pool_metrics: bool = False,
         include_update_metrics: bool = False,
         sampling_targets_used=None, sampling_targets_next=None,
+        sampling_effective_resets_used=None,
+        sampling_episode_length_ema_used=None,
     ) -> None:
         # Les listes d'épisodes peuvent contenir des dizaines de milliers de
         # valeurs : ces agrégats sont volontairement calculés à la cadence des
         # updates RCG, jamais à chaque transition d'entraînement.
         if include_pool_metrics:
             sizes = self.manager.pool_sizes()
+            reset_pools = self.manager.training_reset_pools()
+            self.logger.record(
+                "curriculum/mastered_boundary_pool_size",
+                float(len(reset_pools.get("mastered_boundary", []))),
+            )
+            self.logger.record(
+                "curriculum/too_hard_near_pool_size",
+                float(len(reset_pools.get("too_hard_near", []))),
+            )
             all_depths: list[int] = []
             for name, size in sizes.items():
                 label = "historical" if name == "mastered" else name
@@ -609,15 +639,49 @@ class ReverseCurriculumCallback(BaseCallback):
             self._sampling_targets()
             if sampling_targets_next is None else sampling_targets_next
         )
-        for name in ("true_start", "frontier", "historical"):
+        effective_resets_used = (
+            self.sampling_effective_resets_used
+            if sampling_effective_resets_used is None
+            else sampling_effective_resets_used
+        )
+        episode_length_ema_used = (
+            self.sampling_episode_length_ema_used
+            if sampling_episode_length_ema_used is None
+            else sampling_episode_length_ema_used
+        )
+        for name in SAMPLING_SOURCE_NAMES:
             self.logger.record(
                 f"curriculum/sampling/target_used/{name}",
-                float(getattr(targets_used, name)), exclude="stdout",
+                float(getattr(targets_used, name, 0.0)), exclude="stdout",
             )
             self.logger.record(
                 f"curriculum/sampling/target_next/{name}",
-                float(getattr(targets_next, name)), exclude="stdout",
+                float(getattr(targets_next, name, 0.0)), exclude="stdout",
             )
+            self.logger.record(
+                f"curriculum/sampling/target_transition/{name}",
+                float(getattr(targets_used, name, 0.0)), exclude="stdout",
+            )
+            self.logger.record(
+                f"curriculum/sampling/effective_reset/{name}",
+                float(getattr(effective_resets_used, name, 0.0)),
+                exclude="stdout",
+            )
+            self.logger.record(
+                f"curriculum/sampling/episode_length_ema/{name}",
+                float(episode_length_ema_used.get(name, 1.0)),
+                exclude="stdout",
+            )
+        self.logger.record(
+            "curriculum/sampling/missing_frontier_budget",
+            float(getattr(targets_used, "missing_frontier_budget", 0.0)),
+            exclude="stdout",
+        )
+        self.logger.record(
+            "curriculum/sampling/fallback_budget_used",
+            float(getattr(targets_used, "fallback_budget_used", 0.0)),
+            exclude="stdout",
+        )
 
         total_resets = sum(self.source_episode_counts.values())
         observed_resets = {
@@ -650,13 +714,33 @@ class ReverseCurriculumCallback(BaseCallback):
                 )
 
         total_transitions = sum(self.source_transition_counts.values())
+        observed_transitions = {
+            source: (
+                self.source_transition_counts[source] / total_transitions
+                if total_transitions else 0.0
+            )
+            for source in self.RESET_SOURCES
+        }
         if total_transitions:
             for source in self.RESET_SOURCES:
                 self.logger.record(
                     "curriculum/transition_fraction_"
                     f"{self.SOURCE_LABELS[source]}",
-                    self.source_transition_counts[source] / total_transitions,
+                    observed_transitions[source],
                 )
+        self.logger.record(
+            "curriculum/sampling/transition_target_l1_error",
+            float(sum(
+                abs(
+                    observed_transitions[source]
+                    - float(getattr(
+                        targets_used, self.SOURCE_LABELS[source], 0.0,
+                    ))
+                )
+                for source in self.RESET_SOURCES
+            )),
+            exclude="stdout",
+        )
 
         for source in self.RESET_SOURCES:
             label = self.SOURCE_LABELS[source]
@@ -671,13 +755,20 @@ class ReverseCurriculumCallback(BaseCallback):
             )
             lengths = lengths[np.isfinite(lengths)]
             if lengths.size:
+                # HumanOutputFormat tronque les noms a 36 caracteres. Pour
+                # mastered_boundary, les suffixes mean/median disparaissent
+                # alors tous deux derriere le meme nom tronque et SB3 leve
+                # une ValueError. Garder les noms descriptifs dans
+                # TensorBoard, mais ne pas les envoyer au tableau stdout.
                 self.logger.record(
                     f"curriculum/episode_length_{label}_mean",
                     float(np.mean(lengths)),
+                    exclude="stdout",
                 )
                 self.logger.record(
                     f"curriculum/episode_length_{label}_median",
                     float(np.median(lengths)),
+                    exclude="stdout",
                 )
 
         for source in self.CURRICULUM_SOURCES:
@@ -745,24 +836,81 @@ class ReverseCurriculumCallback(BaseCallback):
 
     def _sampling_targets(self):
         manager_config = getattr(self.manager, "config", {})
-        pools = getattr(self.manager, "pools", {})
+        if hasattr(self.manager, "training_reset_pools"):
+            pools = self.manager.training_reset_pools()
+        else:
+            stored = getattr(self.manager, "pools", {})
+            pools = {
+                "frontier": stored.get("frontier", []),
+                "historical": stored.get("mastered", []),
+                "mastered_boundary": [],
+                "too_hard_near": [],
+            }
         return configured_start_sampling_probabilities(
             frontier_pool_size=len(pools.get("frontier", [])),
-            historical_pool_size=len(pools.get("mastered", [])),
+            historical_pool_size=len(pools.get("historical", [])),
+            mastered_boundary_pool_size=len(
+                pools.get("mastered_boundary", [])
+            ),
+            too_hard_near_pool_size=len(pools.get("too_hard_near", [])),
             curriculum_probability=float(
                 manager_config.get("curriculum_reset_probability", 0.8)
             ),
             config=manager_config.get("start_sampling", {}),
         )
 
+    def _transition_balance_config(self) -> tuple[str, float, float, int]:
+        sampling = getattr(self.manager, "config", {}).get(
+            "start_sampling", {}
+        )
+        settings = sampling.get("transition_balance", {})
+        return (
+            str(sampling.get("balance_unit", "episodes")),
+            float(settings.get("ema_alpha", 0.25)),
+            float(settings.get("min_episode_length", 1.0)),
+            int(settings.get("min_completed_episodes", 1)),
+        )
+
+    def _effective_reset_probabilities(self, targets):
+        balance_unit, _, minimum, _ = self._transition_balance_config()
+        if balance_unit == "episodes":
+            return targets
+        return reset_probabilities_for_transition_targets(
+            targets, self.manager.sampling_episode_length_ema,
+            min_episode_length=minimum,
+        )
+
+    def _update_episode_length_ema(self) -> None:
+        _, alpha, minimum, minimum_count = self._transition_balance_config()
+        completed = {
+            self.SOURCE_LABELS[source]: self.source_episode_lengths[source]
+            for source in self.RESET_SOURCES
+        }
+        self.manager.sampling_episode_length_ema = (
+            update_sampling_episode_length_ema(
+                self.manager.sampling_episode_length_ema, completed,
+                ema_alpha=alpha, min_episode_length=minimum,
+                min_completed_episodes=minimum_count,
+            )
+        )
+
     def _write_curriculum_diagnostics(
         self, targets_used=None, targets_next=None,
+        effective_resets_used=None, episode_length_ema_used=None,
     ) -> None:
         targets_used = (
             self.sampling_targets_used if targets_used is None else targets_used
         )
         targets_next = (
             self._sampling_targets() if targets_next is None else targets_next
+        )
+        effective_resets_used = (
+            self.sampling_effective_resets_used
+            if effective_resets_used is None else effective_resets_used
+        )
+        episode_length_ema_used = (
+            self.sampling_episode_length_ema_used
+            if episode_length_ema_used is None else episode_length_ema_used
         )
         total = sum(self.source_episode_counts.values())
         observed = {
@@ -771,10 +919,37 @@ class ReverseCurriculumCallback(BaseCallback):
             )
             for source in self.RESET_SOURCES
         }
+        transition_total = sum(self.source_transition_counts.values())
+        transition_observed = {
+            self.SOURCE_LABELS[source]: (
+                self.source_transition_counts[source] / transition_total
+                if transition_total else 0.0
+            )
+            for source in self.RESET_SOURCES
+        }
+        success_rates = {
+            self.SOURCE_LABELS[source]: (
+                self.source_success_counts[source]
+                / self.source_episode_counts[source]
+                if self.source_episode_counts[source] else 0.0
+            )
+            for source in self.RESET_SOURCES
+        }
+        start_distances = {
+            self.SOURCE_LABELS[source]: list(
+                self.used_start_distances.get(source, [])
+            )
+            for source in self.RESET_SOURCES
+        }
         timesteps = int(self.model.num_timesteps)
         diagnostics = ExpansionDiagnostics.build(
             self.manager, timesteps, targets_used, observed, targets_next,
             self.frontier_reset_counts,
+            sampling_transition_observed=transition_observed,
+            sampling_success_rates=success_rates,
+            used_start_distances=start_distances,
+            sampling_effective_reset=effective_resets_used,
+            sampling_episode_length_ema=episode_length_ema_used,
         )
         write_curriculum_diagnostics(
             self.output, diagnostics,
@@ -798,16 +973,31 @@ class ReverseCurriculumCallback(BaseCallback):
     def _process_due_work(self) -> None:
         while self.model.num_timesteps >= self.manager.next_update_timesteps:
             targets_used = self.sampling_targets_used
+            effective_resets_used = self.sampling_effective_resets_used
+            episode_length_ema_used = self.sampling_episode_length_ema_used
+            self._update_episode_length_ema()
             self.manager.update(self.model)
-            self._broadcast_pool()
             targets_next = self._sampling_targets()
+            effective_resets_next = self._effective_reset_probabilities(
+                targets_next
+            )
+            self._broadcast_pool(effective_resets_next)
             self._record_metrics(
                 include_pool_metrics=True, include_update_metrics=True,
                 sampling_targets_used=targets_used,
                 sampling_targets_next=targets_next,
+                sampling_effective_resets_used=effective_resets_used,
+                sampling_episode_length_ema_used=episode_length_ema_used,
             )
-            self._write_curriculum_diagnostics(targets_used, targets_next)
+            self._write_curriculum_diagnostics(
+                targets_used, targets_next, effective_resets_used,
+                episode_length_ema_used,
+            )
             self.sampling_targets_used = targets_next
+            self.sampling_effective_resets_used = effective_resets_next
+            self.sampling_episode_length_ema_used = dict(
+                self.manager.sampling_episode_length_ema
+            )
             self._reset_cycle_metrics()
         if self.next_checkpoint_timesteps is None:
             self.next_checkpoint_timesteps = (
@@ -1290,10 +1480,12 @@ def main() -> None:
     else:
         print(f"action_noise_std: {training['td3']['action_noise_std']}")
     callback_items: list[BaseCallback] = []
+    curriculum_callback: ReverseCurriculumCallback | None = None
     if curriculum_manager is not None:
-        callback_items.append(ReverseCurriculumCallback(
+        curriculum_callback = ReverseCurriculumCallback(
             curriculum_manager, env, output, algorithm, checkpoint_freq,
-        ))
+        )
+        callback_items.append(curriculum_callback)
     else:
         callback_items.append(CheckpointCallback(
             scaled_callback_freq(checkpoint_freq, n_envs),
@@ -1303,14 +1495,10 @@ def main() -> None:
     if eval_callback is not None:
         callback_items.append(eval_callback)
     callbacks = CallbackList(callback_items)
-    if curriculum_manager is not None:
+    if curriculum_callback is not None:
         # SB3 appelle env.reset() avant on_training_start : diffuser maintenant
         # évite de forcer les 16 premiers épisodes au vrai départ.
-        reset_pools = curriculum_manager.training_reset_pools()
-        env.env_method(
-            "set_curriculum_reset_pools",
-            reset_pools["frontier"], reset_pools["historical"],
-        )
+        curriculum_callback._broadcast_pool()
     learning_timesteps = total_timesteps
     reset_num_timesteps = True
     if resume_model is not None:

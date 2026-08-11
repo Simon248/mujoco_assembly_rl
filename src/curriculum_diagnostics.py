@@ -8,6 +8,8 @@ from typing import Any
 
 import numpy as np
 
+from src.curriculum import SAMPLING_SOURCE_NAMES
+
 
 def _stat(values: Any, statistic: str) -> float:
     array = np.asarray(values, dtype=float)
@@ -34,10 +36,20 @@ class ExpansionDiagnostics:
         sampling_targets_used: Any, sampling_observed: dict[str, float],
         sampling_targets_next: Any,
         frontier_reset_counts: dict[int, int] | None = None,
+        sampling_transition_observed: dict[str, float] | None = None,
+        sampling_success_rates: dict[str, float] | None = None,
+        used_start_distances: dict[str, list[float]] | None = None,
+        sampling_effective_reset: Any | None = None,
+        sampling_episode_length_ema: dict[str, float] | None = None,
     ) -> "ExpansionDiagnostics":
         report = manager.last_generation_report
         revalidation = manager.last_revalidation_report
         pools = manager.pools
+        reset_pools = (
+            manager.training_reset_pools()
+            if hasattr(manager, "training_reset_pools")
+            else {}
+        )
         depths = {
             name: [int(state.generation_depth) for state in pools[name]]
             for name in ("mastered", "frontier", "too_hard")
@@ -137,6 +149,12 @@ class ExpansionDiagnostics:
             "frontier_pool_size": len(pools["frontier"]),
             "too_hard_pool_size": len(pools["too_hard"]),
             "mastered_boundary_count": len(manager.mastered_boundary_states()),
+            "mastered_boundary_pool_size": len(
+                reset_pools.get("mastered_boundary", [])
+            ),
+            "too_hard_near_pool_size": len(
+                reset_pools.get("too_hard_near", [])
+            ),
             **{
                 f"{name}_position_max": _stat(
                     [state.position_error for state in pools[name]], "max",
@@ -185,16 +203,55 @@ class ExpansionDiagnostics:
                 "max",
             ),
         }
-        for name in ("true_start", "frontier", "historical"):
+        for name in SAMPLING_SOURCE_NAMES:
+            transition_target = float(
+                getattr(sampling_targets_used, name, 0.0)
+            )
+            transition_observed = float(
+                (sampling_transition_observed or {}).get(name, 0.0)
+            )
             values[f"sampling_target_used_{name}"] = float(
-                getattr(sampling_targets_used, name)
+                getattr(sampling_targets_used, name, 0.0)
             )
             values[f"sampling_observed_{name}"] = float(
                 sampling_observed.get(name, 0.0)
             )
             values[f"sampling_target_next_{name}"] = float(
-                getattr(sampling_targets_next, name)
+                getattr(sampling_targets_next, name, 0.0)
             )
+            values[f"sampling_transition_observed_{name}"] = float(
+                transition_observed
+            )
+            values[f"sampling_transition_target_{name}"] = transition_target
+            values[f"sampling_effective_reset_{name}"] = float(getattr(
+                sampling_effective_reset or sampling_targets_used, name, 0.0,
+            ))
+            values[f"sampling_episode_length_ema_{name}"] = float(
+                (sampling_episode_length_ema or {}).get(name, 1.0)
+            )
+            values[f"success_rate_{name}"] = float(
+                (sampling_success_rates or {}).get(name, 0.0)
+            )
+            distances = (used_start_distances or {}).get(name, [])
+            values[f"used_start_distance_{name}_mean"] = _stat(
+                distances, "mean",
+            )
+            values[f"used_start_distance_{name}_max"] = _stat(
+                distances, "max",
+            )
+        values["sampling_transition_target_l1_error"] = float(sum(
+            abs(
+                float((sampling_transition_observed or {}).get(name, 0.0))
+                - float(getattr(sampling_targets_used, name, 0.0))
+            )
+            for name in SAMPLING_SOURCE_NAMES
+        ))
+        values["sampling_missing_frontier_budget"] = float(getattr(
+            sampling_targets_used, "missing_frontier_budget", 0.0,
+        ))
+        values["sampling_fallback_budget_used"] = float(getattr(
+            sampling_targets_used, "fallback_budget_used", 0.0,
+        ))
         for kind in ("uniform", "guided"):
             candidates = int(getattr(report, f"proposal_{kind}_candidates"))
             unique = int(getattr(report, f"proposal_{kind}_unique"))

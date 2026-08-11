@@ -62,6 +62,10 @@ class CurriculumDiagnosticsTest(unittest.TestCase):
             pools={"mastered": [], "frontier": [state], "too_hard": []},
             state_lifecycle={7: lifecycle}, update_count=2,
             mastered_boundary_states=lambda: [],
+            training_reset_pools=lambda: {
+                "frontier": [state], "historical": [],
+                "mastered_boundary": [state], "too_hard_near": [],
+            },
         )
 
     def test_one_expansion_row_and_one_row_per_state_per_update(self):
@@ -69,14 +73,30 @@ class CurriculumDiagnosticsTest(unittest.TestCase):
         targets = SimpleNamespace(
             true_start=.2, frontier=.5, historical=.3,
             historical_fraction_effective=.375,
+            mastered_boundary=.0, too_hard_near=.0,
+            missing_frontier_budget=.1, fallback_budget_used=.05,
         )
         next_targets = SimpleNamespace(
             true_start=.7, frontier=.2, historical=.1,
+            mastered_boundary=.0, too_hard_near=.0,
         )
+        effective_reset = SimpleNamespace(
+            true_start=.1, frontier=.6, historical=.2,
+            mastered_boundary=.05, too_hard_near=.05,
+        )
+        episode_length_ema = {
+            "true_start": 50.0, "frontier": 2.0, "historical": 3.0,
+            "mastered_boundary": 1.0, "too_hard_near": 4.0,
+        }
         diagnostics = ExpansionDiagnostics.build(
             manager, 1000, targets,
             {"true_start": .2, "frontier": .5, "historical": .3},
             next_targets,
+            sampling_transition_observed={"mastered_boundary": .25},
+            sampling_success_rates={"mastered_boundary": .75},
+            used_start_distances={"mastered_boundary": [.01, .03]},
+            sampling_effective_reset=effective_reset,
+            sampling_episode_length_ema=episode_length_ema,
         )
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
@@ -93,6 +113,33 @@ class CurriculumDiagnosticsTest(unittest.TestCase):
         self.assertEqual(expansion[0]["sampling_target_used_frontier"], "0.5")
         self.assertEqual(expansion[0]["sampling_observed_frontier"], "0.5")
         self.assertEqual(expansion[0]["sampling_target_next_frontier"], "0.2")
+        self.assertEqual(
+            expansion[0]["sampling_target_used_mastered_boundary"], "0.0",
+        )
+        self.assertEqual(expansion[0]["sampling_missing_frontier_budget"], "0.1")
+        self.assertEqual(expansion[0]["sampling_fallback_budget_used"], "0.05")
+        self.assertEqual(expansion[0]["mastered_boundary_pool_size"], "1")
+        self.assertEqual(expansion[0]["too_hard_near_pool_size"], "0")
+        self.assertEqual(
+            expansion[0]["sampling_transition_observed_mastered_boundary"],
+            "0.25",
+        )
+        self.assertEqual(
+            expansion[0]["sampling_transition_target_frontier"], "0.5",
+        )
+        self.assertEqual(
+            expansion[0]["sampling_effective_reset_frontier"], "0.6",
+        )
+        self.assertEqual(
+            expansion[0]["sampling_episode_length_ema_true_start"], "50.0",
+        )
+        self.assertEqual(
+            expansion[0]["sampling_transition_target_l1_error"], "1.25",
+        )
+        self.assertEqual(expansion[0]["success_rate_mastered_boundary"], "0.75")
+        self.assertEqual(
+            expansion[0]["used_start_distance_mastered_boundary_mean"], "0.02",
+        )
         self.assertNotIn("sampling_target_frontier", expansion[0])
         self.assertEqual(expansion[0]["persistent_attempts"], "3")
         self.assertEqual(expansion[0]["branch_heading_changes_mean"], "0.2")

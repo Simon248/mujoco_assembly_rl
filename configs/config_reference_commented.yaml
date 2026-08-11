@@ -13,7 +13,7 @@
 # Paramètres optionnels :
 #   - les paramètres TD3 et l'ancien sampler de curriculum sont laissés
 #     commentés pour documenter tous les paramètres rencontrés sans modifier
-#     accidentellement un run SAC / adaptive_three_way.
+#     accidentellement un run SAC / adaptive_diverse_fallback.
 #
 # Unités :
 #   - distances : m
@@ -422,10 +422,8 @@ curriculum:
   #
   # V21 : 0.80 ; V21-curi_max/V29+ : 0.95.
   #
-  # Avec start_sampling.strategy: adaptive_three_way, les probabilités
-  # frontier/historical/true_start sont calculées directement. Cette clé peut
-  # donc être sans effet selon la version du code, mais elle existe encore
-  # dans V34 et est conservée ici pour documentation/compatibilité.
+  # Avec une stratégie adaptative, les probabilités des sources sont calculées
+  # directement. Cette clé reste utilisée uniquement par le sampler legacy.
   curriculum_reset_probability: 0.95
 
   # --------------------------------------------------------------------------
@@ -439,15 +437,12 @@ curriculum:
   # success_rate_low..success_rate_high  => frontier
   # success_rate > success_rate_high     => mastered
   #
-  # Avec 5 rollouts et success_rate_low=0.00, un candidat à 0/5 n'est plus
-  # inférieur au seuil : les nouveaux candidats valides deviennent donc
-  # frontier ou mastered, et plus aucun nouveau too_hard n'est créé si le code
-  # utilise bien la comparaison stricte "< low".
-  success_rate_low: 0.00
+  # V38/V39 : moins de 10 % devient too_hard.
+  success_rate_low: 0.10
 
   # Seuil haut de qualification.
-  # Avec 5 rollouts : 4/5=0.8 reste frontier ; 5/5=1.0 devient mastered.
-  success_rate_high: 0.90
+  # V38/V39 : 10--80 % reste frontier ; au-dessus de 80 % devient mastered.
+  success_rate_high: 0.80
 
   # Nombre de transitions d'entraînement entre deux mises à jour curriculum.
   # V21 : 50_000 ; V29+ : 20_000.
@@ -460,8 +455,8 @@ curriculum:
 
   # Nombre de rollouts forward utilisés pour estimer le taux de succès
   # d'un candidat lors de sa qualification.
-  # 5 => taux observables 0/20/40/60/80/100 %.
-  evaluation_rollouts_per_candidate: 5
+  # 15 => résolution de 1/15, utilisée par V38/V39 avec les seuils 10/80 %.
+  evaluation_rollouts_per_candidate: 15
 
   # Protection sur le nombre total d'états stockés dans les pools.
   max_pool_size: 2000
@@ -471,9 +466,26 @@ curriculum:
   # --------------------------------------------------------------------------
 
   start_sampling:
-    # Stratégie courante : probabilités directes entre frontier,
-    # historical et true_start.
-    strategy: adaptive_three_way
+    # V39 : conserve les probabilités directes frontier/historical et utilise
+    # seulement la capacité frontier manquante pour des fallbacks diversifiés.
+    # Valeurs possibles : legacy, adaptive_three_way,
+    # adaptive_diverse_fallback.
+    strategy: adaptive_diverse_fallback
+
+    # Unité de la distribution calculée par la stratégie ci-dessus.
+    # episodes conserve exactement le sampler historique : les fractions sont
+    # directement des probabilités de reset. transitions les interprète comme
+    # des fractions de transitions cibles, puis les corrige par la longueur
+    # moyenne EMA des épisodes de chaque source.
+    balance_unit: episodes
+
+    # Utilisé uniquement pour convertir les targets lorsque balance_unit vaut
+    # transitions. Les EMA sont agrégées par le callback principal et restent
+    # constantes entre deux mises à jour du curriculum.
+    transition_balance:
+      ema_alpha: 0.25
+      min_episode_length: 1.0
+      min_completed_episodes: 1
 
     # Nombre de bins utilisé par le sampling historique stratifié.
     # Paramètre hérité de l'ancien sampler ; la manière exacte de constituer
@@ -481,33 +493,53 @@ curriculum:
     historical_bins: 4
 
     frontier:
-      # Contribution de chaque state frontier à la probabilité de reset
-      # depuis le pool frontier.
+      # Contribution de chaque state frontier à la distribution cible. Son
+      # unité est choisie par balance_unit.
       #
       # p_frontier = min(fraction_max,
       #                  fraction_per_state * frontier_pool_size)
       fraction_per_state: 0.10
 
-      # Plafond global de resets frontier.
+      # Plafond global frontier dans la distribution cible.
       fraction_max: 0.45
 
     historical:
-      # Contribution de chaque state mastered/historical à la probabilité
-      # de reset historical.
+      # Contribution de chaque state mastered/historical à la distribution
+      # cible historical, dans l'unité choisie plus haut.
       #
       # p_historical = min(fraction_max,
       #                    fraction_per_state * historical_pool_size)
       fraction_per_state: 0.01
 
-      # Plafond global de resets historical.
+      # Plafond global historical dans la distribution cible.
       fraction_max: 0.25
 
+    fallback:
+      # Ces capacités ne sont utilisées que dans la limite du budget frontier
+      # manquant. Si leur somme dépasse ce budget, elles sont réduites
+      # proportionnellement, sans priorité implicite.
+      mastered_boundary:
+        fraction_per_state: 0.05
+        fraction_max: 0.20
+
+      too_hard_near:
+        # Seuls les too_hard dont le parent direct est actuellement mastered.
+        fraction_per_state: 0.05
+        fraction_max: 0.20
+
+      historical_boost:
+        # Utilise le même pool et les mêmes bins que historical.
+        fraction_per_state: 0.01
+        fraction_max: 0.05
+
     true_start:
-      # Part minimale que l'on souhaite conserver pour le vrai départ.
+      # Part minimale du true start dans la distribution cible. En mode
+      # transitions, la probabilité effective de reset peut être inférieure
+      # lorsque ses épisodes sont plus longs.
       # Avec les caps ci-dessus : 0.45 + 0.25 = 0.70 => true_start >= 0.30.
       #
-      # Dans la stratégie adaptative :
-      # p_true_start = 1 - p_frontier - p_historical
+      # La target true_start est le reliquat après toutes les sources et ne
+      # descend jamais sous cette valeur.
       fraction_min: 0.30
 
     # ------------------------------------------------------------------------
@@ -525,16 +557,15 @@ curriculum:
   revalidation:
     # Nombre d'états actuellement mastered/historical retestés par update.
     # Sert à détecter un éventuel forgetting et à les reclasser si nécessaire.
-    # V21 : 8 ; V29+ : 12.
-    mastered_samples_per_update: 12
+    # V21 : 8 ; V29+ : 12 ; V38/V39 : 16.
+    mastered_samples_per_update: 16
 
     # Nombre d'états actuellement too_hard retestés par update.
     # Ce paramètre ne crée pas de too_hard : il décide combien d'anciens
     # too_hard sont réévalués avec la policy actuelle à chaque update.
     #
-    # Avec success_rate_low=0.00, un ancien too_hard revalidé peut migrer
-    # immédiatement vers frontier/mastered selon son nouveau score.
-    too_hard_samples_per_update: 12
+    # V38/V39 revalident 16 états too_hard à chaque update.
+    too_hard_samples_per_update: 16
 
     # 1 = revalidation à chaque update curriculum.
     # 2 = une update sur deux, etc.
@@ -588,12 +619,12 @@ curriculum:
     # Amplitude de base des actions de génération reverse, relativement aux
     # limites définies sous action.max_translation_step / max_rotation_step_deg.
     #
-    # Avec action_scale=0.75 et max_translation_step=0.5 mm :
-    # composante translationnelle uniforme typiquement bornée à ±0.375 mm
+    # Avec action_scale=0.4 et max_translation_step=0.5 mm :
+    # composante translationnelle bornée à ±0.2 mm
     # par axe si l'action reverse normalisée est tirée dans [-1,+1].
     #
     # Ancienne valeur V21 : 0.5.
-    action_scale: 0.75
+    action_scale: 0.4
 
     # independent reproduit le random walk historique : une nouvelle action
     # uniforme est tirée à chaque reverse step.
@@ -713,10 +744,12 @@ diagnostics:
 #   frontier_fraction=0.625
 #   historical_fraction=0.375
 #
-# Nouveau start_sampling :
-#   adaptive_three_way
+# Start sampling adaptatif :
+#   adaptive_three_way (V29--V38)
+#   adaptive_diverse_fallback (V39)
 #   frontier  : fraction_per_state + fraction_max
 #   historical: fraction_per_state + fraction_max
+#   fallback  : mastered_boundary + too_hard_near + historical_boost
 #   true_start: fraction_min
 #
 # ============================================================================

@@ -87,6 +87,8 @@ class _Manager:
         return {
             "frontier": list(self.pools["frontier"]),
             "historical": list(self.pools["mastered"]),
+            "mastered_boundary": list(self.pools["mastered"][-1:]),
+            "too_hard_near": list(self.pools["too_hard"]),
         }
 
     def pool_sizes(self):
@@ -135,20 +137,112 @@ class ReverseCurriculumCallbackTest(unittest.TestCase):
                 info["curriculum_start_pose_distance"] = .006
             elif source == "curriculum_historical":
                 info["curriculum_start_pose_distance"] = .001
+            elif source == "curriculum_mastered_boundary":
+                info["curriculum_start_pose_distance"] = .010
+            elif source == "curriculum_too_hard_near":
+                info["curriculum_start_pose_distance"] = .040
             if done:
                 info["episode"] = {"l": length}
             infos.append(info)
         self.callback.locals = {"dones": dones, "infos": infos}
         self.callback._on_step()
 
-    def test_broadcast_keeps_frontier_and_historical_separate(self):
+    def test_broadcast_keeps_all_reset_sources_separate(self):
         self.callback._broadcast_pool()
-        method, args, kwargs = self.workers.calls[-1]
+        method, args, kwargs = self.workers.calls[-2]
         self.assertEqual(method, "set_curriculum_reset_pools")
         self.assertEqual(args[0], self.manager.pools["frontier"])
         self.assertEqual(args[1], self.manager.pools["mastered"])
-        self.assertNotIn(self.manager.pools["too_hard"][0], args[0] + args[1])
+        self.assertEqual(args[2], self.manager.pools["mastered"][-1:])
+        self.assertEqual(args[3], self.manager.pools["too_hard"])
+        self.assertNotIn(self.manager.pools["too_hard"][0], args[0] + args[1] + args[2])
         self.assertEqual(kwargs, {})
+        method, args, kwargs = self.workers.calls[-1]
+        self.assertEqual(method, "set_curriculum_sampling_probabilities")
+        self.assertEqual(args, (self.callback.sampling_effective_resets_used,))
+        # Absence d'indices : VecEnv diffuse exactement la même valeur à tous.
+        self.assertEqual(kwargs, {})
+
+    def test_episode_balance_keeps_targets_as_exact_reset_probabilities(self):
+        targets = self.callback._sampling_targets()
+        self.assertIs(
+            self.callback._effective_reset_probabilities(targets), targets,
+        )
+
+    def test_diverse_sources_reach_monitoring_and_sampling_diagnostics(self):
+        self.manager.config = {
+            "curriculum_reset_probability": .95,
+            "start_sampling": {
+                "strategy": "adaptive_diverse_fallback",
+                "historical_bins": 4,
+                "frontier": {
+                    "fraction_per_state": .10, "fraction_max": .45,
+                },
+                "historical": {
+                    "fraction_per_state": .01, "fraction_max": .25,
+                },
+                "fallback": {
+                    "mastered_boundary": {
+                        "fraction_per_state": .05, "fraction_max": .20,
+                    },
+                    "too_hard_near": {
+                        "fraction_per_state": .05, "fraction_max": .20,
+                    },
+                    "historical_boost": {
+                        "fraction_per_state": .01, "fraction_max": .05,
+                    },
+                },
+                "true_start": {"fraction_min": .30},
+            },
+        }
+        self.callback.sampling_targets_used = self.callback._sampling_targets()
+        self.callback.sampling_effective_resets_used = (
+            self.callback._effective_reset_probabilities(
+                self.callback.sampling_targets_used
+            )
+        )
+        self._step(
+            ["curriculum_mastered_boundary", "curriculum_too_hard_near"],
+            [True, True], [3, 4], [True, False],
+        )
+        self.callback._record_metrics(include_pool_metrics=True)
+        values = self.logger.values
+        self.assertEqual(values["curriculum/success_rate_mastered_boundary"], 1)
+        self.assertEqual(values["curriculum/success_rate_too_hard_near"], 0)
+        self.assertEqual(
+            values["curriculum/used_start_distance_mastered_boundary_mean"],
+            .010,
+        )
+        self.assertEqual(
+            values["curriculum/used_start_distance_too_hard_near_mean"],
+            .040,
+        )
+        self.assertEqual(
+            values["curriculum/sampling/observed/mastered_boundary"], .5,
+        )
+        self.assertEqual(
+            values["curriculum/sampling/observed/too_hard_near"], .5,
+        )
+        self.assertEqual(values["curriculum/mastered_boundary_pool_size"], 1)
+        self.assertEqual(values["curriculum/too_hard_near_pool_size"], 1)
+        self.assertAlmostEqual(
+            values["curriculum/sampling/target_used/frontier"], .10,
+        )
+        self.assertAlmostEqual(
+            values["curriculum/sampling/missing_frontier_budget"], .35,
+        )
+        self.assertGreater(
+            values["curriculum/sampling/fallback_budget_used"], 0.0,
+        )
+        self.assertEqual(
+            values["curriculum/sampling/target_transition/frontier"], .10,
+        )
+        self.assertIn(
+            "curriculum/sampling/effective_reset/mastered_boundary", values,
+        )
+        self.assertIn(
+            "curriculum/sampling/episode_length_ema/true_start", values,
+        )
 
     def test_episode_and_transition_metrics_are_distinct(self):
         sources = [
@@ -178,6 +272,10 @@ class ReverseCurriculumCallbackTest(unittest.TestCase):
         )
         self.assertAlmostEqual(
             values["curriculum/transition_fraction_true_start"], 4 / 9,
+        )
+        self.assertAlmostEqual(
+            values["curriculum/sampling/transition_target_l1_error"],
+            abs(4 / 9 - .2) + abs(2 / 9 - .5) + abs(3 / 9 - .3),
         )
         self.assertEqual(values["curriculum/episode_length_frontier_mean"], 2)
         self.assertEqual(values["curriculum/episode_length_historical_mean"], 3)
@@ -348,7 +446,7 @@ class ReverseCurriculumCallbackTest(unittest.TestCase):
             ]
             self.manager.next_update_timesteps = 100_000
 
-        def write(targets_used, targets_next):
+        def write(targets_used, targets_next, *args):
             captured["used"] = targets_used
             captured["next"] = targets_next
 
@@ -375,16 +473,84 @@ class ReverseCurriculumCallbackTest(unittest.TestCase):
         )
         self.assertEqual(self.callback.sampling_targets_used.frontier, .20)
 
-    def test_long_used_start_metrics_do_not_collide_in_human_logger(self):
+    def test_transition_balance_updates_ema_once_then_broadcasts_one_distribution(self):
+        self.manager.config = {
+            "curriculum_reset_probability": .95,
+            "start_sampling": {
+                "strategy": "adaptive_three_way",
+                "balance_unit": "transitions",
+                "transition_balance": {
+                    "ema_alpha": .25,
+                    "min_episode_length": 1.0,
+                    "min_completed_episodes": 1,
+                },
+                "historical_bins": 4,
+                "frontier": {
+                    "fraction_per_state": .10, "fraction_max": .45,
+                },
+                "historical": {
+                    "fraction_per_state": .01, "fraction_max": .25,
+                },
+                "true_start": {"fraction_min": .30},
+            },
+        }
+        self.manager.sampling_episode_length_ema = {
+            name: 1.0 for name in self.callback.SOURCE_LABELS.values()
+        }
+        self.callback.sampling_targets_used = self.callback._sampling_targets()
+        self.callback.sampling_effective_resets_used = (
+            self.callback._effective_reset_probabilities(
+                self.callback.sampling_targets_used
+            )
+        )
+        self.callback.sampling_episode_length_ema_used = dict(
+            self.manager.sampling_episode_length_ema
+        )
+        self.callback.source_episode_lengths["true_start"] = [300.0]
+        self.callback.source_episode_lengths["curriculum_frontier"] = [1.0]
+
+        def update(model):
+            self.manager.next_update_timesteps = 100_000
+
+        self.manager.update = update
+        self.callback._write_curriculum_diagnostics = lambda *args: None
+        self.callback.model.num_timesteps = 50_000
+        self.callback._process_due_work()
+
+        self.assertEqual(
+            self.manager.sampling_episode_length_ema["true_start"],
+            .25 * 300.0 + .75 * 1.0,
+        )
+        self.assertEqual(
+            self.manager.sampling_episode_length_ema["frontier"], 1.0,
+        )
+        self.assertEqual(
+            self.callback.sampling_episode_length_ema_used,
+            self.manager.sampling_episode_length_ema,
+        )
+        method, args, kwargs = self.workers.calls[-1]
+        self.assertEqual(method, "set_curriculum_sampling_probabilities")
+        self.assertEqual(args[0], self.callback.sampling_effective_resets_used)
+        self.assertEqual(kwargs, {})
+        self.assertLess(
+            self.callback.sampling_effective_resets_used.true_start,
+            self.callback.sampling_targets_used.true_start,
+        )
+
+    def test_long_curriculum_metrics_do_not_collide_in_human_logger(self):
         stream = io.StringIO()
         logger = Logger(
             folder=None,
             output_formats=[HumanOutputFormat(stream, max_length=36)],
         )
         self.callback.model.logger = logger
-        self.callback.used_start_distances["curriculum_historical"] = [
-            .001, .002, .003,
-        ]
+        for index, source in enumerate(self.callback.RESET_SOURCES, start=1):
+            self.callback.source_episode_counts[source] = 1
+            self.callback.source_transition_counts[source] = index
+            self.callback.source_success_counts[source] = index % 2
+            self.callback.source_episode_lengths[source] = [index, index + 2]
+        for source in self.callback.CURRICULUM_SOURCES:
+            self.callback.used_start_distances[source] = [.001, .002, .003]
         self.callback._record_metrics(
             include_pool_metrics=True, include_update_metrics=True,
         )
@@ -396,6 +562,18 @@ class ReverseCurriculumCallbackTest(unittest.TestCase):
         self.assertTrue(all(key in logger.name_to_value for key in keys))
         self.assertTrue(all(
             logger.name_to_excluded[key] == ("stdout",) for key in keys
+        ))
+        episode_length_keys = [
+            f"curriculum/episode_length_{label}_{statistic}"
+            for label in self.callback.SOURCE_LABELS.values()
+            for statistic in ("mean", "median")
+        ]
+        self.assertTrue(all(
+            key in logger.name_to_value for key in episode_length_keys
+        ))
+        self.assertTrue(all(
+            logger.name_to_excluded[key] == ("stdout",)
+            for key in episode_length_keys
         ))
         expansion_keys = [
             f"curriculum/expansion_seed_distance_{statistic}"
@@ -452,6 +630,7 @@ class ReverseCurriculumCallbackTest(unittest.TestCase):
         logger.dump(step=1)
         self.assertIn("sentinel", stream.getvalue())
         self.assertNotIn("used_start_distance", stream.getvalue())
+        self.assertNotIn("episode_length", stream.getvalue())
         self.assertNotIn("expansion_seed_distance", stream.getvalue())
         self.assertNotIn("expansion_seed_depth", stream.getvalue())
         self.assertNotIn("expansion_candidates", stream.getvalue())

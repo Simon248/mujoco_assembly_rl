@@ -24,7 +24,7 @@ import pickle
 import random
 import time
 import warnings
-from typing import Any, Iterator, TYPE_CHECKING
+from typing import Any, Iterator, Mapping, Sequence, TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -39,6 +39,11 @@ if TYPE_CHECKING:
 POOL_NAMES = ("too_hard", "frontier", "mastered")
 RESET_SOURCES = (
     "true_start", "curriculum_frontier", "curriculum_historical",
+    "curriculum_mastered_boundary", "curriculum_too_hard_near",
+)
+SAMPLING_SOURCE_NAMES = (
+    "true_start", "frontier", "historical", "mastered_boundary",
+    "too_hard_near",
 )
 EXPANSION_DEFAULTS: dict[str, int | float] = {
     "max_hops_per_seed": 4,
@@ -122,6 +127,10 @@ class StartSamplingProbabilities:
     frontier: float
     historical: float
     historical_fraction_effective: float
+    mastered_boundary: float = 0.0
+    too_hard_near: float = 0.0
+    missing_frontier_budget: float = 0.0
+    fallback_budget_used: float = 0.0
 
     @property
     def frontier_fraction_effective(self) -> float:
@@ -130,6 +139,100 @@ class StartSamplingProbabilities:
     @property
     def true_start_fraction_effective(self) -> float:
         return self.true_start
+
+
+def reset_probabilities_for_transition_targets(
+    transition_targets: StartSamplingProbabilities,
+    episode_lengths: Mapping[str, float], *,
+    min_episode_length: float = 1.0,
+) -> StartSamplingProbabilities:
+    """Convert transition shares into reset probabilities.
+
+    The expected transition mass of a source is proportional to ``p_i * L_i``.
+    Therefore ``p_i`` is obtained by normalizing ``q_i / L_i``. Missing,
+    non-finite, or non-positive length estimates are rejected explicitly;
+    finite positive estimates below ``min_episode_length`` are clamped to it.
+    """
+    if (not np.isfinite(min_episode_length) or min_episode_length <= 0.0):
+        raise ValueError("min_episode_length doit être fini et strictement positif")
+    targets: dict[str, float] = {}
+    lengths: dict[str, float] = {}
+    for name in SAMPLING_SOURCE_NAMES:
+        target = float(getattr(transition_targets, name))
+        if not np.isfinite(target) or target < 0.0:
+            raise ValueError(
+                f"La target de transitions {name!r} doit être finie et positive "
+                "ou nulle"
+            )
+        if name not in episode_lengths:
+            raise ValueError(f"Longueur d'épisode manquante pour {name!r}")
+        length = float(episode_lengths[name])
+        if not np.isfinite(length) or length <= 0.0:
+            raise ValueError(
+                f"La longueur d'épisode {name!r} doit être finie et positive"
+            )
+        targets[name] = target
+        lengths[name] = max(float(min_episode_length), length)
+    target_total = sum(targets.values())
+    if not np.isclose(target_total, 1.0, rtol=0.0, atol=1e-12):
+        raise ValueError("Les targets de transitions doivent sommer à 1")
+    if len(set(lengths.values())) == 1:
+        # Preserve the historical values bit-for-bit during the bootstrap.
+        return replace(transition_targets)
+    raw = {name: targets[name] / lengths[name] for name in SAMPLING_SOURCE_NAMES}
+    raw_total = sum(raw.values())
+    if not np.isfinite(raw_total) or raw_total <= 0.0:
+        raise ValueError("Impossible de normaliser les probabilités de reset")
+    probabilities = {name: raw[name] / raw_total for name in SAMPLING_SOURCE_NAMES}
+    result = StartSamplingProbabilities(
+        true_start=float(probabilities["true_start"]),
+        frontier=float(probabilities["frontier"]),
+        historical=float(probabilities["historical"]),
+        historical_fraction_effective=float(probabilities["historical"]),
+        mastered_boundary=float(probabilities["mastered_boundary"]),
+        too_hard_near=float(probabilities["too_hard_near"]),
+        missing_frontier_budget=float(
+            transition_targets.missing_frontier_budget
+        ),
+        fallback_budget_used=float(transition_targets.fallback_budget_used),
+    )
+    values = [getattr(result, name) for name in SAMPLING_SOURCE_NAMES]
+    if (any(not np.isfinite(value) or value < 0.0 for value in values)
+            or not np.isclose(sum(values), 1.0, rtol=0.0, atol=1e-12)):
+        raise AssertionError("Probabilités de reset invalides après conversion")
+    return result
+
+
+def update_sampling_episode_length_ema(
+    previous: Mapping[str, float],
+    completed_episode_lengths: Mapping[str, Sequence[float]], *,
+    ema_alpha: float, min_episode_length: float = 1.0,
+    min_completed_episodes: int = 1,
+) -> dict[str, float]:
+    """Update one episode-length EMA per source from a completed window."""
+    if not np.isfinite(ema_alpha) or not 0.0 < ema_alpha <= 1.0:
+        raise ValueError("ema_alpha doit être dans ]0, 1]")
+    if not np.isfinite(min_episode_length) or min_episode_length <= 0.0:
+        raise ValueError("min_episode_length doit être strictement positif")
+    if (isinstance(min_completed_episodes, bool)
+            or not isinstance(min_completed_episodes, int)
+            or min_completed_episodes < 1):
+        raise ValueError("min_completed_episodes doit être un entier >= 1")
+    updated: dict[str, float] = {}
+    for name in SAMPLING_SOURCE_NAMES:
+        old = float(previous.get(name, 1.0))
+        if not np.isfinite(old) or old <= 0.0:
+            old = 1.0
+        samples = np.asarray(
+            completed_episode_lengths.get(name, ()), dtype=float,
+        )
+        samples = samples[np.isfinite(samples) & (samples > 0.0)]
+        if samples.size < min_completed_episodes:
+            updated[name] = old
+            continue
+        window_mean = max(float(min_episode_length), float(np.mean(samples)))
+        updated[name] = float(ema_alpha * window_mean + (1.0 - ema_alpha) * old)
+    return updated
 
 
 def compute_adaptive_three_way_probabilities(
@@ -152,15 +255,125 @@ def compute_adaptive_three_way_probabilities(
     )
 
 
+def compute_adaptive_diverse_fallback_probabilities(
+    frontier_pool_size: int, historical_pool_size: int,
+    mastered_boundary_pool_size: int, too_hard_near_pool_size: int, *,
+    frontier_fraction_per_state: float, frontier_fraction_max: float,
+    historical_fraction_per_state: float, historical_fraction_max: float,
+    mastered_boundary_fraction_per_state: float,
+    mastered_boundary_fraction_max: float,
+    too_hard_near_fraction_per_state: float,
+    too_hard_near_fraction_max: float,
+    historical_boost_fraction_per_state: float,
+    historical_boost_fraction_max: float,
+    true_start_fraction_min: float,
+) -> StartSamplingProbabilities:
+    """Fill only missing frontier capacity with diversity-capped reset pools."""
+    frontier = min(
+        frontier_fraction_max,
+        frontier_fraction_per_state * max(0, int(frontier_pool_size)),
+    )
+    historical_base = min(
+        historical_fraction_max,
+        historical_fraction_per_state * max(0, int(historical_pool_size)),
+    )
+    missing_frontier_budget = max(0.0, frontier_fraction_max - frontier)
+    fallback_budget = min(
+        missing_frontier_budget,
+        max(
+            0.0,
+            1.0 - true_start_fraction_min - frontier - historical_base,
+        ),
+    )
+    boundary_raw = min(
+        mastered_boundary_fraction_max,
+        mastered_boundary_fraction_per_state
+        * max(0, int(mastered_boundary_pool_size)),
+    )
+    too_hard_raw = min(
+        too_hard_near_fraction_max,
+        too_hard_near_fraction_per_state
+        * max(0, int(too_hard_near_pool_size)),
+    )
+    historical_boost_raw = min(
+        historical_boost_fraction_max,
+        historical_boost_fraction_per_state
+        * max(0, int(historical_pool_size)),
+    )
+    raw_fallback_total = boundary_raw + too_hard_raw + historical_boost_raw
+    scale = (
+        min(1.0, fallback_budget / raw_fallback_total)
+        if raw_fallback_total > 0.0 else 0.0
+    )
+    mastered_boundary = boundary_raw * scale
+    too_hard_near = too_hard_raw * scale
+    historical_boost = historical_boost_raw * scale
+    historical = historical_base + historical_boost
+    fallback_budget_used = mastered_boundary + too_hard_near + historical_boost
+    true_start = 1.0 - frontier - historical - mastered_boundary - too_hard_near
+    probabilities = StartSamplingProbabilities(
+        true_start=float(true_start),
+        frontier=float(frontier),
+        historical=float(historical),
+        historical_fraction_effective=float(historical),
+        mastered_boundary=float(mastered_boundary),
+        too_hard_near=float(too_hard_near),
+        missing_frontier_budget=float(missing_frontier_budget),
+        fallback_budget_used=float(fallback_budget_used),
+    )
+    if probabilities.true_start < true_start_fraction_min - 1e-12:
+        raise AssertionError("Le fallback viole le minimum true_start")
+    if not np.isclose(
+        sum(getattr(probabilities, name) for name in SAMPLING_SOURCE_NAMES),
+        1.0, rtol=0.0, atol=1e-12,
+    ):
+        raise AssertionError("Les probabilités de reset ne somment pas à 1")
+    return probabilities
+
+
 def configured_start_sampling_probabilities(
     *, frontier_pool_size: int, historical_pool_size: int,
     curriculum_probability: float, config: dict[str, Any],
+    mastered_boundary_pool_size: int = 0,
+    too_hard_near_pool_size: int = 0,
 ) -> StartSamplingProbabilities:
     """Dispatch one explicit strategy; legacy remains available for A/B runs."""
     strategy = config.get("strategy", "legacy")
-    if strategy == "adaptive_three_way":
+    if strategy in {"adaptive_three_way", "adaptive_diverse_fallback"}:
         frontier = config["frontier"]
         historical = config["historical"]
+        if strategy == "adaptive_diverse_fallback":
+            fallback = config["fallback"]
+            boundary = fallback["mastered_boundary"]
+            too_hard = fallback["too_hard_near"]
+            historical_boost = fallback["historical_boost"]
+            return compute_adaptive_diverse_fallback_probabilities(
+                frontier_pool_size, historical_pool_size,
+                mastered_boundary_pool_size, too_hard_near_pool_size,
+                frontier_fraction_per_state=float(frontier["fraction_per_state"]),
+                frontier_fraction_max=float(frontier["fraction_max"]),
+                historical_fraction_per_state=float(
+                    historical["fraction_per_state"]
+                ),
+                historical_fraction_max=float(historical["fraction_max"]),
+                mastered_boundary_fraction_per_state=float(
+                    boundary["fraction_per_state"]
+                ),
+                mastered_boundary_fraction_max=float(boundary["fraction_max"]),
+                too_hard_near_fraction_per_state=float(
+                    too_hard["fraction_per_state"]
+                ),
+                too_hard_near_fraction_max=float(too_hard["fraction_max"]),
+                historical_boost_fraction_per_state=float(
+                    historical_boost["fraction_per_state"]
+                ),
+                historical_boost_fraction_max=float(
+                    historical_boost["fraction_max"]
+                ),
+                true_start_fraction_min=float(
+                    config["true_start"]["fraction_min"]
+                ),
+            )
         return compute_adaptive_three_way_probabilities(
             frontier_pool_size, historical_pool_size,
             frontier_fraction_per_state=float(frontier["fraction_per_state"]),
@@ -254,20 +467,24 @@ def select_training_start(
     historical_bins: int,
     frontier: list[CurriculumState],
     historical: list[CurriculumState],
+    mastered_boundary: list[CurriculumState] | None = None,
+    too_hard_near: list[CurriculumState] | None = None,
     requested: str = "auto",
     historical_bin_groups: list[list[CurriculumState]] | None = None,
     probabilities: StartSamplingProbabilities | None = None,
 ) -> CurriculumResetSelection:
     """Tire la source d'un épisode puis un état dans le pool choisi.
 
-    ``probabilities`` active le tirage direct à trois sources. Sans lui, le
+    ``probabilities`` active le tirage direct adaptatif. Sans lui, le
     chemin RNG et les fallbacks du sampler legacy restent inchangés.
     """
+    mastered_boundary = [] if mastered_boundary is None else mastered_boundary
+    too_hard_near = [] if too_hard_near is None else too_hard_near
     allowed = {"auto", "curriculum", *RESET_SOURCES}
     if requested not in allowed:
         raise ValueError(
             "options.reset_source doit être 'auto', 'curriculum', "
-            "'true_start', 'curriculum_frontier' ou 'curriculum_historical'"
+            "'true_start' ou une source curriculum connue"
         )
     fraction_total = frontier_fraction + historical_fraction
     if (not np.isfinite(curriculum_probability)
@@ -280,12 +497,19 @@ def select_training_start(
         raise ValueError("les fractions frontier/historical doivent sommer à 1")
     if requested == "true_start":
         return CurriculumResetSelection("true_start", None)
-    if requested in {"curriculum_frontier", "curriculum_historical"}:
+    if requested in {
+        "curriculum_frontier", "curriculum_historical",
+        "curriculum_mastered_boundary", "curriculum_too_hard_near",
+    }:
         preferred = requested.removeprefix("curriculum_")
         if preferred == "frontier" and not frontier:
             return CurriculumResetSelection("true_start", None)
         if preferred == "historical" and not historical:
             preferred = "frontier" if frontier else "true_start"
+        if preferred == "mastered_boundary" and not mastered_boundary:
+            preferred = "true_start"
+        if preferred == "too_hard_near" and not too_hard_near:
+            preferred = "true_start"
     elif requested == "curriculum":
         if frontier and historical:
             preferred = (
@@ -298,12 +522,22 @@ def select_training_start(
                 "historical" if historical else "true_start"
             )
     elif probabilities is not None:
-        # The adaptive three-way strategy is a direct categorical reset draw.
+        # Adaptive strategies use one direct categorical reset draw.
         draw = float(rng.random())
         if draw < probabilities.frontier:
             preferred = "frontier"
         elif draw < probabilities.frontier + probabilities.historical:
             preferred = "historical"
+        elif draw < (
+            probabilities.frontier + probabilities.historical
+            + probabilities.mastered_boundary
+        ):
+            preferred = "mastered_boundary"
+        elif draw < (
+            probabilities.frontier + probabilities.historical
+            + probabilities.mastered_boundary + probabilities.too_hard_near
+        ):
+            preferred = "too_hard_near"
         else:
             preferred = "true_start"
     else:
@@ -349,6 +583,16 @@ def select_training_start(
         state_index = int(rng.integers(len(bins[bin_index])))
         return CurriculumResetSelection(
             "curriculum_historical", bins[bin_index][state_index], bin_index,
+        )
+    if preferred == "mastered_boundary" and mastered_boundary:
+        index = int(rng.integers(len(mastered_boundary)))
+        return CurriculumResetSelection(
+            "curriculum_mastered_boundary", mastered_boundary[index],
+        )
+    if preferred == "too_hard_near" and too_hard_near:
+        index = int(rng.integers(len(too_hard_near)))
+        return CurriculumResetSelection(
+            "curriculum_too_hard_near", too_hard_near[index],
         )
     return CurriculumResetSelection("true_start", None)
 
@@ -611,11 +855,7 @@ def select_too_hard_by_lineage(
         )
     if sample_count == 0 or not too_hard:
         return []
-    mastered_ids = {int(state.state_id) for state in mastered}
-    preferred = [
-        state for state in too_hard
-        if state.parent_id is not None and int(state.parent_id) in mastered_ids
-    ]
+    preferred = too_hard_near_states(too_hard, mastered)
     preferred_count = min(sample_count, len(preferred))
     selected: list[CurriculumState] = []
     if preferred_count:
@@ -635,6 +875,17 @@ def select_too_hard_by_lineage(
         )
         selected.extend(fallback[int(index)] for index in np.atleast_1d(indices))
     return selected
+
+
+def too_hard_near_states(
+    too_hard: list[CurriculumState], mastered: list[CurriculumState],
+) -> list[CurriculumState]:
+    """Return only too-hard states whose direct parent is mastered now."""
+    mastered_ids = {int(state.state_id) for state in mastered}
+    return [
+        state for state in too_hard
+        if state.parent_id is not None and int(state.parent_id) in mastered_ids
+    ]
 
 
 def select_too_hard_near_mastered(
@@ -669,7 +920,7 @@ class ReverseCurriculumManager:
     diagnostic, jamais dans une décision de progression.
     """
 
-    STATE_VERSION = 3
+    STATE_VERSION = 4
 
     def __init__(
         self, env: TenonMortaiseEnv, config: dict[str, Any], *, seed: int,
@@ -702,6 +953,9 @@ class ReverseCurriculumManager:
         self._active_proposal_direction: np.ndarray | None = None
         self._active_proposal_kind = "uniform"
         self.state_lifecycle: dict[int, StateLifecycleStats] = {}
+        self.sampling_episode_length_ema = {
+            name: 1.0 for name in SAMPLING_SOURCE_NAMES
+        }
 
     def _proposal_settings(self) -> dict[str, Any]:
         proposal = self.walk.get("proposal", {})
@@ -874,14 +1128,18 @@ class ReverseCurriculumManager:
         return [state for name in POOL_NAMES for state in self.pools[name]]
 
     def training_reset_pools(self) -> dict[str, list[CurriculumState]]:
-        """Retourne les deux seules mémoires autorisées comme starts RL."""
+        """Build all reset views from the current pool classification."""
         return {
             "frontier": list(self.pools["frontier"]),
             "historical": list(self.pools["mastered"]),
+            "mastered_boundary": self.mastered_boundary_states(),
+            "too_hard_near": too_hard_near_states(
+                self.pools["too_hard"], self.pools["mastered"],
+            ),
         }
 
     def training_states(self) -> list[CurriculumState]:
-        """Compatibilité API : union des starts, sans aucun ``too_hard``."""
+        """Legacy view of the two original training reset pools."""
         pools = self.training_reset_pools()
         return pools["frontier"] + pools["historical"]
 
@@ -2196,18 +2454,21 @@ class ReverseCurriculumManager:
                 None if training_timesteps is None else int(training_timesteps)
             ),
             "state_lifecycle": deepcopy(self.state_lifecycle),
+            "sampling_episode_length_ema": deepcopy(
+                self.sampling_episode_length_ema
+            ),
         }
 
     def load_state_dict(self, payload: dict[str, Any]) -> None:
         version = int(payload.get("version", 1))
-        if version not in {1, 2, self.STATE_VERSION}:
+        if version not in {1, 2, 3, self.STATE_VERSION}:
             raise ValueError(
                 "Version de curriculum_state.pkl incompatible: "
                 f"{payload.get('version')!r}"
             )
         saved_config = payload.get("curriculum_config")
         saved_hash = payload.get("task_config_sha256")
-        if version in {2, self.STATE_VERSION}:
+        if version in {2, 3, self.STATE_VERSION}:
             compatible_task = saved_hash == self._task_config_sha256()
         elif saved_hash is not None and saved_config is not None:
             compatible_task = saved_hash == self._task_config_sha256(
@@ -2260,6 +2521,15 @@ class ReverseCurriculumManager:
         self.update_count = int(payload["update_count"])
         self.next_update_timesteps = int(payload["next_update_timesteps"])
         self.loaded_training_timesteps = payload.get("training_timesteps")
+        saved_episode_length_ema = payload.get(
+            "sampling_episode_length_ema", {}
+        )
+        self.sampling_episode_length_ema = {}
+        for name in SAMPLING_SOURCE_NAMES:
+            value = float(saved_episode_length_ema.get(name, 1.0))
+            self.sampling_episode_length_ema[name] = (
+                value if np.isfinite(value) and value > 0.0 else 1.0
+            )
         saved_lifecycle = payload.get("state_lifecycle", {})
         self.state_lifecycle = {}
         for state_id, stats in saved_lifecycle.items():
