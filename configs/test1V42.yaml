@@ -5,7 +5,7 @@ extends: test1V39.yaml
 # AJOUT DE L'HISTORIQUE DE POSE PROFONDEUR 1
 
 training:
-  n_envs: 8
+  n_envs: 16
 
 curriculum:
   start_sampling:
