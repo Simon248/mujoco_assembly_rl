@@ -98,6 +98,7 @@ class CurriculumState:
     reference_quaternion: np.ndarray | None
     perception_bias_position: np.ndarray
     perception_bias_quaternion: np.ndarray
+    previous_pose_error: np.ndarray
     environment_rng_state: dict[str, Any] | None
     task_position: np.ndarray
     task_quaternion: np.ndarray
@@ -920,7 +921,7 @@ class ReverseCurriculumManager:
     diagnostic, jamais dans une décision de progression.
     """
 
-    STATE_VERSION = 4
+    STATE_VERSION = 5
 
     def __init__(
         self, env: TenonMortaiseEnv, config: dict[str, Any], *, seed: int,
@@ -1090,7 +1091,7 @@ class ReverseCurriculumManager:
 
     def _task_config_sha256(
         self, curriculum_config: dict[str, Any] | None = None, *,
-        legacy: bool = False,
+        legacy: bool = False, legacy_observation_history: bool = False,
     ) -> str:
         # Le budget/checkpoint/eval et la stratégie de sampling peuvent changer
         # lors d'une reprise. La physique, la reward et la tâche doivent rester.
@@ -1098,6 +1099,10 @@ class ReverseCurriculumManager:
             key: value for key, value in self.env.cfg.items()
             if key not in {"training", "evaluation", "curriculum"}
         }
+        if legacy_observation_history:
+            task_config.get("observation", {}).pop(
+                "include_previous_pose_error", None,
+            )
         if legacy:
             task_config["curriculum"] = (
                 self.env.cfg["curriculum"]
@@ -2461,15 +2466,20 @@ class ReverseCurriculumManager:
 
     def load_state_dict(self, payload: dict[str, Any]) -> None:
         version = int(payload.get("version", 1))
-        if version not in {1, 2, 3, self.STATE_VERSION}:
+        if version not in {1, 2, 3, 4, self.STATE_VERSION}:
             raise ValueError(
                 "Version de curriculum_state.pkl incompatible: "
                 f"{payload.get('version')!r}"
             )
         saved_config = payload.get("curriculum_config")
         saved_hash = payload.get("task_config_sha256")
-        if version in {2, 3, self.STATE_VERSION}:
-            compatible_task = saved_hash == self._task_config_sha256()
+        if version in {2, 3, 4, self.STATE_VERSION}:
+            compatible_hashes = {self._task_config_sha256()}
+            if version < 5:
+                compatible_hashes.add(self._task_config_sha256(
+                    legacy_observation_history=True,
+                ))
+            compatible_task = saved_hash in compatible_hashes
         elif saved_hash is not None and saved_config is not None:
             compatible_task = saved_hash == self._task_config_sha256(
                 saved_config, legacy=True,
@@ -2496,6 +2506,23 @@ class ReverseCurriculumManager:
                 "incompatibles avec la configuration curriculum courante"
             )
         self.goal_seed = payload["goal_seed"]
+        legacy_states = [
+            self.goal_seed,
+            *(state for states in payload["pools"].values() for state in states),
+        ]
+        migrated_history = False
+        for state in legacy_states:
+            if not hasattr(state, "previous_pose_error"):
+                # Les anciens snapshots n'ont que les normes; reconstruire le
+                # rotvec signé depuis la pose physique se fait à la restauration.
+                state.previous_pose_error = None
+                migrated_history = True
+        if migrated_history:
+            warnings.warn(
+                "Loaded legacy curriculum state without previous_pose_error. "
+                "Initializing previous_pose_error from current pose error.",
+                RuntimeWarning,
+            )
         # Le goal est la racine logique réservée : il n'appartient à aucun pool.
         self.goal_seed.state_id = -1
         self.goal_seed.parent_id = None

@@ -86,15 +86,19 @@ class ObservationTest(unittest.TestCase):
         env = self._configured_env(True, True)
         try:
             env.reset(seed=17)
-            errors = iter([
+            errors = [
                 np.array([.001, .002, .003, .01, .02, .03]),
                 np.array([.002, .003, .004, .02, .03, .04]),
                 np.array([.003, .004, .005, .03, .04, .05]),
-            ])
-            env.previous_pose_error = None
-            env._error = lambda observed=False: next(errors)
+            ]
             env._observed_wrench = lambda: np.zeros(6)
-            observations = [env._observation() for _ in range(3)]
+            env.current_observed_pose_error = errors[0].copy()
+            env.previous_pose_error = errors[0].copy()
+            observations = [env._observation()]
+            for error in errors[1:]:
+                env._begin_physical_transition()
+                env.current_observed_pose_error = error.copy()
+                observations.append(env._observation())
             normalized = [
                 np.r_[error[:3] / env.cfg["observation"]["position_scale"],
                       error[3:] / env.cfg["observation"]["rotation_scale"]]
@@ -114,7 +118,21 @@ class ObservationTest(unittest.TestCase):
             env.close()
             env._temporary_config_directory.cleanup()
 
-    def test_new_episode_and_curriculum_restore_clear_observation_history(self):
+    def test_multiple_reads_do_not_advance_history(self):
+        env = self._configured_env(True, True)
+        try:
+            first, _ = env.reset(seed=17)
+            second = env._observation()
+            third = env._observation()
+            np.testing.assert_array_equal(first, second)
+            np.testing.assert_array_equal(second, third)
+            np.testing.assert_array_equal(env.previous_pose_error,
+                                          env.current_observed_pose_error)
+        finally:
+            env.close()
+            env._temporary_config_directory.cleanup()
+
+    def test_new_episode_resets_but_curriculum_restore_preserves_history(self):
         env = self._configured_env(True, True)
         try:
             env.reset(seed=17)
@@ -126,9 +144,37 @@ class ObservationTest(unittest.TestCase):
             restored_observation, _ = env.restore_curriculum_state(
                 state, reset_episode=True, reset_source="curriculum_frontier",
             )
-            np.testing.assert_array_equal(
-                restored_observation[:6], restored_observation[6:12],
-            )
+            scales = env.cfg["observation"]
+            expected_previous = np.r_[
+                state.previous_pose_error[:3] / scales["position_scale"],
+                state.previous_pose_error[3:] / scales["rotation_scale"],
+            ]
+            np.testing.assert_allclose(restored_observation[6:12], expected_previous)
+        finally:
+            env.close()
+            env._temporary_config_directory.cleanup()
+
+    def test_curriculum_snapshot_keeps_previous_error_used_by_observation(self):
+        env = self._configured_env(True, True)
+        try:
+            initial, _ = env.reset(seed=29)
+            stepped, *_ = env.step(np.array([0, 0, -1, 0, 0, 0], dtype=float))
+            state = env.capture_curriculum_state()
+            scales = env.cfg["observation"]
+            saved_normalized = np.r_[
+                state.previous_pose_error[:3] / scales["position_scale"],
+                state.previous_pose_error[3:] / scales["rotation_scale"],
+            ]
+            np.testing.assert_allclose(saved_normalized, stepped[6:12])
+            restored_a, _ = env.restore_curriculum_state(state)
+            env.step(np.array([1, 0, 0, 0, 0, 0], dtype=float))
+            restored_b, _ = env.restore_curriculum_state(state)
+            np.testing.assert_array_equal(restored_a, restored_b)
+            np.testing.assert_allclose(restored_a[6:12], saved_normalized)
+            self.assertFalse(np.shares_memory(
+                state.previous_pose_error, env.previous_pose_error,
+            ))
+            self.assertEqual(initial.shape, (24,))
         finally:
             env.close()
             env._temporary_config_directory.cleanup()

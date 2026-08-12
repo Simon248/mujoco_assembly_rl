@@ -120,6 +120,8 @@ class TenonMortaiseEnv(gym.Env):
         # État réservé au mode historique; le mode réactif n'en dépend pas.
         self.reference_pose: tuple[np.ndarray, np.ndarray] | None = None
         self.previous_pose_error: np.ndarray | None = None
+        self.current_observed_pose_error: np.ndarray | None = None
+        self.current_observed_wrench: np.ndarray | None = None
         self.episode_max_force = 0.0; self.episode_max_torque = 0.0
         self.best_position_error = np.inf; self.best_rotation_error = np.inf
         self.best_pose_metric = np.inf
@@ -222,7 +224,13 @@ class TenonMortaiseEnv(gym.Env):
             0, np.asarray(self.cfg["perception"]["wrench_noise_std"], float)
         )
     def _observation(self):
-        error, wrench, n = self._error(observed=True), self._observed_wrench(), self.cfg["observation"]
+        if self.current_observed_pose_error is None:
+            self.current_observed_pose_error = self._error(observed=True)
+        if self.current_observed_wrench is None:
+            self.current_observed_wrench = self._observed_wrench()
+        error = self.current_observed_pose_error
+        wrench = self.current_observed_wrench
+        n = self.cfg["observation"]
         previous_error = error if self.previous_pose_error is None else self.previous_pose_error
         # Ordre stable quand toutes les options sont actives:
         # 0:6 current pose, 6:12 previous pose, 12:18 wrench,
@@ -244,9 +252,21 @@ class TenonMortaiseEnv(gym.Env):
             # Translation and rotation-vector use the existing reference frame;
             # max_offset gives a natural unit scale without changing its limits.
             values.append(self.admittance.offset / self.admittance.offset_limit)
-        observation = np.clip(np.concatenate(values), -20, 20).astype(np.float32)
-        self.previous_pose_error = error.copy()
-        return observation
+        return np.clip(np.concatenate(values), -20, 20).astype(np.float32)
+
+    def _reset_observation_history(self) -> None:
+        """Initialise un start artificiel avec une variation de pose nulle."""
+        self.current_observed_pose_error = self._error(observed=True)
+        self.current_observed_wrench = self._observed_wrench()
+        self.previous_pose_error = self.current_observed_pose_error.copy()
+
+    def _begin_physical_transition(self) -> None:
+        """Avance l'historique une fois, avant une transition physique."""
+        if self.current_observed_pose_error is None:
+            self.current_observed_pose_error = self._error(observed=True)
+        self.previous_pose_error = self.current_observed_pose_error.copy()
+        self.current_observed_pose_error = None
+        self.current_observed_wrench = None
 
     def _reset_episode_statistics(self) -> None:
         self.steps = 0
@@ -397,6 +417,8 @@ class TenonMortaiseEnv(gym.Env):
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         self.previous_pose_error = None
+        self.current_observed_pose_error = None
+        self.current_observed_wrench = None
         if seed is not None:
             self.curriculum_rng = np.random.default_rng(
                 np.random.SeedSequence([int(seed), 22])
@@ -409,6 +431,7 @@ class TenonMortaiseEnv(gym.Env):
                 restore_rng=False, reset_source=selection.source,
             )
         true_error = self._initialize_true_start()
+        self._reset_observation_history()
         return self._observation(), self._start_info(true_error)
 
     def set_curriculum_reset_pools(
@@ -523,6 +546,11 @@ class TenonMortaiseEnv(gym.Env):
             reference_quaternion=reference_quaternion,
             perception_bias_position=self.perception_bias[0].copy(),
             perception_bias_quaternion=self.perception_bias[1].copy(),
+            previous_pose_error=(
+                self._error(observed=True).copy()
+                if self.previous_pose_error is None
+                else self.previous_pose_error.copy()
+            ),
             environment_rng_state=rng_state,
             task_position=task_pose[0].copy(),
             task_quaternion=task_pose[1].copy(),
@@ -575,9 +603,15 @@ class TenonMortaiseEnv(gym.Env):
             mujoco.mjtState.mjSTATE_INTEGRATION,
         )
         true_error = self._error()
-        # L'historique d'observation n'est pas une propriété physique du
-        # snapshot: la première observation restaurée utilise e_t comme e_(t-1).
-        self.previous_pose_error = None
+        self.current_observed_pose_error = None
+        self.current_observed_wrench = None
+        saved_previous = getattr(state, "previous_pose_error", None)
+        if saved_previous is None:
+            # Migration des snapshots V1-V4 : historique inconnu, variation nulle.
+            self.current_observed_pose_error = self._error(observed=True)
+            self.previous_pose_error = self.current_observed_pose_error.copy()
+        else:
+            self.previous_pose_error = np.asarray(saved_previous, dtype=float).copy()
         if reset_episode:
             self._reset_episode_statistics()
             position_error = float(np.linalg.norm(true_error[:3]))
@@ -647,6 +681,7 @@ class TenonMortaiseEnv(gym.Env):
         self.best_rotation_error = rotation_error
         self._update_best_pose(position_error, rotation_error)
         self._set_episode_start_metadata("goal_seed")
+        self._reset_observation_history()
         goal_seed = self.capture_curriculum_state(success_rate=1.0)
 
         # Vérification de stabilité sur un cycle de contrôle, puis restauration
@@ -688,6 +723,7 @@ class TenonMortaiseEnv(gym.Env):
 
     def _advance_physics(self, action) -> PhysicsStepResult:
         """Chaîne physique commune aux épisodes RL et aux marches RCG."""
+        self._begin_physical_transition()
         action = np.clip(np.asarray(action,float), -1, 1); a=self.cfg["action"]
         nominal = np.r_[action[:3]*a["max_translation_step"], action[3:]*np.deg2rad(a["max_rotation_step_deg"])]
         delta_pose = (nominal[:3], rotvec_to_quat(nominal[3:]))

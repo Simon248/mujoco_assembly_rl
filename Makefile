@@ -28,9 +28,9 @@ tensorboard:
 	docker compose up tensorboard
 
 
-# CONFIG=configs/test1V21.yaml \
-# RUN_NAME=test1V22-resume-713k \
-# RESUME_MODEL=data/output/test1V22/model_interrupted.zip \
+# CONFIG=configs/test1V42.yaml \
+# RUN_NAME=test1V41-resume-2.7M \
+# RESUME_MODEL=data/output/test1V41/model_interrupted.zip \
 # make train
 
 

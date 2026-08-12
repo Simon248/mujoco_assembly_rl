@@ -578,7 +578,7 @@ class ReverseCurriculumPhysicsTest(unittest.TestCase):
             "too_hard_near": 4.4,
         }
         payload = source.state_dict()
-        self.assertEqual(payload["version"], 4)
+        self.assertEqual(payload["version"], 5)
         restored = ReverseCurriculumManager(
             self.env, self.config["curriculum"], seed=212,
         )
@@ -587,6 +587,31 @@ class ReverseCurriculumPhysicsTest(unittest.TestCase):
             restored.sampling_episode_length_ema,
             source.sampling_episode_length_ema,
         )
+
+    def test_v4_snapshot_without_pose_history_migrates_once(self):
+        source = ReverseCurriculumManager(
+            self.env, self.config["curriculum"], seed=215,
+        )
+        payload = source.state_dict()
+        payload["version"] = 4
+        payload["task_config_sha256"] = source._task_config_sha256(
+            legacy_observation_history=True,
+        )
+        states = [
+            payload["goal_seed"],
+            *(state for pool in payload["pools"].values() for state in pool),
+        ]
+        for state in states:
+            vars(state).pop("previous_pose_error", None)
+        restored = ReverseCurriculumManager(
+            self.env, self.config["curriculum"], seed=216,
+        )
+        with self.assertWarnsRegex(RuntimeWarning, "legacy curriculum state"):
+            restored.load_state_dict(payload)
+        self.assertIsNone(restored.goal_seed.previous_pose_error)
+        self.env.include_previous_pose_error = True
+        observation, _ = self.env.restore_curriculum_state(restored.goal_seed)
+        np.testing.assert_array_equal(observation[:6], observation[6:12])
 
     def test_v3_pickle_without_sampling_ema_loads_unit_bootstrap(self):
         source = ReverseCurriculumManager(
@@ -901,6 +926,7 @@ class ReverseCurriculumPureLogicTest(unittest.TestCase):
             reference_position=None, reference_quaternion=None,
             perception_bias_position=np.zeros(3),
             perception_bias_quaternion=np.array([1.0, 0.0, 0.0, 0.0]),
+            previous_pose_error=np.zeros(6),
             environment_rng_state=None,
             task_position=np.array([x, 0.0, 0.0]),
             task_quaternion=np.array([1.0, 0.0, 0.0, 0.0]),
