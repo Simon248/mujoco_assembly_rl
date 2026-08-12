@@ -127,6 +127,13 @@ def load_config(path: str | Path) -> dict[str, Any]:
     training.setdefault("buffer_size", 50_000)
     training.setdefault("learning_rate", 3e-4)
     training.setdefault("gamma", 0.99)
+    training.setdefault("tau", 0.005)
+    training.setdefault("batch_size", 256)
+    training.setdefault("train_freq", [1, "step"])
+    training.setdefault("gradient_steps", -1)
+    training.setdefault("learning_starts", 5_000)
+    training.setdefault("target_update_interval", 1)
+    training.setdefault("network", [256, 256])
     td3 = training.setdefault("td3", {})
     if not isinstance(td3, dict):
         raise ValueError("training.td3 doit être un mapping")
@@ -147,6 +154,35 @@ def load_config(path: str | Path) -> dict[str, Any]:
     if (isinstance(gamma, bool) or not isinstance(gamma, (int, float))
             or not 0 < gamma <= 1 or not np.isfinite(gamma)):
         raise ValueError("training.gamma doit être dans ]0, 1]")
+    if not 0 < float(training["tau"]) <= 1:
+        raise ValueError("training.tau doit être dans ]0, 1]")
+    for key in ("batch_size", "learning_starts", "target_update_interval"):
+        if isinstance(training[key], bool) or not isinstance(training[key], int) or training[key] <= 0:
+            raise ValueError(f"training.{key} doit être un entier strictement positif")
+    if isinstance(training["gradient_steps"], bool) or not isinstance(training["gradient_steps"], int):
+        raise ValueError("training.gradient_steps doit être un entier")
+    train_freq = training["train_freq"]
+    if (not isinstance(train_freq, (list, tuple)) or len(train_freq) != 2
+            or not isinstance(train_freq[0], int) or train_freq[0] <= 0
+            or train_freq[1] not in {"step", "episode"}):
+        raise ValueError("training.train_freq doit être [entier positif, step|episode]")
+    network = training["network"]
+    if not isinstance(network, list) or not network or any(
+        isinstance(width, bool) or not isinstance(width, int) or width <= 0 for width in network
+    ):
+        raise ValueError("training.network doit être une liste d'entiers positifs")
+    resume = cfg.setdefault("resume", {})
+    if not isinstance(resume, dict):
+        raise ValueError("resume doit être un mapping")
+    resume.setdefault("replay_buffer_policy", "auto")
+    resume.setdefault("apply_current_yaml", True)
+    resume.setdefault("fail_on_structural_change", True)
+    resume.setdefault("log_parameter_diff", True)
+    if resume["replay_buffer_policy"] not in {"keep", "discard", "auto", "error"}:
+        raise ValueError("resume.replay_buffer_policy doit être keep, discard, auto ou error")
+    for key in ("apply_current_yaml", "fail_on_structural_change", "log_parameter_diff"):
+        if not isinstance(resume[key], bool):
+            raise ValueError(f"resume.{key} doit être un booléen")
     for key in ("action_noise_std", "target_policy_noise", "target_noise_clip"):
         value = td3[key]
         if (isinstance(value, bool) or not isinstance(value, (int, float))
@@ -160,8 +196,10 @@ def load_config(path: str | Path) -> dict[str, Any]:
         raise ValueError("training.base_seed doit être un entier positif ou nul")
     observation = cfg.setdefault("observation", {})
     observation.setdefault("include_admittance_position", False)
-    if not isinstance(observation["include_admittance_position"], bool):
-        raise ValueError("observation.include_admittance_position doit être un booléen")
+    observation.setdefault("include_previous_pose_error", False)
+    for key in ("include_admittance_position", "include_previous_pose_error"):
+        if not isinstance(observation[key], bool):
+            raise ValueError(f"observation.{key} doit être un booléen")
     evaluation = cfg.setdefault("evaluation", {})
     evaluation.setdefault("enabled", False)
     evaluation.setdefault("eval_freq", 25_000)

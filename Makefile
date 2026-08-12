@@ -5,7 +5,7 @@ test:
 	docker compose run --rm --no-deps train python -m unittest discover -s tests -v
 train:
 	docker compose run --rm train
-# CONFIG=configs/test1V8.yaml RUN_NAME=test1V10 make train
+# CONFIG=configs/test1V41.yaml RUN_NAME=test1V41 make train
 evaluate:
 	docker compose run --rm --remove-orphans evaluate
 evaluate-scripted:

@@ -97,13 +97,21 @@ class TenonMortaiseEnv(gym.Env):
         self._contact_geom_ids = np.array([self.fixed_geom, self.mobile_geom])
         self._base_contact_friction = self.model.geom_friction[self._contact_geom_ids].copy()
         self.action_space = spaces.Box(-1., 1., (6,), dtype=np.float32)
-        # pose error 6D + wrench 6D + optional admittance position offset 6D.
+        # current pose error 6D + optional previous pose error 6D + wrench 6D
+        # + optional admittance position offset 6D.
         # The offset is controller-owned and can also be reconstructed on the
         # real robot; no simulator or admittance velocity is observed.
         self.include_admittance_position = bool(
             self.cfg["observation"]["include_admittance_position"]
         )
-        observation_size = 12 + (6 if self.include_admittance_position else 0)
+        self.include_previous_pose_error = bool(
+            self.cfg["observation"]["include_previous_pose_error"]
+        )
+        observation_size = 12
+        if self.include_previous_pose_error:
+            observation_size += 6
+        if self.include_admittance_position:
+            observation_size += 6
         self.observation_space = spaces.Box(
             -np.inf, np.inf, (observation_size,), dtype=np.float32
         )
@@ -111,6 +119,7 @@ class TenonMortaiseEnv(gym.Env):
         self.perception_bias = (np.zeros(3), np.array([1., 0., 0., 0.]))
         # État réservé au mode historique; le mode réactif n'en dépend pas.
         self.reference_pose: tuple[np.ndarray, np.ndarray] | None = None
+        self.previous_pose_error: np.ndarray | None = None
         self.episode_max_force = 0.0; self.episode_max_torque = 0.0
         self.best_position_error = np.inf; self.best_rotation_error = np.inf
         self.best_pose_metric = np.inf
@@ -214,17 +223,30 @@ class TenonMortaiseEnv(gym.Env):
         )
     def _observation(self):
         error, wrench, n = self._error(observed=True), self._observed_wrench(), self.cfg["observation"]
+        previous_error = error if self.previous_pose_error is None else self.previous_pose_error
+        # Ordre stable quand toutes les options sont actives:
+        # 0:6 current pose, 6:12 previous pose, 12:18 wrench,
+        # 18:24 admittance offset.
         values = [
             error[:3] / n["position_scale"],
             error[3:] / n["rotation_scale"],
+        ]
+        if self.include_previous_pose_error:
+            values.extend([
+                previous_error[:3] / n["position_scale"],
+                previous_error[3:] / n["rotation_scale"],
+            ])
+        values.extend([
             wrench[:3] / n["force_scale"],
             wrench[3:] / n["torque_scale"],
-        ]
+        ])
         if self.include_admittance_position:
             # Translation and rotation-vector use the existing reference frame;
             # max_offset gives a natural unit scale without changing its limits.
             values.append(self.admittance.offset / self.admittance.offset_limit)
-        return np.clip(np.concatenate(values), -20, 20).astype(np.float32)
+        observation = np.clip(np.concatenate(values), -20, 20).astype(np.float32)
+        self.previous_pose_error = error.copy()
+        return observation
 
     def _reset_episode_statistics(self) -> None:
         self.steps = 0
@@ -374,6 +396,7 @@ class TenonMortaiseEnv(gym.Env):
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
+        self.previous_pose_error = None
         if seed is not None:
             self.curriculum_rng = np.random.default_rng(
                 np.random.SeedSequence([int(seed), 22])
@@ -552,6 +575,9 @@ class TenonMortaiseEnv(gym.Env):
             mujoco.mjtState.mjSTATE_INTEGRATION,
         )
         true_error = self._error()
+        # L'historique d'observation n'est pas une propriété physique du
+        # snapshot: la première observation restaurée utilise e_t comme e_(t-1).
+        self.previous_pose_error = None
         if reset_episode:
             self._reset_episode_statistics()
             position_error = float(np.linalg.norm(true_error[:3]))

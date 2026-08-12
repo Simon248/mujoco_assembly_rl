@@ -1,0 +1,22 @@
+# V41 conserve intégralement V39 et teste uniquement un équilibrage du
+# sampling en fractions de transitions plutôt qu'en fractions de resets.
+extends: test1V39.yaml
+
+curriculum:
+  start_sampling:
+    balance_unit: transitions
+    transition_balance:
+      ema_alpha: 0.25
+      min_episode_length: 1.0
+      min_completed_episodes: 1
+training:
+  learning_rate: 0.0001
+
+resume:
+  replay_buffer_policy: auto
+  apply_current_yaml: true
+  fail_on_structural_change: true
+  log_parameter_diff: true
+
+observation:
+  include_previous_pose_error: true

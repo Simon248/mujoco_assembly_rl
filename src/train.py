@@ -36,6 +36,11 @@ from src.curriculum import (
 from src.curriculum_diagnostics import (
     ExpansionDiagnostics, curriculum_state_rows, write_curriculum_diagnostics,
 )
+from src.resume import (
+    apply_resume_configuration, effective_resume_summary,
+    next_future_curriculum_update, rebuild_empty_replay_buffer,
+    validate_effective_resume_configuration,
+)
 
 
 MONITOR_FIELDS = (
@@ -1171,15 +1176,18 @@ def create_sac_model(
     return SAC(
         "MlpPolicy", env, seed=base_seed, verbose=1,
         tensorboard_log=str(tensorboard_log), device=device,
-        learning_starts=5_000,
+        learning_starts=int(training.get("learning_starts", 5_000)),
         buffer_size=training.get("buffer_size", 50_000),
         learning_rate=training.get("learning_rate", 3e-4),
-        batch_size=256,
-        train_freq=(1, "step"), gradient_steps=-1,
+        batch_size=int(training.get("batch_size", 256)),
+        train_freq=tuple(training.get("train_freq", [1, "step"])),
+        gradient_steps=int(training.get("gradient_steps", -1)),
         gamma=float(training.get("gamma", 0.99)),
+        tau=float(training.get("tau", 0.005)),
+        target_update_interval=int(training.get("target_update_interval", 1)),
         ent_coef=training.get("ent_coef", "auto"),
         target_entropy=training.get("target_entropy", "auto"),
-        policy_kwargs={"net_arch": [256, 256]},
+        policy_kwargs={"net_arch": list(training.get("network", [256, 256]))},
     )
 
 
@@ -1201,17 +1209,19 @@ def create_td3_model(
     return TD3(
         "MlpPolicy", env, seed=base_seed, verbose=1,
         tensorboard_log=str(tensorboard_log), device=device,
-        learning_starts=5_000,
+        learning_starts=int(training.get("learning_starts", 5_000)),
         buffer_size=training.get("buffer_size", 50_000),
         learning_rate=training.get("learning_rate", 3e-4),
-        batch_size=256,
-        train_freq=(1, "step"), gradient_steps=-1,
+        batch_size=int(training.get("batch_size", 256)),
+        train_freq=tuple(training.get("train_freq", [1, "step"])),
+        gradient_steps=int(training.get("gradient_steps", -1)),
         gamma=float(training.get("gamma", 0.99)),
+        tau=float(training.get("tau", 0.005)),
         action_noise=action_noise,
         policy_delay=int(td3.get("policy_delay", 2)),
         target_policy_noise=float(td3.get("target_policy_noise", 0.2)),
         target_noise_clip=float(td3.get("target_noise_clip", 0.5)),
-        policy_kwargs={"net_arch": [256, 256]},
+        policy_kwargs={"net_arch": list(training.get("network", [256, 256]))},
     )
 
 
@@ -1239,7 +1249,9 @@ def load_training_model(
 ) -> BaseAlgorithm:
     algorithm = training["algorithm"]
     model_class = SAC if algorithm == "sac" else TD3
-    return model_class.load(path, env=env, device=device)
+    # Charger d'abord sans env permet à notre validation structurelle de produire
+    # un diagnostic explicite avant que SB3 n'effectue sa propre vérification.
+    return model_class.load(path, device=device)
 
 
 def derived_resume_paths(model_path: Path) -> tuple[Path, Path]:
@@ -1258,6 +1270,20 @@ def derived_resume_paths(model_path: Path) -> tuple[Path, Path]:
         )
         curriculum = model_path.with_name("curriculum_state.pkl")
     return replay, curriculum
+
+
+def previous_run_config(model_path: Path) -> dict | None:
+    """Charge le snapshot résolu du run source quand il est identifiable."""
+    candidates = [model_path.parent / "config.yaml", model_path.parent.parent / "config.yaml"]
+    for candidate in candidates:
+        if candidate.is_file():
+            return load_config(candidate)
+    warnings.warn(
+        f"Snapshot config.yaml du run source introuvable près de {model_path}; "
+        "les changements sémantiques sans changement de shape ne seront pas détectés.",
+        RuntimeWarning,
+    )
+    return None
 
 
 def archive_run_context(
@@ -1373,6 +1399,7 @@ def main() -> None:
             log_path=str(eval_dir),
         )
     resume_model = args.resume_model.resolve() if args.resume_model else None
+    resume_result = None
     if resume_model is not None:
         if not resume_model.is_file():
             raise FileNotFoundError(f"Checkpoint de reprise introuvable: {resume_model}")
@@ -1380,17 +1407,31 @@ def main() -> None:
             resume_model, env, training, device=args.device,
         )
         model.tensorboard_log = str(output / "tensorboard")
+        old_config = previous_run_config(resume_model)
+        if resolved_config["resume"]["apply_current_yaml"]:
+            resume_result = apply_resume_configuration(
+                model, env, resolved_config, previous_config=old_config,
+            )
+        model.set_env(env)
         derived_replay, derived_curriculum = derived_resume_paths(resume_model)
         replay_path = (
             args.resume_replay_buffer.resolve()
             if args.resume_replay_buffer else derived_replay
         )
-        if not replay_path.is_file():
-            raise FileNotFoundError(
-                "Reprise fidèle impossible: replay buffer coordonné introuvable: "
-                f"{replay_path}"
-            )
-        model.load_replay_buffer(replay_path)
+        replay_action = "keep" if resume_result is None else resume_result.replay_action
+        if replay_action == "keep":
+            if not replay_path.is_file():
+                raise FileNotFoundError(
+                    "Replay buffer à conserver mais fichier coordonné introuvable: "
+                    f"{replay_path}"
+                )
+            model.load_replay_buffer(replay_path)
+        else:
+            rebuild_empty_replay_buffer(model, int(training["buffer_size"]))
+        if resume_result is not None:
+            validate_effective_resume_configuration(model, resolved_config)
+            if model.replay_buffer.buffer_size != int(training["buffer_size"]):
+                raise RuntimeError("Resume override ineffective: replay_buffer.buffer_size")
         curriculum_resume_path = (
             args.resume_curriculum.resolve()
             if args.resume_curriculum else derived_curriculum
@@ -1427,6 +1468,17 @@ def main() -> None:
                     f"{saved_curriculum_step} transitions, mais le modèle repris "
                     f"est à {model.num_timesteps}.", RuntimeWarning,
                 )
+                if int(saved_curriculum_step) < int(model.num_timesteps):
+                    old_next = curriculum_manager.next_update_timesteps
+                    curriculum_manager.next_update_timesteps = next_future_curriculum_update(
+                        int(model.num_timesteps),
+                        int(resolved_config["curriculum"]["update_interval_timesteps"]),
+                    )
+                    print(
+                        "Réalignement curriculum stale: rattrapage historique SKIPPED; "
+                        f"next_update_timesteps {old_next} -> "
+                        f"{curriculum_manager.next_update_timesteps}"
+                    )
         else:
             if curriculum_resume_path is not None:
                 warnings.warn(
@@ -1473,7 +1525,31 @@ def main() -> None:
     print(f"total_timesteps: {total_timesteps}")
     print(f"buffer_size: {training['buffer_size']}")
     print(f"learning_rate: {training['learning_rate']}")
-    print("network: [256, 256]")
+    print(f"network: {training['network']}")
+    observation_config = resolved_config["observation"]
+    previous_error_size = 6 if observation_config["include_previous_pose_error"] else 0
+    admittance_size = 6 if observation_config["include_admittance_position"] else 0
+    print("Observation:")
+    print("  current pose error:      6")
+    print(f"  previous pose error:     {previous_error_size}")
+    print("  wrench:                  6")
+    print(f"  admittance offset:       {admittance_size}")
+    print(f"  total:                   {12 + previous_error_size + admittance_size}")
+    if resume_model is not None:
+        remaining = total_timesteps - int(model.num_timesteps)
+        print("Resume training\n" + "=" * 48)
+        print(f"Checkpoint: {resume_model} @ {model.num_timesteps} transitions")
+        if resume_result is not None and resolved_config["resume"]["log_parameter_diff"]:
+            print("Configuration changes:")
+            for change in resume_result.changes:
+                print(f"  {change}")
+            print(f"Replay buffer: {resume_result.replay_action.upper()}")
+        print("Effective SAC parameters:")
+        for key, value in effective_resume_summary(model).items():
+            print(f"  {key}: {value}")
+        print("Spaces: observation compatible; action compatible; network compatible")
+        print(f"Remaining timesteps: {remaining}")
+        print("=" * 48)
     if algorithm == "sac":
         print(f"ent_coef: {training['ent_coef']}")
         print(f"target_entropy: {training['target_entropy']}")

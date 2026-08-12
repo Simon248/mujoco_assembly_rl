@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import unittest
+from copy import deepcopy
+from pathlib import Path
+import tempfile
 
 import numpy as np
 
 from src.assembly_env import TenonMortaiseEnv
+from src.config import load_config, save_resolved_config
 
 
 class ObservationTest(unittest.TestCase):
@@ -41,6 +45,93 @@ class ObservationTest(unittest.TestCase):
         self.env.admittance.velocity = np.array([0.01, -0.01, 0.02, 0.1, -0.2, 0.25])
         after = self.env._observation()
         np.testing.assert_array_equal(after, before)
+
+    def _configured_env(self, previous: bool, admittance: bool):
+        config = deepcopy(load_config("configs/test1V42.yaml"))
+        config["observation"]["include_previous_pose_error"] = previous
+        config["observation"]["include_admittance_position"] = admittance
+        directory = tempfile.TemporaryDirectory()
+        path = Path(directory.name) / "config.yaml"
+        save_resolved_config(config, path)
+        env = TenonMortaiseEnv(path)
+        env._temporary_config_directory = directory
+        return env
+
+    def test_all_observation_dimension_combinations(self):
+        for previous, admittance, expected in (
+            (False, False, 12), (True, False, 18),
+            (False, True, 18), (True, True, 24),
+        ):
+            with self.subTest(previous=previous, admittance=admittance):
+                env = self._configured_env(previous, admittance)
+                try:
+                    observation, _ = env.reset(seed=17)
+                    self.assertEqual(env.observation_space.shape, (expected,))
+                    self.assertEqual(observation.shape, (expected,))
+                finally:
+                    env.close()
+                    env._temporary_config_directory.cleanup()
+
+    def test_first_observation_repeats_current_error_as_previous(self):
+        env = self._configured_env(True, True)
+        try:
+            observation, _ = env.reset(seed=17)
+            np.testing.assert_array_equal(observation[:6], observation[6:12])
+            np.testing.assert_allclose(observation[18:24], 0.0, atol=1e-7)
+        finally:
+            env.close()
+            env._temporary_config_directory.cleanup()
+
+    def test_temporal_sequence_is_current_then_previous(self):
+        env = self._configured_env(True, True)
+        try:
+            env.reset(seed=17)
+            errors = iter([
+                np.array([.001, .002, .003, .01, .02, .03]),
+                np.array([.002, .003, .004, .02, .03, .04]),
+                np.array([.003, .004, .005, .03, .04, .05]),
+            ])
+            env.previous_pose_error = None
+            env._error = lambda observed=False: next(errors)
+            env._observed_wrench = lambda: np.zeros(6)
+            observations = [env._observation() for _ in range(3)]
+            normalized = [
+                np.r_[error[:3] / env.cfg["observation"]["position_scale"],
+                      error[3:] / env.cfg["observation"]["rotation_scale"]]
+                for error in (
+                    np.array([.001, .002, .003, .01, .02, .03]),
+                    np.array([.002, .003, .004, .02, .03, .04]),
+                    np.array([.003, .004, .005, .03, .04, .05]),
+                )
+            ]
+            np.testing.assert_allclose(observations[0][:6], normalized[0])
+            np.testing.assert_allclose(observations[0][6:12], normalized[0])
+            np.testing.assert_allclose(observations[1][:6], normalized[1])
+            np.testing.assert_allclose(observations[1][6:12], normalized[0])
+            np.testing.assert_allclose(observations[2][:6], normalized[2])
+            np.testing.assert_allclose(observations[2][6:12], normalized[1])
+        finally:
+            env.close()
+            env._temporary_config_directory.cleanup()
+
+    def test_new_episode_and_curriculum_restore_clear_observation_history(self):
+        env = self._configured_env(True, True)
+        try:
+            env.reset(seed=17)
+            state = env.capture_curriculum_state()
+            env.step(np.array([0, 0, -1, 0, 0, 0], dtype=float))
+            reset_observation, _ = env.reset(seed=18)
+            np.testing.assert_array_equal(reset_observation[:6], reset_observation[6:12])
+            env.step(np.array([1, 0, 0, 0, 0, 0], dtype=float))
+            restored_observation, _ = env.restore_curriculum_state(
+                state, reset_episode=True, reset_source="curriculum_frontier",
+            )
+            np.testing.assert_array_equal(
+                restored_observation[:6], restored_observation[6:12],
+            )
+        finally:
+            env.close()
+            env._temporary_config_directory.cleanup()
 
 
 if __name__ == "__main__":
