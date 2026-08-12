@@ -761,6 +761,9 @@ class GenerationReport:
 @dataclass
 class StateLifecycleStats:
     created_update: int
+    # Premier update auquel cet état a été classé mastered. Ce marqueur est
+    # monotone: les revalidations ultérieures ne l'effacent jamais.
+    first_mastered_update: int | None = None
     last_revalidated_update: int = -1
     revalidation_count: int = 0
     frontier_since_update: int | None = None
@@ -783,6 +786,9 @@ class RevalidationReport:
     frontier_promoted_to_mastered: int = 0
     frontier_remained_frontier: int = 0
     frontier_demoted_to_too_hard: int = 0
+    mastered_remained_mastered: int = 0
+    mastered_to_frontier: int = 0
+    mastered_to_too_hard: int = 0
     frontier_rollouts: int = 0
     mastered_rollouts: int = 0
     too_hard_rollouts: int = 0
@@ -921,7 +927,7 @@ class ReverseCurriculumManager:
     diagnostic, jamais dans une décision de progression.
     """
 
-    STATE_VERSION = 5
+    STATE_VERSION = 6
 
     def __init__(
         self, env: TenonMortaiseEnv, config: dict[str, Any], *, seed: int,
@@ -1753,6 +1759,10 @@ class ReverseCurriculumManager:
                     self.state_lifecycle = {}
                 self.state_lifecycle[int(state.state_id)] = StateLifecycleStats(
                     created_update=int(getattr(self, "update_count", 0)) + 1,
+                    first_mastered_update=(
+                        int(getattr(self, "update_count", 0)) + 1
+                        if category == "mastered" else None
+                    ),
                     frontier_since_update=(
                         int(getattr(self, "update_count", 0)) + 1
                         if category == "frontier" else None
@@ -2105,6 +2115,9 @@ class ReverseCurriculumManager:
             category = classify_success_rate(state.success_rate, low, high)
             self.state_lifecycle[int(state.state_id)] = StateLifecycleStats(
                 created_update=self.update_count,
+                first_mastered_update=(
+                    self.update_count if category == "mastered" else None
+                ),
                 frontier_since_update=(
                     self.update_count if category == "frontier" else None
                 ),
@@ -2233,6 +2246,10 @@ class ReverseCurriculumManager:
                 )
                 for state in requalified
             }
+            mastered_revalidated = sum(
+                old_categories.get(state_id) == "mastered"
+                for state_id in new_categories
+            )
             self._update_lifecycle_after_revalidation(
                 old_categories, new_categories,
             )
@@ -2255,7 +2272,7 @@ class ReverseCurriculumManager:
             ))
             self.last_revalidation_report = RevalidationReport(
                 frontier_revalidated=len(frontier_selected),
-                mastered_revalidated=mastered_count,
+                mastered_revalidated=mastered_revalidated,
                 too_hard_revalidated=len(too_hard_keys),
                 too_hard_to_frontier=too_hard_categories.count("frontier"),
                 too_hard_to_mastered=too_hard_categories.count("mastered"),
@@ -2272,11 +2289,32 @@ class ReverseCurriculumManager:
                     old_categories.get(state_id) == "frontier" and category == "too_hard"
                     for state_id, category in new_categories.items()
                 ),
+                mastered_remained_mastered=sum(
+                    old_categories.get(state_id) == "mastered" and category == "mastered"
+                    for state_id, category in new_categories.items()
+                ),
+                mastered_to_frontier=sum(
+                    old_categories.get(state_id) == "mastered" and category == "frontier"
+                    for state_id, category in new_categories.items()
+                ),
+                mastered_to_too_hard=sum(
+                    old_categories.get(state_id) == "mastered" and category == "too_hard"
+                    for state_id, category in new_categories.items()
+                ),
                 frontier_rollouts=len(frontier_selected) * rollouts,
-                mastered_rollouts=mastered_count * rollouts,
+                mastered_rollouts=mastered_revalidated * rollouts,
                 too_hard_rollouts=len(too_hard_keys) * rollouts,
                 wall_time=time.perf_counter() - started_at,
             )
+            mastered_outcomes = (
+                self.last_revalidation_report.mastered_remained_mastered
+                + self.last_revalidation_report.mastered_to_frontier
+                + self.last_revalidation_report.mastered_to_too_hard
+            )
+            if mastered_outcomes != self.last_revalidation_report.mastered_revalidated:
+                raise AssertionError(
+                    "Le bilan de revalidation mastered est incohérent"
+                )
         else:
             self.last_revalidation_report = RevalidationReport(
                 wall_time=time.perf_counter() - started_at,
@@ -2295,6 +2333,9 @@ class ReverseCurriculumManager:
             update_count = int(getattr(self, "update_count", 0)) + 1
             stats.last_revalidated_update = update_count
             stats.revalidation_count += 1
+            if (category == "mastered" or old_categories.get(state_id) == "mastered") \
+                    and stats.first_mastered_update is None:
+                stats.first_mastered_update = update_count
             if category == "frontier":
                 if old_categories.get(state_id) == "frontier":
                     stats.consecutive_frontier_updates += 1
@@ -2466,14 +2507,14 @@ class ReverseCurriculumManager:
 
     def load_state_dict(self, payload: dict[str, Any]) -> None:
         version = int(payload.get("version", 1))
-        if version not in {1, 2, 3, 4, self.STATE_VERSION}:
+        if version not in {1, 2, 3, 4, 5, self.STATE_VERSION}:
             raise ValueError(
                 "Version de curriculum_state.pkl incompatible: "
                 f"{payload.get('version')!r}"
             )
         saved_config = payload.get("curriculum_config")
         saved_hash = payload.get("task_config_sha256")
-        if version in {2, 3, 4, self.STATE_VERSION}:
+        if version in {2, 3, 4, 5, self.STATE_VERSION}:
             compatible_hashes = {self._task_config_sha256()}
             if version < 5:
                 compatible_hashes.add(self._task_config_sha256(
@@ -2565,6 +2606,7 @@ class ReverseCurriculumManager:
                 else StateLifecycleStats(**stats)
             )
             for name, default in (
+                ("first_mastered_update", None),
                 ("nearest_ancestor_position_m", None),
                 ("nearest_ancestor_rotation_deg", None),
                 ("near_ancestor_return", False),
@@ -2580,10 +2622,17 @@ class ReverseCurriculumManager:
                 if state_id not in self.state_lifecycle:
                     self.state_lifecycle[state_id] = StateLifecycleStats(
                         created_update=-1,
+                        # Pour un ancien snapshot, seule la maîtrise actuelle
+                        # est certaine; son ancienneté reste inconnue (-1).
+                        first_mastered_update=(-1 if pool == "mastered" else None),
                         frontier_since_update=(
                             self.update_count if pool == "frontier" else None
                         ),
                     )
+                elif (pool == "mastered"
+                      and self.state_lifecycle[state_id].first_mastered_update is None
+                      and version < self.STATE_VERSION):
+                    self.state_lifecycle[state_id].first_mastered_update = -1
         self.proposal_memory = {}
         self._active_proposal_direction = None
         self._active_proposal_kind = "uniform"

@@ -75,7 +75,15 @@ EVAL_MONITOR_FIELDS = MONITOR_FIELDS + (
 
 
 class EpisodeMetricsCallback(BaseCallback):
-    """Expose les métriques terminales centralisées dans TensorBoard."""
+    """Expose une petite whitelist de métriques terminales dans TensorBoard."""
+
+    METRICS = {
+        "success": "performance/success_rate",
+        "safe_success": "performance/safe_success_rate",
+        "unsafe": "safety/unsafe_rate",
+        "episode_max_force": "safety/episode_max_force",
+        "episode_max_torque": "safety/episode_max_torque",
+    }
 
     def _on_step(self) -> bool:
         terminal_infos = [
@@ -83,14 +91,14 @@ class EpisodeMetricsCallback(BaseCallback):
                 self.locals.get("dones", []), self.locals.get("infos", [])
             ) if done
         ]
-        for key in MONITOR_FIELDS:
+        for key, tag in self.METRICS.items():
             values = [
                 float(info[key]) for info in terminal_infos
                 if isinstance(info.get(key), (bool, int, float, np.number))
                 and np.isfinite(float(info[key]))
             ]
             if values:
-                self.logger.record(f"assembly/{key}", float(np.mean(values)))
+                self.logger.record(tag, float(np.mean(values)))
         return True
 
 
@@ -109,7 +117,7 @@ class TrainingTimestepEvalCallback(EvalCallback):
                 curriculum_roles = []
             if any(curriculum_roles):
                 raise RuntimeError("EvalCallback ne doit jamais autoriser le curriculum")
-            self.logger.record("eval/reset_source_true_start", 1.0)
+            self.logger.record("from_start_eval/reset_source_true_start", 1.0)
         return super()._on_step()
 
 
@@ -819,6 +827,170 @@ class ReverseCurriculumCallback(BaseCallback):
             if np.isfinite(frontier_mean):
                 self.logger.record(
                     "curriculum/frontier_success_rate_mean", frontier_mean,
+                )
+
+    def _record_metrics(
+        self, *, include_pool_metrics: bool = False,
+        include_update_metrics: bool = False,
+        sampling_targets_used=None, sampling_targets_next=None,
+        sampling_effective_resets_used=None,
+        sampling_episode_length_ema_used=None,
+    ) -> None:
+        """Enregistre le dashboard compact; les diagnostics CSV restent séparés."""
+        del sampling_targets_next, sampling_effective_resets_used
+        del sampling_episode_length_ema_used
+
+        if include_pool_metrics:
+            pools = self.manager.pools
+            for pool in ("mastered", "frontier", "too_hard"):
+                self.logger.record(
+                    f"curriculum_progress/{pool}_count", float(len(pools[pool]))
+                )
+
+            def record_pool(pool: str, prefix: str) -> None:
+                states = pools[pool]
+                if not states:
+                    return
+                positions = np.asarray([
+                    getattr(s, "position_error", s.pose_distance) for s in states
+                ], dtype=float)
+                rotations = np.asarray([
+                    getattr(s, "rotation_error", 0.0) for s in states
+                ], dtype=float)
+                poses = np.asarray([s.pose_distance for s in states], dtype=float)
+                self.logger.record(
+                    f"curriculum_progress/{prefix}_position_max_mm",
+                    float(np.max(positions) * 1000.0),
+                )
+                self.logger.record(
+                    f"curriculum_progress/{prefix}_rotation_max_deg",
+                    float(np.rad2deg(np.max(rotations))),
+                )
+                self.logger.record(
+                    f"curriculum_progress/{prefix}_pose_max_mm_eq",
+                    float(np.max(poses) * 1000.0),
+                )
+                self.logger.record(
+                    f"curriculum_progress/{prefix}_depth_max",
+                    float(max(s.generation_depth for s in states)),
+                )
+                if pool == "frontier":
+                    self.logger.record(
+                        "curriculum_progress/frontier_position_median_mm",
+                        float(np.median(positions) * 1000.0),
+                    )
+                    self.logger.record(
+                        "curriculum_progress/frontier_rotation_median_deg",
+                        float(np.rad2deg(np.median(rotations))),
+                    )
+                    self.logger.record(
+                        "curriculum_progress/frontier_pose_median_mm_eq",
+                        float(np.median(poses) * 1000.0),
+                    )
+
+            record_pool("mastered", "mastered")
+            record_pool("frontier", "frontier")
+
+            lifecycle = getattr(self.manager, "state_lifecycle", {})
+            ever_ids = {
+                int(state_id) for state_id, stats in lifecycle.items()
+                if getattr(stats, "first_mastered_update", None) is not None
+            }
+            pool_ids = {
+                pool: {int(state.state_id) for state in states}
+                for pool, states in pools.items()
+            }
+            ever_count = len(ever_ids)
+            forgotten_frontier = len(ever_ids & pool_ids["frontier"])
+            forgotten_hard = len(ever_ids & pool_ids["too_hard"])
+            forgotten = forgotten_frontier + forgotten_hard
+            self.logger.record("forgetting/ever_mastered_count", float(ever_count))
+            self.logger.record("forgetting/forgotten_count", float(forgotten))
+            self.logger.record(
+                "forgetting/forgotten_to_frontier_count", float(forgotten_frontier)
+            )
+            self.logger.record(
+                "forgetting/forgotten_to_too_hard_count", float(forgotten_hard)
+            )
+            if ever_count:
+                self.logger.record(
+                    "forgetting/global_retention_rate",
+                    len(ever_ids & pool_ids["mastered"]) / ever_count,
+                )
+
+        if include_update_metrics:
+            generation = getattr(self.manager, "last_generation_report", None)
+            if generation is not None:
+                for name in ("new_mastered", "new_frontier", "new_too_hard"):
+                    if hasattr(generation, name):
+                        self.logger.record(
+                            f"curriculum_progress/{name}", float(getattr(generation, name))
+                        )
+            report = getattr(self.manager, "last_revalidation_report", None)
+            if report is not None and getattr(report, "mastered_revalidated", 0):
+                denominator = float(report.mastered_revalidated)
+                self.logger.record(
+                    "forgetting/mastered_retention_rate",
+                    float(report.mastered_remained_mastered) / denominator,
+                )
+                self.logger.record(
+                    "forgetting/mastered_to_frontier_rate",
+                    float(report.mastered_to_frontier) / denominator,
+                )
+                self.logger.record(
+                    "forgetting/mastered_to_too_hard_rate",
+                    float(report.mastered_to_too_hard) / denominator,
+                )
+
+        targets = self.sampling_targets_used if sampling_targets_used is None else sampling_targets_used
+        target = {
+            "true_start": float(getattr(targets, "true_start", 0.0)),
+            "frontier": float(getattr(targets, "frontier", 0.0)),
+            "historical": float(getattr(targets, "historical", 0.0)),
+            "fallback": float(getattr(targets, "mastered_boundary", 0.0))
+                + float(getattr(targets, "too_hard_near", 0.0)),
+        }
+        source = self.source_transition_counts
+        total = float(sum(source.values()))
+        observed = {
+            "true_start": source["true_start"] / total if total else 0.0,
+            "frontier": source["curriculum_frontier"] / total if total else 0.0,
+            "historical": source["curriculum_historical"] / total if total else 0.0,
+            "fallback": (
+                source["curriculum_mastered_boundary"]
+                + source["curriculum_too_hard_near"]
+            ) / total if total else 0.0,
+        }
+        for name in target:
+            self.logger.record(f"sampling/target_transition/{name}", target[name])
+            if total:
+                self.logger.record(f"sampling/observed_transition/{name}", observed[name])
+        if total:
+            self.logger.record(
+                "sampling/transition_target_l1_error",
+                float(sum(abs(observed[name] - target[name]) for name in target)),
+            )
+
+        historical = "curriculum_historical"
+        if self.source_episode_counts[historical]:
+            self.logger.record(
+                "forgetting/historical_success_rate",
+                self.source_success_counts[historical]
+                / self.source_episode_counts[historical],
+            )
+        true_start = "true_start"
+        if self.source_episode_counts[true_start]:
+            self.logger.record(
+                "from_start_train/success_rate",
+                self.source_success_counts[true_start]
+                / self.source_episode_counts[true_start],
+            )
+        for name, samples in self.true_start_diagnostics.items():
+            values = np.asarray(samples, dtype=float)
+            values = values[np.isfinite(values)]
+            if values.size:
+                self.logger.record(
+                    f"from_start_train/{name}", float(np.mean(values))
                 )
 
     def _reset_cycle_metrics(self) -> None:
