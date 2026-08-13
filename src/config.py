@@ -134,6 +134,7 @@ def load_config(path: str | Path) -> dict[str, Any]:
     training.setdefault("learning_starts", 5_000)
     training.setdefault("target_update_interval", 1)
     training.setdefault("network", [256, 256])
+    training.setdefault("optimize_memory_usage", False)
     td3 = training.setdefault("td3", {})
     if not isinstance(td3, dict):
         raise ValueError("training.td3 doit être un mapping")
@@ -150,27 +151,74 @@ def load_config(path: str | Path) -> dict[str, Any]:
             or not isinstance(learning_rate, (int, float))
             or not 0 < learning_rate < float("inf")):
         raise ValueError("training.learning_rate doit être strictement positif")
+    ent_coef = training["ent_coef"]
+    if isinstance(ent_coef, str):
+        valid_ent_coef = ent_coef == "auto"
+        if ent_coef.startswith("auto_"):
+            try:
+                initial_entropy = float(ent_coef.removeprefix("auto_"))
+                valid_ent_coef = (
+                    np.isfinite(initial_entropy) and initial_entropy > 0.0
+                )
+            except ValueError:
+                valid_ent_coef = False
+    else:
+        valid_ent_coef = (
+            not isinstance(ent_coef, bool)
+            and isinstance(ent_coef, (int, float))
+            and np.isfinite(ent_coef) and ent_coef > 0.0
+        )
+    if not valid_ent_coef:
+        raise ValueError(
+            "training.ent_coef doit être positif, 'auto' ou 'auto_<valeur>'"
+        )
+    target_entropy = training["target_entropy"]
+    if not (
+        target_entropy == "auto"
+        or (not isinstance(target_entropy, (bool, str))
+            and isinstance(target_entropy, (int, float))
+            and np.isfinite(target_entropy))
+    ):
+        raise ValueError(
+            "training.target_entropy doit être 'auto' ou un nombre fini"
+        )
     gamma = training["gamma"]
     if (isinstance(gamma, bool) or not isinstance(gamma, (int, float))
             or not 0 < gamma <= 1 or not np.isfinite(gamma)):
         raise ValueError("training.gamma doit être dans ]0, 1]")
-    if not 0 < float(training["tau"]) <= 1:
+    if (isinstance(training["tau"], bool)
+            or not isinstance(training["tau"], (int, float))
+            or not np.isfinite(training["tau"])
+            or not 0 < float(training["tau"]) <= 1):
         raise ValueError("training.tau doit être dans ]0, 1]")
     for key in ("batch_size", "learning_starts", "target_update_interval"):
         if isinstance(training[key], bool) or not isinstance(training[key], int) or training[key] <= 0:
             raise ValueError(f"training.{key} doit être un entier strictement positif")
-    if isinstance(training["gradient_steps"], bool) or not isinstance(training["gradient_steps"], int):
+    if (isinstance(training["gradient_steps"], bool)
+            or not isinstance(training["gradient_steps"], int)):
         raise ValueError("training.gradient_steps doit être un entier")
     train_freq = training["train_freq"]
     if (not isinstance(train_freq, (list, tuple)) or len(train_freq) != 2
             or not isinstance(train_freq[0], int) or train_freq[0] <= 0
             or train_freq[1] not in {"step", "episode"}):
         raise ValueError("training.train_freq doit être [entier positif, step|episode]")
+    if training["n_envs"] > 1 and train_freq[1] == "episode":
+        raise ValueError(
+            "training.train_freq en épisodes n'est pas supporté avec n_envs > 1"
+        )
     network = training["network"]
     if not isinstance(network, list) or not network or any(
         isinstance(width, bool) or not isinstance(width, int) or width <= 0 for width in network
     ):
         raise ValueError("training.network doit être une liste d'entiers positifs")
+    if not isinstance(training["optimize_memory_usage"], bool):
+        raise ValueError("training.optimize_memory_usage doit être un booléen")
+    if training["optimize_memory_usage"]:
+        raise ValueError(
+            "training.optimize_memory_usage=true n'est pas supporté: "
+            "SB3 2.9.0 l'interdit avec la gestion des timeouts utilisée par "
+            "le ReplayBuffer du projet"
+        )
     resume = cfg.setdefault("resume", {})
     if not isinstance(resume, dict):
         raise ValueError("resume doit être un mapping")

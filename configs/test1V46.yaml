@@ -1,0 +1,10 @@
+# V41 conserve intégralement V39 et teste uniquement un équilibrage du
+# sampling en fractions de transitions plutôt qu'en fractions de resets.
+extends: test1V43.yaml
+
+target_pose_fixed_to_mobile: # C'est la cible finale de la tâche.
+  position: [0.0005, 0.0002, -0.005]
+  orientation_quat: [1.0, 0.0, 0.0, 0.0] # w, x, y, z
+initial_pose_fixed_to_mobile:
+  position: [0.0, 0.0, 0.04]
+  orientation_quat: [1.0, 0.0, 0.0, 0.0]

@@ -1,7 +1,7 @@
 # Test 0: validation mécanique et commande manuelle. Les unités sont SI.
 case: tenon_1                 # tenon_1 (tenon_visual.stl) ou tenon_2 (tenon-2.stl)
 simulation:
-  timestep: 0.002
+  timestep: 0.002  # is admittance executed 10 times ?
   control_dt: 0.02
   max_episode_steps: 300
 training:
@@ -43,12 +43,12 @@ action:
   # grasp = comportement historique; task = incréments dans les axes CAD cibles.
   action_frame: grasp
   # 1 mm et 1° par décision à 50 Hz pour limiter les impacts au Test 1.
-  max_translation_step: 0.001
+  max_translation_step: 0.001    # [ -t*O.5 , t*0.5 ]
   max_rotation_step_deg: 1.0
 admittance:
-  mass: [2.0, 2.0, 2.0, 0.08, 0.08, 0.08]
-  damping: [80, 80, 80, 2.0, 2.0, 2.0]
-  stiffness: [600, 600, 600, 15, 15, 15]
+  mass: [2.0, 2.0, 2.0, 0.08, 0.08, 0.08] #15
+  damping: [80, 80, 80, 2.0, 2.0, 2.0] #damping ~ 100 damping ratio  C/2*square(M*K)=1  ==> K=
+  stiffness: [600, 600, 600, 15, 15, 15]  #200
   max_offset: [0.008, 0.008, 0.008, 0.15, 0.15, 0.15]
   max_velocity: [0.02, 0.02, 0.02, 0.25, 0.25, 0.25]
 success:

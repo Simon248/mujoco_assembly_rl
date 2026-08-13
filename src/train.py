@@ -38,7 +38,7 @@ from src.curriculum_diagnostics import (
 )
 from src.resume import (
     apply_resume_configuration, effective_resume_summary,
-    next_future_curriculum_update, rebuild_empty_replay_buffer,
+    next_future_curriculum_update, prepare_resume_replay_buffer,
     validate_effective_resume_configuration,
 )
 
@@ -1357,6 +1357,9 @@ def create_sac_model(
         gamma=float(training.get("gamma", 0.99)),
         tau=float(training.get("tau", 0.005)),
         target_update_interval=int(training.get("target_update_interval", 1)),
+        optimize_memory_usage=bool(
+            training.get("optimize_memory_usage", False)
+        ),
         ent_coef=training.get("ent_coef", "auto"),
         target_entropy=training.get("target_entropy", "auto"),
         policy_kwargs={"net_arch": list(training.get("network", [256, 256]))},
@@ -1393,6 +1396,9 @@ def create_td3_model(
         policy_delay=int(td3.get("policy_delay", 2)),
         target_policy_noise=float(td3.get("target_policy_noise", 0.2)),
         target_noise_clip=float(td3.get("target_noise_clip", 0.5)),
+        optimize_memory_usage=bool(
+            training.get("optimize_memory_usage", False)
+        ),
         policy_kwargs={"net_arch": list(training.get("network", [256, 256]))},
     )
 
@@ -1572,6 +1578,7 @@ def main() -> None:
         )
     resume_model = args.resume_model.resolve() if args.resume_model else None
     resume_result = None
+    replay_report = None
     if resume_model is not None:
         if not resume_model.is_file():
             raise FileNotFoundError(f"Checkpoint de reprise introuvable: {resume_model}")
@@ -1580,10 +1587,9 @@ def main() -> None:
         )
         model.tensorboard_log = str(output / "tensorboard")
         old_config = previous_run_config(resume_model)
-        if resolved_config["resume"]["apply_current_yaml"]:
-            resume_result = apply_resume_configuration(
-                model, env, resolved_config, previous_config=old_config,
-            )
+        resume_result = apply_resume_configuration(
+            model, env, resolved_config, previous_config=old_config,
+        )
         model.set_env(env)
         derived_replay, derived_curriculum = derived_resume_paths(resume_model)
         replay_path = (
@@ -1591,29 +1597,66 @@ def main() -> None:
             if args.resume_replay_buffer else derived_replay
         )
         replay_action = "keep" if resume_result is None else resume_result.replay_action
-        if replay_action == "keep":
-            if not replay_path.is_file():
-                raise FileNotFoundError(
-                    "Replay buffer à conserver mais fichier coordonné introuvable: "
-                    f"{replay_path}"
-                )
-            model.load_replay_buffer(replay_path)
-        else:
-            rebuild_empty_replay_buffer(model, int(training["buffer_size"]))
+        requested_replay_total = (
+            int(model.buffer_size)
+            if resume_result is None else int(training["buffer_size"])
+        )
+        replay_report = prepare_resume_replay_buffer(
+            model, replay_path, replay_action,
+            requested_total=requested_replay_total,
+            checkpoint_requested_total=(
+                int(model.buffer_size) if resume_result is None
+                else resume_result.checkpoint_buffer_size
+            ),
+        )
         if resume_result is not None:
             validate_effective_resume_configuration(model, resolved_config)
-            if model.replay_buffer.buffer_size != int(training["buffer_size"]):
-                raise RuntimeError("Resume override ineffective: replay_buffer.buffer_size")
         curriculum_resume_path = (
             args.resume_curriculum.resolve()
             if args.resume_curriculum else derived_curriculum
         )
+        if (resume_result is not None
+                and (resume_result.curriculum_incompatible_changes
+                     or not resume_result.semantic_compatibility_known)
+                and args.resume_curriculum is None):
+            warnings.warn(
+                "Curriculum coordonné ignoré car le YAML courant modifie des "
+                "éléments qui changent la sémantique de ses snapshots, ou car "
+                "la configuration source est indisponible: "
+                + (", ".join(resume_result.curriculum_incompatible_changes)
+                   or "config source inconnue")
+                + ". Un bootstrap neuf sera effectué.",
+                RuntimeWarning,
+            )
+            curriculum_resume_path = None
     else:
         model = create_model(
             env, training, base_seed=base_seed,
             tensorboard_log=output / "tensorboard", device=args.device,
         )
         curriculum_resume_path = None
+
+    if resume_model is not None:
+        remaining = total_timesteps - int(model.num_timesteps)
+        print("Resume training\n" + "=" * 48)
+        print(f"Checkpoint: {resume_model} @ {model.num_timesteps} transitions")
+        if (resume_result is not None
+                and resolved_config["resume"]["log_parameter_diff"]):
+            print("Configuration changes:")
+            for change in resume_result.changes:
+                print(f"  {change}")
+            print(f"Replay buffer: {resume_result.replay_action.upper()}")
+        if resume_result is not None and replay_report is not None:
+            print("Resume configuration overrides:")
+            for key, values in effective_resume_summary(
+                model, resolved_config, resume_result, replay_report,
+            ).items():
+                print(f"\n{key}:")
+                for label, value in values.items():
+                    print(f"  {label}: {value}")
+        print("Spaces: observation compatible; action compatible; network compatible")
+        print(f"Remaining timesteps: {remaining}")
+        print("=" * 48, flush=True)
 
     curriculum_manager = None
     curriculum_env = None
@@ -1707,21 +1750,6 @@ def main() -> None:
     print("  wrench:                  6")
     print(f"  admittance offset:       {admittance_size}")
     print(f"  total:                   {12 + previous_error_size + admittance_size}")
-    if resume_model is not None:
-        remaining = total_timesteps - int(model.num_timesteps)
-        print("Resume training\n" + "=" * 48)
-        print(f"Checkpoint: {resume_model} @ {model.num_timesteps} transitions")
-        if resume_result is not None and resolved_config["resume"]["log_parameter_diff"]:
-            print("Configuration changes:")
-            for change in resume_result.changes:
-                print(f"  {change}")
-            print(f"Replay buffer: {resume_result.replay_action.upper()}")
-        print("Effective SAC parameters:")
-        for key, value in effective_resume_summary(model).items():
-            print(f"  {key}: {value}")
-        print("Spaces: observation compatible; action compatible; network compatible")
-        print(f"Remaining timesteps: {remaining}")
-        print("=" * 48)
     if algorithm == "sac":
         print(f"ent_coef: {training['ent_coef']}")
         print(f"target_entropy: {training['target_entropy']}")

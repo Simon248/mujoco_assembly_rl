@@ -105,6 +105,32 @@ training:
   # Facteur d'actualisation du retour futur.
   gamma: 0.99
 
+  # Coefficient de Polyak utilisé pour mettre à jour les réseaux cibles.
+  tau: 0.005
+
+  # Nombre de transitions tirées du replay à chaque gradient step.
+  batch_size: 256
+
+  # SB3 transforme cette paire en objet TrainFreq.
+  train_freq: [1, step]
+
+  # -1 demande un gradient step par transition collectée dans le rollout.
+  gradient_steps: -1
+
+  # Nombre de transitions collectées avant les premières mises à jour.
+  learning_starts: 5000
+
+  # SAC : cadence des mises à jour du critic target.
+  target_update_interval: 1
+
+  # Architecture commune des MLP actor/critic. Elle est structurelle et ne
+  # peut pas changer lors d'une reprise.
+  network: [256, 256]
+
+  # Le projet conserve false. Avec SB3 2.9.0, true est incompatible avec la
+  # gestion des timeouts du ReplayBuffer utilisée ici et est donc refusé.
+  optimize_memory_usage: false
+
   # --------------------------------------------------------------------------
   # TD3 — uniquement utilisé si training.algorithm: td3
   # Paramètres rencontrés dans test1V15.
@@ -143,6 +169,32 @@ evaluation:
 
   # Seed dédiée à l'évaluation.
   seed: 10007
+
+
+# ----------------------------------------------------------------------------
+# REPRISE D'ENTRAÎNEMENT
+# ----------------------------------------------------------------------------
+
+resume:
+  # auto conserve le replay seulement si capacité et sémantique du MDP sont
+  # inchangées. Une modification de reward, tâche, dynamique, action,
+  # observation, randomisation ou perception le vide explicitement.
+  # keep force sa conservation uniquement lorsque structure et sémantique sont
+  # prouvées compatibles;
+  # discard le vide; error refuse toute incompatibilité détectée.
+  replay_buffer_policy: auto
+
+  # Applique les hyperparamètres runtime du YAML courant au modèle chargé.
+  # Doit rester true : false est ambigu puisque l'environnement courant est
+  # toujours construit depuis ce YAML.
+  apply_current_yaml: true
+
+  # Doit rester true : algorithm, espaces, network, n_envs, seed et layout du
+  # replay ne peuvent pas être changés silencieusement pendant une reprise.
+  fail_on_structural_change: true
+
+  # Affiche checkpoint, valeur demandée et valeur SB3 effective au lancement.
+  log_parameter_diff: true
 
 
 # ----------------------------------------------------------------------------

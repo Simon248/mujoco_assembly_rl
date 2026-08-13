@@ -7,6 +7,7 @@ extends: test1V39.yaml
 training:
   n_envs: 16
   gamma: 0.996
+  learning_rate: 0.0001
 
 curriculum:
   start_sampling:
@@ -15,8 +16,7 @@ curriculum:
       ema_alpha: 0.25
       min_episode_length: 1.0
       min_completed_episodes: 1
-training:
-  learning_rate: 0.0001
+
 
 resume:
   replay_buffer_policy: auto

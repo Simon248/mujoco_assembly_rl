@@ -136,6 +136,26 @@ class ConfigTest(unittest.TestCase):
             resolved = load_config(path)
         self.assertEqual(resolved["training"]["buffer_size"], 50_000)
         self.assertEqual(resolved["training"]["learning_rate"], 3e-4)
+        self.assertFalse(resolved["training"]["optimize_memory_usage"])
+
+    def test_unsupported_replay_layout_is_rejected(self):
+        config = load_config("configs/test1V43.yaml")
+        mutations = (
+            (
+                lambda cfg: cfg["training"].__setitem__(
+                    "optimize_memory_usage", True,
+                ),
+                "optimize_memory_usage=true",
+            ),
+        )
+        for mutate, message in mutations:
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as directory:
+                invalid = deepcopy(config)
+                mutate(invalid)
+                path = Path(directory) / "invalid.yaml"
+                save_resolved_config(invalid, path)
+                with self.assertRaisesRegex(ValueError, message):
+                    load_config(path)
 
     def test_old_config_gets_zero_torque_penalty_and_v16_enables_it(self):
         config = load_config("configs/test1V15.yaml")
@@ -651,6 +671,30 @@ class ConfigTest(unittest.TestCase):
         self.assertIsInstance(resolved["training"]["ent_coef"], float)
         self.assertEqual(resolved["training"]["target_entropy"], -3.0)
         self.assertIsInstance(resolved["training"]["target_entropy"], float)
+
+    def test_sac_transformed_parameters_are_validated_before_construction(self):
+        base = load_config("configs/test1V43.yaml")
+        mutations = (
+            (lambda training: training.__setitem__("ent_coef", "automatic"),
+             "ent_coef"),
+            (lambda training: training.__setitem__("ent_coef", "auto_0"),
+             "ent_coef"),
+            (lambda training: training.__setitem__("target_entropy", "max"),
+             "target_entropy"),
+            (lambda training: training.__setitem__("tau", True), "tau"),
+            (lambda training: training.__setitem__("gradient_steps", 1.5),
+             "gradient_steps"),
+            (lambda training: training.__setitem__(
+                "train_freq", [1, "episode"]), "train_freq"),
+        )
+        for mutate, message in mutations:
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as directory:
+                invalid = deepcopy(base)
+                mutate(invalid["training"])
+                path = Path(directory) / "invalid.yaml"
+                save_resolved_config(invalid, path)
+                with self.assertRaisesRegex(ValueError, message):
+                    load_config(path)
 
     def test_old_config_gets_backward_compatible_observation_and_eval_defaults(self):
         config = load_config("configs/test1.yaml")
